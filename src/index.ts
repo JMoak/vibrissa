@@ -1,8 +1,7 @@
 export interface RunCasesOptions {
-  server?: unknown;
+  server?: unknown
 }
 
 export async function runCases(_options: RunCasesOptions = {}): Promise<number> {
-  return 0;
+  return 0
 }
-
