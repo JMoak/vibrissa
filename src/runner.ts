@@ -1,18 +1,15 @@
 import { type ChildProcess, spawn } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
+import fg from 'fast-glob'
 import type { RunCasesOptions, TestCase } from './types.js'
-import { deepEqual, matchGlob, walk } from './utils.js'
+import { deepEqual } from './utils.js'
 
-function resolveCaseFiles(globs: string[], cwd: string): string[] {
-  const all = walk(cwd)
-  const jsonFiles = all.filter((f) => f.endsWith('.json'))
-  const matched = new Set<string>()
-  for (const g of globs) {
-    const gAbs = path.isAbsolute(g) ? g : path.join(cwd, g)
-    for (const f of jsonFiles) if (matchGlob(f, gAbs)) matched.add(f)
-  }
-  return Array.from(matched)
+async function resolveCaseFiles(globs: string[], cwd: string): Promise<string[]> {
+  const patterns = globs.map((g) =>
+    (path.isAbsolute(g) ? g : path.join(cwd, g)).replace(/\\/g, '/'),
+  )
+  return await fg(patterns, { dot: false, onlyFiles: true, unique: true })
 }
 
 async function waitForSpawn(proc: ChildProcess, timeoutMs: number): Promise<void> {
@@ -47,9 +44,7 @@ async function waitForSpawn(proc: ChildProcess, timeoutMs: number): Promise<void
 async function executeCase(
   _proc: ChildProcess,
   testCase: TestCase,
-  timeoutMs: number,
 ): Promise<{ ok: boolean; error?: string }> {
-  const timer = setTimeout(() => {}, timeoutMs)
   try {
     const tool = testCase.tool ?? ''
     const args = testCase.args ?? {}
@@ -63,8 +58,30 @@ async function executeCase(
     const msg = err instanceof Error ? err.message : String(err)
     if (testCase.expectError) return { ok: true }
     return { ok: false, error: msg }
+  }
+}
+
+async function runWithTimeout<T>(fn: () => Promise<T>, timeoutMs: number): Promise<T> {
+  let timeoutHandle: NodeJS.Timeout | undefined
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutHandle = setTimeout(() => reject(new Error('Case timeout exceeded')), timeoutMs)
+  })
+  try {
+    return await Promise.race([fn(), timeoutPromise])
   } finally {
-    clearTimeout(timer)
+    if (timeoutHandle) clearTimeout(timeoutHandle)
+  }
+}
+
+async function gracefulKill(proc: ChildProcess, waitMs: number): Promise<void> {
+  try {
+    proc.kill('SIGTERM')
+  } catch {}
+  await new Promise((resolve) => setTimeout(resolve, waitMs))
+  if (proc.exitCode == null) {
+    try {
+      proc.kill('SIGKILL')
+    } catch {}
   }
 }
 
@@ -76,10 +93,10 @@ export class Runner {
   }
 
   async run(): Promise<number> {
-    const cwd = this.options.server.cwd ?? process.cwd()
-    const files = resolveCaseFiles(this.options.globs, cwd)
+    const casesBaseDir = process.cwd()
+    const files = await resolveCaseFiles(this.options.globs, casesBaseDir)
     if (files.length === 0) return 0
-    const { cmd, args = [], env = {} } = this.options.server
+    const { cmd, args = [], env = {}, cwd = '.' } = this.options.server
     const proc = spawn(cmd, args, {
       cwd,
       env: { ...process.env, ...env },
@@ -91,7 +108,10 @@ export class Runner {
       for (const file of files) {
         const raw = fs.readFileSync(file, 'utf8')
         const data = JSON.parse(raw) as TestCase
-        const { ok, error } = await executeCase(proc, data, this.options.timeoutMs)
+        const { ok, error } = await runWithTimeout(
+          () => executeCase(proc, data),
+          this.options.timeoutMs,
+        )
         if (!ok) {
           failures++
           console.error(
@@ -102,9 +122,7 @@ export class Runner {
       }
       return failures === 0 ? 0 : 1
     } finally {
-      try {
-        proc.kill()
-      } catch {}
+      await gracefulKill(proc, 500)
     }
   }
 }
