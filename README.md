@@ -17,12 +17,12 @@ npm i -D vibrissa
 ```
 
 ### Quickstart
-1) Add an NPM script in your MCP server repo:
+1) Create `vibrissa.jsonc` in your MCP server repo (root):
 ```json
 {
-  "scripts": {
-    "test:integration": "vib-test --server \"node dist/index.js\" --cases \"tests/integration/**/*.json\" --fail-fast --concurrency 4 --timeout 15000"
-  }
+  "$schema": "./node_modules/vibrissa/schema/vibrissa.schema.json",
+  "server": { "cmd": "node", "args": ["dist/index.js"] },
+  "globs": ["tests/integration/**/*.json"]
 }
 ```
 
@@ -48,9 +48,16 @@ npm i -D vibrissa
 
 3) Run
 ```bash
-npx vib-test --server "node dist/index.js" --cases "tests/integration/**/*.json"
-# or
-npm run test:integration
+vib-test
+```
+
+Optional: add an NPM script
+```json
+{
+  "scripts": {
+    "test:integration": "vib-test"
+  }
+}
 ```
 
 ### Test Case Semantics
@@ -127,30 +134,12 @@ npm run test:integration
 ```
 
 ### CLI — vib-test
+Usage:
 ```bash
-vib-test \
-  --server "node dist/index.js" \
-  --server-cwd "." \
-  --env FOO=bar --env BAZ=qux \
-  --cases "tests/integration/**/*.json" \
-  --fail-fast \
-  --concurrency 4 \
-  --timeout 15000 \
-  --report reports/junit/junit.xml \
-  --before "node scripts/before.js" \
-  --after "node scripts/after.js"
+vib-test [--config ./path/to/vibrissa.jsonc] [--server-cwd .]
 ```
-- **--server**: command to start your MCP server (stdio)
-- **--server-cwd**: working directory for the server process
-- **--env**: repeatable `KEY=value` pairs for the server env
-- **--cases**: glob(s) for JSON cases
-- **--fail-fast**: stop at first failure
-- **--concurrency**: parallel case workers
-- **--timeout**: per‑case timeout (ms)
-- **--report**: optional JUnit XML path
-- **--before/--after**: optional hook scripts
-
-Tips (Windows PowerShell): quote with `"..."` inside `package.json` and use regular `"` in direct shells.
+- **--config**: path to your config file (otherwise auto-discovered)
+- **--server-cwd**: working directory for starting the server
 
 ### Case Layout (recommended)
 ```
@@ -161,6 +150,43 @@ tests/
       invalid-args.json
       flow.multistep.json
 ```
+
+### Configuration (vibrissa.jsonc)
+Create a `vibrissa.jsonc` in your project root to avoid repeating flags and enable IDE IntelliSense via `$schema`.
+
+```json
+{
+  "$schema": "./node_modules/vibrissa/schema/vibrissa.schema.json",
+  "server": {
+    "cmd": "node",
+    "args": ["dist/index.js"],
+    "cwd": ".",
+    "env": {
+      "LOG_LEVEL": "info"
+    }
+  },
+  "globs": [
+    "tests/integration/**/*.json"
+  ],
+  "concurrency": 4,
+  "timeoutMs": 15000,
+  "failFast": false,
+  "reportPath": "reports/junit/junit.xml",
+  "hooks": {
+    "before": "node scripts/before.js",
+    "after": "node scripts/after.js"
+  }
+}
+```
+
+Then run:
+```bash
+vib-test
+```
+
+Notes:
+- `$schema` gives editor validation/autocomplete. Using the local path works immediately after install and offline.
+- CLI flags always override config values.
 
 ### Library API
 ```ts

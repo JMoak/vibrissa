@@ -7,6 +7,9 @@ module.exports = {
     '^.+\\.(t|j)sx?$': ['@swc/jest'],
   },
   extensionsToTreatAsEsm: ['.ts', '.tsx'],
+  moduleNameMapper: {
+    '^(\\.{1,2}/.*)\\.js$': '$1',
+  },
   testMatch: ['**/?(*.)+(spec|test).(ts|tsx|js)'],
   reporters: [
     'default',

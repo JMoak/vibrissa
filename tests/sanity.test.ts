@@ -1,5 +1,5 @@
 describe('sanity', () => {
-  it('adds numbers', () => {
-    expect(1 + 2).toBe(3)
+  it('true is true', () => {
+    expect(true).toBe(true)
   })
 })

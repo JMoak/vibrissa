@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://unpkg.com/vibrissa/schema/vibrissa.schema.json",
+  "title": "Vibrissa Config",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "server": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cmd"],
+      "properties": {
+        "cmd": { "type": "string" },
+        "args": { "type": "array", "items": { "type": "string" } },
+        "cwd": { "type": "string" },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "globs": { "type": "array", "items": { "type": "string" } },
+    "concurrency": { "type": "integer", "minimum": 1 },
+    "timeoutMs": { "type": "integer", "minimum": 0 },
+    "failFast": { "type": "boolean" },
+    "reportPath": { "type": "string" },
+    "hooks": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "before": { "type": "string" },
+        "after": { "type": "string" }
+      }
+    },
+    "profiles": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "concurrency": { "type": "integer", "minimum": 1 },
+          "timeoutMs": { "type": "integer", "minimum": 0 },
+          "failFast": { "type": "boolean" },
+          "reportPath": { "type": "string" }
+        }
+      }
+    }
+  }
+}

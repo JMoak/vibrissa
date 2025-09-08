@@ -1,7 +1,21 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuites name="jest tests" tests="1" failures="0" errors="0" time="0.388">
-  <testsuite name="sanity" errors="0" failures="0" skipped="0" timestamp="2025-09-08T01:52:13" time="0.276" tests="1">
-    <testcase classname="sanity" name="adds numbers" time="0.006">
+<testsuites name="jest tests" tests="6" failures="0" errors="0" time="0.571">
+  <testsuite name="index exports" errors="0" failures="0" skipped="0" timestamp="2025-09-08T03:13:27" time="0.302" tests="3">
+    <testcase classname="index exports" name="exposes sensible defaults" time="0.008">
+    </testcase>
+    <testcase classname="index exports" name="runCases resolves to 0 with defaults" time="0.001">
+    </testcase>
+    <testcase classname="index exports" name="runCases accepts custom options" time="0.001">
+    </testcase>
+  </testsuite>
+  <testsuite name="config resolution" errors="0" failures="0" skipped="0" timestamp="2025-09-08T03:13:28" time="0.073" tests="2">
+    <testcase classname="config resolution" name="loads vibrissa.jsonc and merges with defaults" time="0.005">
+    </testcase>
+    <testcase classname="config resolution" name="falls back to package.json vibrissa field when file missing" time="0.003">
+    </testcase>
+  </testsuite>
+  <testsuite name="sanity" errors="0" failures="0" skipped="0" timestamp="2025-09-08T03:13:28" time="0.059" tests="1">
+    <testcase classname="sanity" name="true is true" time="0.001">
     </testcase>
   </testsuite>
 </testsuites>

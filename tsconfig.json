@@ -9,7 +9,9 @@
     "rootDir": "src",
     "skipLibCheck": true,
     "resolveJsonModule": true,
-    "sourceMap": true
+    "sourceMap": true,
+    "types": ["node", "jest"]
   },
-  "include": ["src"]
+  "include": ["src"],
+  "exclude": ["tests", "dist", "node_modules"]
 }
