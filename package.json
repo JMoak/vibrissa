@@ -7,7 +7,7 @@
     "node": ">=20"
   },
   "bin": {
-    "mcp-test": "bin/mcp-test.js"
+    "vib-test": "bin/vib-test.js"
   },
   "exports": {
     ".": {
