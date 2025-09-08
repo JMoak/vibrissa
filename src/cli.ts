@@ -1,6 +1,4 @@
 #!/usr/bin/env node
-import fs from 'node:fs'
-import path from 'node:path'
 import { resolveOptions } from './config.js'
 import { runCases } from './index.js'
 
@@ -33,11 +31,41 @@ if (argv.includes('-h') || argv.includes('--help')) {
 
 let cwd = process.cwd()
 let configPath: string | undefined
+let serverCmd: string | undefined
+let serverArgs: string[] | undefined
+let casesGlob: string | undefined
+let concurrency: number | undefined
+let timeoutMs: number | undefined
+let failFast: boolean | undefined
+
 for (let i = 0; i < argv.length; i++) {
-  if (argv[i] === '--config') configPath = argv[i + 1]
-  if (argv[i] === '--server-cwd') cwd = argv[i + 1]
+  const arg = argv[i]
+  if (arg === '--config') configPath = argv[i + 1]
+  if (arg === '--server-cwd') cwd = argv[i + 1]
+  if (arg === '--server') {
+    serverCmd = argv[i + 1]
+    const rest = argv[i + 2]
+    if (rest && !rest.startsWith('--')) serverArgs = rest.split(' ')
+  }
+  if (arg === '--cases') casesGlob = argv[i + 1]
+  if (arg === '--concurrency') concurrency = Number(argv[i + 1])
+  if (arg === '--timeout') timeoutMs = Number(argv[i + 1])
+  if (arg === '--fail-fast') failFast = true
 }
 
 const resolved = resolveOptions(cwd, configPath)
-await runCases(resolved)
-process.exit(0)
+const merged = {
+  ...resolved,
+  server: {
+    ...resolved.server,
+    ...(serverCmd ? { cmd: serverCmd } : {}),
+    ...(serverArgs ? { args: serverArgs } : {}),
+  },
+  ...(casesGlob ? { globs: [casesGlob] } : {}),
+  ...(typeof concurrency === 'number' && Number.isFinite(concurrency) ? { concurrency } : {}),
+  ...(typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) ? { timeoutMs } : {}),
+  ...(failFast ? { failFast: true } : {}),
+}
+
+const code = await runCases(merged)
+process.exit(code)

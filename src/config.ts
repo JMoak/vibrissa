@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { type RunCasesOptions, defaultRunCasesOptions } from './index.js'
+import { defaultRunCasesOptions } from './defaults.js'
+import type { RunCasesOptions } from './types.js'
 
 export function stripJsonComments(input: string): string {
   let result = ''
