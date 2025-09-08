@@ -10,6 +10,7 @@ End‑to‑end test your MCP server over stdio using declarative JSON cases. Shi
 
 ### Requirements
 - Node.js >= 20
+- ESM-only package (use `import`, not `require`)
 
 ### Install
 ```bash
@@ -217,7 +218,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
-      - run: npx vib-test --server "node dist/index.js" --cases "tests/integration/**/*.json" --report reports/junit/junit.xml
+      - run: npx vib-test --config vibrissa.jsonc
       - uses: actions/upload-artifact@v4
         if: always()
         with:
