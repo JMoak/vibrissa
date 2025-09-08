@@ -1,0 +1,55 @@
+{
+  "name": "vibrissa",
+  "version": "0.1.0",
+  "description": "Ultra-light JSON-driven MCP integration test runner",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "mcp-test": "bin/mcp-test.js"
+  },
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs",
+      "types": "./dist/index.d.ts"
+    },
+    "./cli": {
+      "import": "./dist/cli.js",
+      "require": "./dist/cli.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "bin",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup src/cli.ts src/index.ts --format esm,cjs --dts --clean --sourcemap",
+    "dev": "tsup src/cli.ts src/index.ts --format esm,cjs --dts --watch --sourcemap",
+    "typecheck": "tsc --noEmit",
+    "test": "node dist/cli.js --help"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JMoak/vibrissa.git"
+  },
+  "keywords": [
+    "mcp",
+    "integration",
+    "testing"
+  ],
+  "author": "",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/JMoak/vibrissa/issues"
+  },
+  "homepage": "https://github.com/JMoak/vibrissa#readme",
+  "devDependencies": {
+    "@types/node": "^20.19.13",
+    "tsup": "^8.5.0",
+    "typescript": "^5.9.2"
+  }
+}
