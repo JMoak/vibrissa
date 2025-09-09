@@ -64,12 +64,17 @@ export class PrettyConsoleResultsDisplay implements ResultsDisplay {
   onCasePass(name: string): void {
     this.passed.push(name)
     this.cases.push({ name, status: 'pass' })
+    const badge = color('[OK]', FG_GREEN)
+    const nameColored = color(name, FG_CYAN)
+    console.log(`${badge} ${nameColored}`)
   }
 
   onCaseFail(name: string, error?: string): void {
     this.failed.push({ name, error })
     this.cases.push({ name, status: 'fail', error })
-    console.error(`Case failed: ${name}${error ? ` - ${error}` : ''}`)
+    const badge = color('[!!]', FG_RED)
+    const nameColored = color(name, FG_CYAN)
+    console.log(`${badge} ${nameColored}`)
   }
 
   onComplete(summary: { total: number; passed: number; failed: number; durationMs: number }): void {
@@ -84,35 +89,6 @@ export class PrettyConsoleResultsDisplay implements ResultsDisplay {
     console.log(top)
     console.log(title)
     console.log(mid)
-    // Per-case status list
-    const casesHeader = `| Cases:${' '.repeat(width - 9)}|`
-    console.log(color(casesHeader, FG_GRAY))
-    if (this.cases.length === 0) {
-      const none = `|  (no cases found)${' '.repeat(width - 20)}|`
-      console.log(color(none, FG_GRAY))
-    } else {
-      for (const c of this.cases) {
-        const icon = c.status === 'pass' ? '✔' : '✖'
-        const iconColored = c.status === 'pass' ? color(icon, FG_GREEN) : color(icon, FG_RED)
-        const name = c.name
-        const errPlain = c.status === 'fail' && c.error ? ` [${c.error}]` : ''
-        const maxContent = width - 2
-        const contentPlain = ` ${icon} ${name}${errPlain}`
-        const trimmedPlain =
-          contentPlain.length > maxContent
-            ? `${contentPlain.slice(0, maxContent - 3)}...`
-            : contentPlain
-        let contentColored = trimmedPlain.replace(` ${icon} `, ` ${iconColored} `)
-        if (errPlain && trimmedPlain.includes(errPlain)) {
-          contentColored = contentColored.replace(errPlain, color(errPlain, FG_GRAY))
-        }
-        const pad = Math.max(0, maxContent - stripAnsi(contentColored).length)
-        const line = `|${contentColored}${' '.repeat(pad)}|`
-        console.log(line)
-      }
-    }
-
-    console.log(mid)
     console.log(totalsLine)
 
     if (this.failed.length > 0) {
@@ -122,7 +98,7 @@ export class PrettyConsoleResultsDisplay implements ResultsDisplay {
       const maxList = 10
       for (let i = 0; i < Math.min(this.failed.length, maxList); i++) {
         const f = this.failed[i]
-        const lineRaw = ` - ${f.name}${f.error ? ` [${f.error}]` : ''}`
+        const lineRaw = ` - ${f.name}`
         const maxContent = width - 3
         const trimmed =
           lineRaw.length > maxContent ? `${lineRaw.slice(0, maxContent - 3)}...` : lineRaw
