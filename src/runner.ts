@@ -2,6 +2,8 @@ import { type ChildProcess, spawn } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import fg from 'fast-glob'
+import type { ResultsDisplay } from './display.js'
+import { ConsoleResultsDisplay } from './display.js'
 import type { RunCasesOptions, TestCase } from './types.js'
 import { deepEqual } from './utils.js'
 
@@ -87,15 +89,18 @@ async function gracefulKill(proc: ChildProcess, waitMs: number): Promise<void> {
 
 export class Runner {
   private readonly options: RunCasesOptions
+  private readonly display: ResultsDisplay
 
-  constructor(options: RunCasesOptions) {
+  constructor(options: RunCasesOptions, display: ResultsDisplay = new ConsoleResultsDisplay()) {
     this.options = options
+    this.display = display
   }
 
   async run(): Promise<number> {
     const casesBaseDir = process.cwd()
     const files = await resolveCaseFiles(this.options.globs, casesBaseDir)
     if (files.length === 0) return 0
+    this.display.onStart(files.length)
     const { cmd, args = [], env = {}, cwd = '.' } = this.options.server
     const proc = spawn(cmd, args, {
       cwd,
@@ -105,6 +110,7 @@ export class Runner {
     try {
       await waitForSpawn(proc, Math.max(2000, Math.min(10000, this.options.timeoutMs)))
       let failures = 0
+      const startedAt = Date.now()
       for (const file of files) {
         const raw = fs.readFileSync(file, 'utf8')
         const data = JSON.parse(raw) as TestCase
@@ -114,12 +120,20 @@ export class Runner {
         )
         if (!ok) {
           failures++
-          console.error(
-            `Case failed: ${data.name ?? path.basename(file)}${error ? ` - ${error}` : ''}`,
-          )
+          const caseName = data.name ?? path.basename(file)
+          this.display.onCaseFail(caseName, error)
           if (this.options.failFast) break
+        } else {
+          const caseName = data.name ?? path.basename(file)
+          this.display.onCasePass(caseName)
         }
       }
+      this.display.onComplete({
+        total: files.length,
+        passed: files.length - failures,
+        failed: failures,
+        durationMs: Date.now() - startedAt,
+      })
       return failures === 0 ? 0 : 1
     } finally {
       await gracefulKill(proc, 500)

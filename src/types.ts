@@ -16,6 +16,7 @@ export interface RunCasesOptions {
   concurrency: number
   timeoutMs: number
   failFast: boolean
+  display?: 'plain' | 'pretty'
   reportPath?: string
   hooks?: HooksConfig
 }

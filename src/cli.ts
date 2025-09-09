@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { resolveOptions } from './config.js'
-import { runCases } from './index.js'
+import { ConsoleResultsDisplay, PrettyConsoleResultsDisplay } from './display.js'
+import { Runner } from './runner.js'
 
 // Config parsing is handled by resolveOptions
 
@@ -37,6 +38,7 @@ let casesGlob: string | undefined
 let concurrency: number | undefined
 let timeoutMs: number | undefined
 let failFast: boolean | undefined
+let display: 'plain' | 'pretty' | undefined
 
 for (let i = 0; i < argv.length; i++) {
   const arg = argv[i]
@@ -51,11 +53,15 @@ for (let i = 0; i < argv.length; i++) {
   if (arg === '--concurrency') concurrency = Number(argv[i + 1])
   if (arg === '--timeout') timeoutMs = Number(argv[i + 1])
   if (arg === '--fail-fast') failFast = true
+  if (arg === '--display') display = argv[i + 1] as 'plain' | 'pretty'
+  if (arg === '--pretty') display = 'pretty'
+  if (arg === '--no-pretty') display = 'plain'
 }
 
 const resolved = resolveOptions(cwd, configPath)
 const merged = {
   ...resolved,
+  ...(display ? { display } : {}),
   server: {
     ...resolved.server,
     ...(serverCmd ? { cmd: serverCmd } : {}),
@@ -67,5 +73,9 @@ const merged = {
   ...(failFast ? { failFast: true } : {}),
 }
 
-const code = await runCases(merged)
+const runner = new Runner(
+  merged,
+  merged.display === 'pretty' ? new PrettyConsoleResultsDisplay() : new ConsoleResultsDisplay(),
+)
+const code = await runner.run()
 process.exit(code)

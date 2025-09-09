@@ -6,4 +6,5 @@ export const defaultRunCasesOptions: RunCasesOptions = {
   concurrency: 4,
   timeoutMs: 15000,
   failFast: false,
+  display: 'pretty',
 }
