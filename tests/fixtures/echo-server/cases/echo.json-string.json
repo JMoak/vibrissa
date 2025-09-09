@@ -1,0 +1,9 @@
+{
+  "name": "echo json string",
+  "tool": "echo",
+  "args": { "text": "{\"foo\":1,\"bar\":[\"a\",\"b\"],\"nested\":{\"x\":10}}" },
+  "expect": {
+    "tool": "echo",
+    "args": { "text": "{\"foo\":1,\"bar\":[\"a\",\"b\"],\"nested\":{\"x\":10}}" }
+  }
+}

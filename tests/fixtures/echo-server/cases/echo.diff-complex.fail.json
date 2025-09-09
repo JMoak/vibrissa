@@ -1,0 +1,13 @@
+{
+  "name": "echo diff complex",
+  "tool": "echo",
+  "args": {
+    "text": "{\"user\":{\"id\":123,\"name\":\"Ada\",\"tags\":[\"ml\",\"systems\"],\"prefs\":{\"theme\":\"dark\",\"fontsize\":14}},\"items\":[1,2,3],\"ok\":true}"
+  },
+  "expect": {
+    "tool": "echo",
+    "args": {
+      "text": "{\"user\":{\"id\":123,\"name\":\"Ada Lovelace\",\"tags\":[\"ml\",\"systems\",\"math\"],\"prefs\":{\"theme\":\"light\",\"fontsize\":16}},\"items\":[1,2,3,4],\"ok\":false}"
+    }
+  }
+}

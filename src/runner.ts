@@ -120,6 +120,7 @@ export class Runner {
       await waitForSpawn(proc, Math.max(2000, Math.min(10000, this.options.timeoutMs)))
       let failures = 0
       const startedAt = Date.now()
+      let processed = 0
       for (const file of files) {
         const raw = fs.readFileSync(file, 'utf8')
         const data = JSON.parse(raw) as TestCase
@@ -138,10 +139,11 @@ export class Runner {
           const caseName = data.name ?? path.basename(file)
           this.display.onCasePass(caseName)
         }
+        processed++
       }
       this.display.onComplete({
-        total: files.length,
-        passed: files.length - failures,
+        total: processed,
+        passed: processed - failures,
         failed: failures,
         durationMs: Date.now() - startedAt,
       })

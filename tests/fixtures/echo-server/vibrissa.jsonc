@@ -7,5 +7,5 @@
   ],
   "concurrency": 1,
   "timeoutMs": 3000,
-  "failFast": true
+  "failFast": false
 }
