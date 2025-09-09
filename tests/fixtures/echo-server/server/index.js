@@ -11,5 +11,3 @@ process.on('SIGTERM', () => {
   process.stderr.write('[echo-server] received SIGTERM, exiting\n')
   process.exit(0)
 })
-
-
