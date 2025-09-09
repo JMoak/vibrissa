@@ -1,0 +1,10 @@
+{
+  "$schema": "../../../schema/vibrissa.schema.json",
+  "server": { "cmd": "node", "args": ["tests/fixtures/echo-server/server/index.js"], "cwd": "." },
+  "globs": ["tests/fixtures/echo-server/cases/**/*.json"],
+  "concurrency": 1,
+  "timeoutMs": 3000,
+  "failFast": true
+}
+
+

@@ -1,0 +1,8 @@
+{
+  "name": "echo basic",
+  "tool": "echo",
+  "args": { "text": "hello" },
+  "expect": { "tool": "echo", "args": { "text": "hello" } }
+}
+
+
