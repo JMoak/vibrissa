@@ -4,7 +4,7 @@ import path from 'node:path'
 import { runCases } from '../src'
 
 function resolveFixtureConfig(): string {
-  return path.join(process.cwd(), 'tests/fixtures/echo-server/vibrissa.jsonc')
+  return path.join(process.cwd(), 'tests/fixtures/echo-server/vibrissa.json')
 }
 
 function mkTmpDir(): string {

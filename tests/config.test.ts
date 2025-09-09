@@ -8,18 +8,17 @@ function mkTmpDir(): string {
 }
 
 describe('config resolution', () => {
-  it('loads vibrissa.jsonc and merges with defaults', () => {
+  it('loads vibrissa.json and merges with defaults', () => {
     const tmp = mkTmpDir()
-    const jsonc = `{
-      // comment
-      "server": { "cmd": "node", "args": ["custom.js"], "env": { "FOO": "bar" } },
-      "globs": ["tests/**/*.json"],
-      "concurrency": 2,
-      "timeoutMs": 12345,
-      "failFast": true,
-      "reportPath": "reports/junit.xml"
-    }`
-    fs.writeFileSync(path.join(tmp, 'vibrissa.jsonc'), jsonc, 'utf8')
+    const json = JSON.stringify({
+      server: { cmd: 'node', args: ['custom.js'], env: { FOO: 'bar' } },
+      globs: ['tests/**/*.json'],
+      concurrency: 2,
+      timeoutMs: 12345,
+      failFast: true,
+      reportPath: 'reports/junit.xml',
+    })
+    fs.writeFileSync(path.join(tmp, 'vibrissa.json'), json, 'utf8')
 
     const resolved = resolveOptions(tmp)
 

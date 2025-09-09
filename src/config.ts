@@ -83,7 +83,7 @@ export function loadConfigFile(
     return loadConfigObjectFromPath(abs)
   }
 
-  const candidates = ['vibrissa.jsonc', 'vibrissa.json']
+  const candidates = ['vibrissa.json', 'vibrissa.jsonc']
   for (const name of candidates) {
     const file = path.join(cwd, name)
     if (fs.existsSync(file)) {

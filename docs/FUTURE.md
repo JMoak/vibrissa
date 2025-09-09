@@ -36,7 +36,7 @@ vib-test --profile ci
 ### Fixtures: echo server
 - Create `tests/fixtures/echo-server/` containing:
   - `server/` minimal MCP server
-  - `vibrissa.jsonc` tailored to the fixture
+  - `vibrissa.json` tailored to the fixture
   - `cases/` with a couple happy-path JSON cases
 - Dogfood Vibrissa by targeting this fixture in CI.
 

@@ -18,7 +18,7 @@ npm i -D vibrissa
 ```
 
 ### Quickstart
-1) Create `vibrissa.jsonc` in your MCP server repo (root):
+1) Create `vibrissa.json` in your MCP server repo (root):
 ```json
 {
   "$schema": "./node_modules/vibrissa/schema/vibrissa.schema.json",
@@ -137,7 +137,7 @@ Optional: add an NPM script
 ### CLI — vib-test
 Usage:
 ```bash
-vib-test [--config ./path/to/vibrissa.jsonc] [--server-cwd .]
+vib-test [--config ./path/to/vibrissa.json] [--server-cwd .]
 ```
 - **--config**: path to your config file (otherwise auto-discovered)
 - **--server-cwd**: working directory for starting the server
@@ -152,8 +152,8 @@ tests/
       flow.multistep.json
 ```
 
-### Configuration (vibrissa.jsonc)
-Create a `vibrissa.jsonc` in your project root to avoid repeating flags and enable IDE IntelliSense via `$schema`.
+### Configuration (vibrissa.json)
+Create a `vibrissa.json` in your project root to avoid repeating flags and enable IDE IntelliSense via `$schema`.
 
 ```json
 {
@@ -218,7 +218,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
-      - run: npx vib-test --config vibrissa.jsonc
+      - run: npx vib-test --config vibrissa.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:

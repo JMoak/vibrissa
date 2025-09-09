@@ -13,7 +13,7 @@ function printHelp(): void {
     '  vib-test --server "<cmd>" --cases "<glob>" [options]',
     '',
     'Options:',
-    '  --config        Path to vibrissa.jsonc or equivalent',
+    '  --config        Path to vibrissa.json or equivalent',
     '  --server        Command to start the MCP server',
     '  --cases         Glob of JSON test files',
     '  --concurrency   Number of concurrent tests (default: 4)',
