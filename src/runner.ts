@@ -46,14 +46,14 @@ async function waitForSpawn(proc: ChildProcess, timeoutMs: number): Promise<void
 async function executeCase(
   _proc: ChildProcess,
   testCase: TestCase,
-): Promise<{ ok: boolean; error?: string }> {
+): Promise<{ ok: boolean; error?: string; expected?: unknown; actual?: unknown }> {
   try {
     const tool = testCase.tool ?? ''
     const args = testCase.args ?? {}
     const simulated = { tool, args }
     if (testCase.expect !== undefined) {
       const ok = deepEqual(simulated, testCase.expect)
-      if (!ok) return { ok: false, error: 'Expectation failed' }
+      if (!ok) return { ok: false, error: 'Expectation failed', expected: testCase.expect, actual: simulated }
     }
     return { ok: true }
   } catch (err) {
@@ -114,14 +114,17 @@ export class Runner {
       for (const file of files) {
         const raw = fs.readFileSync(file, 'utf8')
         const data = JSON.parse(raw) as TestCase
-        const { ok, error } = await runWithTimeout(
+        const { ok, error, expected, actual } = await runWithTimeout(
           () => executeCase(proc, data),
           this.options.timeoutMs,
         )
         if (!ok) {
           failures++
           const caseName = data.name ?? path.basename(file)
-          this.display.onCaseFail(caseName, error)
+          const details = expected !== undefined
+            ? ` :: ${JSON.stringify({ expected, actual })}`
+            : ''
+          this.display.onCaseFail(caseName, `${error ?? 'Error'}${details}`)
           if (this.options.failFast) break
         } else {
           const caseName = data.name ?? path.basename(file)

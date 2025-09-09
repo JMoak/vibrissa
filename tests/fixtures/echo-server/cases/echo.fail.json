@@ -1,0 +1,7 @@
+{
+  "name": "echo mismatch",
+  "tool": "echo",
+  "args": { "text": "hello" },
+  "expect": { "tool": "echo", "args": { "text": "HELLO" } }
+}
+
