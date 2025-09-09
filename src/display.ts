@@ -1,4 +1,4 @@
-import { createUnifiedDiff, stripAnsi } from './utils.js'
+import { createUnifiedDiff } from './utils.js'
 export interface ResultsDisplay {
   onStart(total: number): void
   onCasePass(name: string): void
@@ -119,8 +119,7 @@ export class PrettyConsoleResultsDisplay implements ResultsDisplay {
                 : d.startsWith('+ ')
                   ? `${BG_GREEN}${d}${RESET}`
                   : color(d, FG_GRAY)
-              const padInner = Math.max(0, width - 2 - stripAnsi(colored).length)
-              console.log(`|${colored}${' '.repeat(padInner)}|`)
+              console.log(`|${colored}`)
             }
           } catch {}
         }
