@@ -1,4 +1,4 @@
-import { createUnifiedDiff } from './utils.js'
+import { diffStringsUnified } from 'jest-diff'
 export interface ResultsDisplay {
   onStart(total: number): void
   onCasePass(name: string): void
@@ -112,15 +112,14 @@ export class PrettyConsoleResultsDisplay implements ResultsDisplay {
             const parsed = JSON.parse(json) as { expected?: unknown; actual?: unknown }
             const expectedStr = JSON.stringify(parsed.expected, null, 2)
             const actualStr = JSON.stringify(parsed.actual, null, 2)
-            const diffLines = createUnifiedDiff(expectedStr, actualStr, 20).split(/\r?\n/)
-            for (const d of diffLines) {
-              const colored = d.startsWith('- ')
-                ? `${BG_RED}${d}${RESET}`
-                : d.startsWith('+ ')
-                  ? `${BG_GREEN}${d}${RESET}`
-                  : color(d, FG_GRAY)
-              console.log(`|${colored}`)
-            }
+            const unified = diffStringsUnified(expectedStr, actualStr, {
+              aAnnotation: 'expected',
+              bAnnotation: 'actual',
+              expand: false,
+              contextLines: 3,
+            })
+            const diffLines = (unified ?? '').split(/\r?\n/)
+            for (const d of diffLines) console.log(`|${d}`)
           } catch {}
         }
       }
