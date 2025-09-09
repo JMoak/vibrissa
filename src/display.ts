@@ -1,4 +1,4 @@
-import { stripAnsi, createUnifiedDiff } from './utils.js'
+import { createUnifiedDiff, stripAnsi } from './utils.js'
 export interface ResultsDisplay {
   onStart(total: number): void
   onCasePass(name: string): void
@@ -76,7 +76,7 @@ export class PrettyConsoleResultsDisplay implements ResultsDisplay {
     const width = 64
     const top = `+${'='.repeat(width - 2)}+`
     const mid = `+${'-'.repeat(width - 2)}+`
-    const titleRaw = padCenter('Vibrissa Results', width - 2)
+    const titleRaw = padCenter('vib-test results', width - 2)
     const title = `|${color(BOLD + color(titleRaw, FG_CYAN), '')}|`
 
     const totalsLine = `| Total: ${color(String(summary.total), FG_CYAN)}  | Passed: ${color(String(summary.passed), FG_GREEN)}  | Failed: ${color(String(summary.failed), FG_RED)}  | Duration: ${color(formatDuration(summary.durationMs), FG_GRAY)}${' '.repeat(Math.max(0, width - 2 - ('| Total:  | Passed:   | Failed:   | Duration: '.length + String(summary.total).length + String(summary.passed).length + String(summary.failed).length + formatDuration(summary.durationMs).length)))}|`
@@ -98,7 +98,10 @@ export class PrettyConsoleResultsDisplay implements ResultsDisplay {
         const errPlain = c.status === 'fail' && c.error ? ` [${c.error}]` : ''
         const maxContent = width - 2
         const contentPlain = ` ${icon} ${name}${errPlain}`
-        const trimmedPlain = contentPlain.length > maxContent ? `${contentPlain.slice(0, maxContent - 3)}...` : contentPlain
+        const trimmedPlain =
+          contentPlain.length > maxContent
+            ? `${contentPlain.slice(0, maxContent - 3)}...`
+            : contentPlain
         let contentColored = trimmedPlain.replace(` ${icon} `, ` ${iconColored} `)
         if (errPlain && trimmedPlain.includes(errPlain)) {
           contentColored = contentColored.replace(errPlain, color(errPlain, FG_GRAY))
@@ -121,11 +124,12 @@ export class PrettyConsoleResultsDisplay implements ResultsDisplay {
         const f = this.failed[i]
         const lineRaw = ` - ${f.name}${f.error ? ` [${f.error}]` : ''}`
         const maxContent = width - 3
-        const trimmed = lineRaw.length > maxContent ? `${lineRaw.slice(0, maxContent - 3)}...` : lineRaw
+        const trimmed =
+          lineRaw.length > maxContent ? `${lineRaw.slice(0, maxContent - 3)}...` : lineRaw
         const line = `| ${trimmed}${' '.repeat(Math.max(0, width - 3 - trimmed.length))}|`
         console.log(color(line, FG_RED))
 
-        if (f.error && f.error.includes('::')) {
+        if (f.error?.includes('::')) {
           const idx = f.error.indexOf('::')
           try {
             const json = f.error.slice(idx + 2).trim()

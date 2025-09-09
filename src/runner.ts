@@ -8,9 +8,12 @@ import type { RunCasesOptions, TestCase } from './types.js'
 import { deepEqual } from './utils.js'
 
 async function resolveCaseFiles(globs: string[], cwd: string): Promise<string[]> {
-  const patterns = globs.map((g) =>
-    (path.isAbsolute(g) ? g : path.join(cwd, g)).replace(/\\/g, '/'),
-  )
+  const patterns = globs.map((g) => {
+    const isNegative = g.startsWith('!')
+    const body = isNegative ? g.slice(1) : g
+    const resolved = (path.isAbsolute(body) ? body : path.join(cwd, body)).replace(/\\/g, '/')
+    return isNegative ? `!${resolved}` : resolved
+  })
   return await fg(patterns, { dot: false, onlyFiles: true, unique: true })
 }
 
@@ -53,7 +56,13 @@ async function executeCase(
     const simulated = { tool, args }
     if (testCase.expect !== undefined) {
       const ok = deepEqual(simulated, testCase.expect)
-      if (!ok) return { ok: false, error: 'Expectation failed', expected: testCase.expect, actual: simulated }
+      if (!ok)
+        return {
+          ok: false,
+          error: 'Expectation failed',
+          expected: testCase.expect,
+          actual: simulated,
+        }
     }
     return { ok: true }
   } catch (err) {
@@ -121,9 +130,8 @@ export class Runner {
         if (!ok) {
           failures++
           const caseName = data.name ?? path.basename(file)
-          const details = expected !== undefined
-            ? ` :: ${JSON.stringify({ expected, actual })}`
-            : ''
+          const details =
+            expected !== undefined ? ` :: ${JSON.stringify({ expected, actual })}` : ''
           this.display.onCaseFail(caseName, `${error ?? 'Error'}${details}`)
           if (this.options.failFast) break
         } else {

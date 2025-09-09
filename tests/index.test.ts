@@ -1,3 +1,6 @@
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { defaultRunCasesOptions, runCases } from '../src/index'
 
 describe('index exports', () => {
@@ -17,11 +20,24 @@ describe('index exports', () => {
   })
 
   it('runCases accepts custom options', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vibrissa-index-'))
+    const file = path.join(tmp, 'pass.json')
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        name: 'pass',
+        tool: 'echo',
+        args: { text: 'x' },
+        expect: { tool: 'echo', args: { text: 'x' } },
+      }),
+      'utf8',
+    )
+
     const code = await runCases({
       server: { cmd: 'node', args: ['dist/index.js'], cwd: '.', env: { FOO: 'BAR' } },
-      globs: ['tests/**/*.json'],
+      globs: [path.join(tmp, '**/*.json')],
       concurrency: 1,
-      timeoutMs: 10,
+      timeoutMs: 1000,
       failFast: true,
       reportPath: undefined,
       hooks: undefined,

@@ -25,7 +25,7 @@
     "typecheck": "tsc --noEmit",
     "test": "jest --config ./jest.config.cjs --runInBand --colors",
     "test:ci": "jest --config ./jest.config.cjs --reporters=default --reporters=jest-junit",
-    "e2e": "npm run build && node bin/vib-test.js --config tests/fixtures/echo-server/vibrissa.jsonc",
+    "e2e": "npm run build && node bin/vib-test.js --config tests/fixtures/echo-server/vibrissa.jsonc --cases \"tests/fixtures/echo-server/cases/**/*.json\"",
     "lint": "biome check . --write",
     "lint:fix": "biome check . --write --unsafe"
   },

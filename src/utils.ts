@@ -7,10 +7,26 @@ export function deepEqual(a: unknown, b: unknown): boolean {
 }
 
 export function stripAnsi(input: string): string {
-  const pattern =
-    // eslint-disable-next-line no-control-regex
-    /[\u001B\u009B][[\]()#;?]*(?:(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nq-uy=><~])/g
-  return input.replace(pattern, '')
+  let result = ''
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i]
+    if (ch === '\x1B' || ch === '\x9B') {
+      let j = i + 1
+      if (ch === '\x1B' && input[j] === '[') j++
+      while (j < input.length) {
+        const code = input.charCodeAt(j)
+        if (code >= 0x40 && code <= 0x7e) {
+          j++
+          break
+        }
+        j++
+      }
+      i = j - 1
+      continue
+    }
+    result += ch
+  }
+  return result
 }
 
 export function createUnifiedDiff(expected: string, actual: string, maxLines = 40): string {

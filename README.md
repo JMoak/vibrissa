@@ -1,4 +1,4 @@
-## Vibrissa (Whisker) — JSON‑Driven MCP Integration Test Runner
+## vibrissa (Whisker) — JSON‑Driven MCP Integration Test Runner
 
 End‑to‑end test your MCP server over stdio using declarative JSON cases. Ship stable, contract‑focused integration suites that humans can review and LLMs can author.
 
