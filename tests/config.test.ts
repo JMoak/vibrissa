@@ -22,6 +22,7 @@ describe('config resolution', () => {
 
     const resolved = resolveOptions(tmp)
 
+    expect(resolved.rootDir).toBe(tmp)
     expect(resolved.server.cmd).toBe('node')
     expect(resolved.server.args).toEqual(['custom.js'])
     expect(resolved.server.cwd).toBe('.')
@@ -31,6 +32,24 @@ describe('config resolution', () => {
     expect(resolved.timeoutMs).toBe(12345)
     expect(resolved.failFast).toBe(true)
     expect(resolved.reportPath).toBe('reports/junit.xml')
+  })
+
+  it('sets rootDir to the config file directory for explicit paths', () => {
+    const tmp = mkTmpDir()
+    const nested = path.join(tmp, 'nested')
+    fs.mkdirSync(nested)
+    fs.writeFileSync(
+      path.join(nested, 'vibrissa.json'),
+      JSON.stringify({
+        server: { cmd: 'node', args: ['server.js'] },
+        globs: ['cases/**/*.json'],
+      }),
+      'utf8',
+    )
+
+    const resolved = resolveOptions(tmp, path.join(nested, 'vibrissa.json'))
+    expect(resolved.rootDir).toBe(nested)
+    expect(resolved.globs).toEqual(['cases/**/*.json'])
   })
 
   it('falls back to package.json vibrissa field when file missing', () => {
@@ -46,6 +65,7 @@ describe('config resolution', () => {
     fs.writeFileSync(path.join(tmp, 'package.json'), JSON.stringify(pkg), 'utf8')
 
     const resolved = resolveOptions(tmp)
+    expect(resolved.rootDir).toBe(tmp)
     expect(resolved.server.args).toEqual(['pkg.js'])
     expect(resolved.globs).toEqual(['pkg/**/*.json'])
   })

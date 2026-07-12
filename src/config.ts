@@ -73,21 +73,32 @@ export function loadConfigObjectFromPath(configPath: string): Partial<RunCasesOp
   return json as Partial<RunCasesOptions>
 }
 
-export function loadConfigFile(
-  cwd: string,
-  explicitPath?: string,
-): Partial<RunCasesOptions> | undefined {
+export interface LoadedConfig {
+  config: Partial<RunCasesOptions>
+  rootDir: string
+  configPath?: string
+}
+
+export function loadConfigFile(cwd: string, explicitPath?: string): LoadedConfig | undefined {
   if (explicitPath) {
     const abs = path.isAbsolute(explicitPath) ? explicitPath : path.join(cwd, explicitPath)
     if (!fs.existsSync(abs)) throw new Error(`Config not found: ${abs}`)
-    return loadConfigObjectFromPath(abs)
+    return {
+      config: loadConfigObjectFromPath(abs),
+      rootDir: path.dirname(abs),
+      configPath: abs,
+    }
   }
 
   const candidates = ['vibrissa.json', 'vibrissa.jsonc']
   for (const name of candidates) {
     const file = path.join(cwd, name)
     if (fs.existsSync(file)) {
-      return loadConfigObjectFromPath(file)
+      return {
+        config: loadConfigObjectFromPath(file),
+        rootDir: path.dirname(file),
+        configPath: file,
+      }
     }
   }
 
@@ -95,14 +106,20 @@ export function loadConfigFile(
   if (fs.existsSync(pkgPath)) {
     const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'))
     if (pkg?.vibrissa && typeof pkg.vibrissa === 'object') {
-      return pkg.vibrissa as Partial<RunCasesOptions>
+      return {
+        config: pkg.vibrissa as Partial<RunCasesOptions>,
+        rootDir: path.dirname(pkgPath),
+        configPath: pkgPath,
+      }
     }
   }
   return undefined
 }
 
 export function resolveOptions(cwd: string, explicitPath?: string): RunCasesOptions {
-  const fileConfig = loadConfigFile(cwd, explicitPath)
+  const loaded = loadConfigFile(cwd, explicitPath)
+  const fileConfig = loaded?.config
+  const rootDir = loaded?.rootDir ?? path.resolve(cwd)
   const resolved: RunCasesOptions = {
     ...defaultRunCasesOptions,
     ...fileConfig,
@@ -110,6 +127,7 @@ export function resolveOptions(cwd: string, explicitPath?: string): RunCasesOpti
       ...defaultRunCasesOptions.server,
       ...(fileConfig?.server ?? {}),
     },
+    rootDir,
   }
   return resolved
 }

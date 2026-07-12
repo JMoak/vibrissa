@@ -59,7 +59,7 @@ vib-test \
 - M1 (done): Minimal runner executing JSON cases via real MCP stdio (`@modelcontextprotocol/sdk` client); exact match plus `expectError` (code + message/`$regex`).
 - M2 (done): Partial/regex/wildcard/unordered semantics via a structured matcher engine (`src/match.ts`) that reports path-level mismatches (e.g. `content[0].text`). `$partial` cascades to its subtree; `$unordered` uses backtracking multiset matching and combines with `$partial`.
 - M3: JUnit reporting + before/after hooks.
-- M4: Library API parity with CLI; dev-loop subcommands (`tools`, `call`, `record`, `init`).
+- M4 (done): Dev-loop CLI subcommands — `run` (default), `tools`, `call`, `record`, `init`, plus `inspect` to launch MCP Inspector with the same server config. Case JSON schema at `schema/case.schema.json`. Binary aliases: `vib` and `vib-test`.
 - M5: Performance thresholds + streaming guidance.
 
 

@@ -1,27 +1,62 @@
 #!/usr/bin/env node
-import { resolveOptions } from './config.js'
-import { ConsoleResultsDisplay, PrettyConsoleResultsDisplay } from './display.js'
-import { Runner } from './runner.js'
+import { callCommand } from './cli/call.js'
+import { initCommand } from './cli/init.js'
+import { inspectCommand } from './cli/inspect.js'
+import { recordCommand } from './cli/record.js'
+import { runCommand } from './cli/run.js'
+import { toolsCommand } from './cli/tools.js'
 
-// Config parsing is handled by resolveOptions
+const COMMANDS = new Set(['run', 'tools', 'call', 'record', 'init', 'inspect'])
 
 function printHelp(): void {
-  const text = [
-    'vib-test - JSON-driven MCP integration runner',
-    '',
-    'Usage:',
-    '  vib-test --server "<cmd>" --cases "<glob>" [options]',
-    '',
-    'Options:',
-    '  --config        Path to vibrissa.json or equivalent',
-    '  --server        Command to start the MCP server',
-    '  --cases         Glob of JSON test files',
-    '  --concurrency   Number of concurrent tests (default: 4)',
-    '  --timeout       Per-test timeout in ms (default: 15000)',
-    '  --fail-fast     Stop on first failure',
-    '  -h, --help      Show help',
-  ].join('\n')
-  console.log(text)
+  console.log(
+    [
+      'vib-test — JSON-driven MCP integration runner + authoring loop',
+      '',
+      'Usage:',
+      '  vib-test run [options]                 Run JSON cases (default)',
+      '  vib-test tools [options]               List tools on the server',
+      '  vib-test call <tool> [options]         Call a tool and print the result',
+      '  vib-test record <tool> [options]       Call a tool and write a case file',
+      '  vib-test init [options]                Scaffold vibrissa.json + sample case',
+      '  vib-test inspect [options] [-- ...]    Open MCP Inspector with this server',
+      '',
+      'Shared options:',
+      '  --config <path>       vibrissa.json / .jsonc / package.json#vibrissa',
+      '  --server "<cmd ...>"  Override server command',
+      '  --server-cwd <dir>    Working directory for the server process',
+      '  --env KEY=VALUE       Extra env var (repeatable)',
+      '  --timeout <ms>        Per-call / spawn timeout',
+      '  --json                Machine-readable output (tools/call/record)',
+      '',
+      'run options:',
+      '  --cases <glob>        Case glob (relative to shell cwd)',
+      '  --fail-fast           Stop on first failure',
+      '  --allow-empty         Exit 0 when no cases match',
+      '  --pretty / --no-pretty',
+      '',
+      'call / record options:',
+      "  --args '{...}'        JSON object of tool arguments",
+      '  --arg key=value       Tool argument (repeatable; JSON-ish values ok)',
+      '',
+      'record options:',
+      '  --out <path>          Case file path (default: tests/integration/<name>.json)',
+      '  --name <string>       Case name',
+      '  --partial             Wrap expect in "$partial": true',
+      '  --force               Overwrite an existing case file',
+      '',
+      'init options:',
+      '  --dir <path>          Target directory (default: .)',
+      '  --force               Overwrite existing scaffold files',
+      '',
+      'inspect options:',
+      '  --cli                 Use Inspector CLI mode',
+      '  -- ...                Extra args forwarded after the server command',
+      '',
+      'Workflow:',
+      '  init → tools → call → record → run → inspect (when you want the UI)',
+    ].join('\n'),
+  )
 }
 
 const argv = process.argv.slice(2)
@@ -30,52 +65,41 @@ if (argv.includes('-h') || argv.includes('--help')) {
   process.exit(0)
 }
 
-let cwd = process.cwd()
-let configPath: string | undefined
-let serverCmd: string | undefined
-let serverArgs: string[] | undefined
-let casesGlob: string | undefined
-let concurrency: number | undefined
-let timeoutMs: number | undefined
-let failFast: boolean | undefined
-let display: 'plain' | 'pretty' | undefined
+let command = 'run'
+let rest = argv
+if (argv[0] && COMMANDS.has(argv[0])) {
+  command = argv[0]
+  rest = argv.slice(1)
+}
 
-for (let i = 0; i < argv.length; i++) {
-  const arg = argv[i]
-  if (arg === '--config') configPath = argv[i + 1]
-  if (arg === '--server-cwd') cwd = argv[i + 1]
-  if (arg === '--server') {
-    serverCmd = argv[i + 1]
-    const rest = argv[i + 2]
-    if (rest && !rest.startsWith('--')) serverArgs = rest.split(' ')
+let code = 1
+try {
+  switch (command) {
+    case 'run':
+      code = await runCommand(rest)
+      break
+    case 'tools':
+      code = await toolsCommand(rest)
+      break
+    case 'call':
+      code = await callCommand(rest)
+      break
+    case 'record':
+      code = await recordCommand(rest)
+      break
+    case 'init':
+      code = await initCommand(rest)
+      break
+    case 'inspect':
+      code = await inspectCommand(rest)
+      break
+    default:
+      printHelp()
+      code = 1
   }
-  if (arg === '--cases') casesGlob = argv[i + 1]
-  if (arg === '--concurrency') concurrency = Number(argv[i + 1])
-  if (arg === '--timeout') timeoutMs = Number(argv[i + 1])
-  if (arg === '--fail-fast') failFast = true
-  if (arg === '--display') display = argv[i + 1] as 'plain' | 'pretty'
-  if (arg === '--pretty') display = 'pretty'
-  if (arg === '--no-pretty') display = 'plain'
+} catch (err) {
+  const message = err instanceof Error ? err.message : String(err)
+  console.error(message)
+  code = 1
 }
-
-const resolved = resolveOptions(cwd, configPath)
-const merged = {
-  ...resolved,
-  ...(display ? { display } : {}),
-  server: {
-    ...resolved.server,
-    ...(serverCmd ? { cmd: serverCmd } : {}),
-    ...(serverArgs ? { args: serverArgs } : {}),
-  },
-  ...(casesGlob ? { globs: [casesGlob] } : {}),
-  ...(typeof concurrency === 'number' && Number.isFinite(concurrency) ? { concurrency } : {}),
-  ...(typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) ? { timeoutMs } : {}),
-  ...(failFast ? { failFast: true } : {}),
-}
-
-const runner = new Runner(
-  merged,
-  merged.display === 'pretty' ? new PrettyConsoleResultsDisplay() : new ConsoleResultsDisplay(),
-)
-const code = await runner.run()
 process.exit(code)

@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://unpkg.com/vibrissa/schema/case.schema.json",
+  "title": "Vibrissa Test Case",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["tool"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "name": { "type": "string" },
+    "tool": { "type": "string", "minLength": 1 },
+    "args": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "expect": {},
+    "expectError": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "code": { "type": "string" },
+        "message": {
+          "oneOf": [
+            { "type": "string" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "$regex": { "type": "string" },
+                "flags": { "type": "string" }
+              },
+              "required": ["$regex"]
+            }
+          ]
+        }
+      }
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}

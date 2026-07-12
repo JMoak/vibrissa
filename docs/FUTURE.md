@@ -34,11 +34,12 @@ vib-test --profile ci
 ```
 
 ### Fixtures: echo server
-- Create `tests/fixtures/echo-server/` containing:
-  - `server/` minimal MCP server
-  - `vibrissa.json` tailored to the fixture
-  - `cases/` with a couple happy-path JSON cases
-- Dogfood Vibrissa by targeting this fixture in CI.
+- Done: `tests/fixtures/echo-server/` dogfoods Vibrissa end-to-end.
+
+### MCP Inspector integration
+- `vib-test inspect` launches `@modelcontextprotocol/inspector` using the resolved Vibrissa server block (command/args/cwd/env).
+- Positioning: Inspector for visual exploration; Vibrissa for authoring (`tools`/`call`/`record`) and regression (`run`).
+- Optional CLI mode: `vib-test inspect --cli -- --method tools/list`
 
 ### Watch mode
 - `vib-test --watch` to re-run affected cases on file changes.

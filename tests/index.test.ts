@@ -12,18 +12,24 @@ describe('index exports', () => {
     expect(defaultRunCasesOptions.concurrency).toBeGreaterThan(0)
     expect(defaultRunCasesOptions.timeoutMs).toBeGreaterThanOrEqual(0)
     expect(defaultRunCasesOptions.failFast).toBe(false)
+    expect(defaultRunCasesOptions.allowEmpty).toBe(false)
   })
 
-  it('runCases resolves to 0 with defaults', async () => {
-    const code = await runCases(defaultRunCasesOptions)
-    expect(code).toBe(0)
+  it('runCases fails loud when defaults match no cases', async () => {
+    const spy = jest.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const code = await runCases(defaultRunCasesOptions)
+      expect(code).toBe(1)
+      expect(spy).toHaveBeenCalledWith(expect.stringMatching(/No test cases matched globs/))
+    } finally {
+      spy.mockRestore()
+    }
   })
 
   it('runCases accepts custom options', async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vibrissa-index-'))
-    const file = path.join(tmp, 'pass.json')
     fs.writeFileSync(
-      file,
+      path.join(tmp, 'pass.json'),
       JSON.stringify({
         name: 'pass',
         tool: 'echo',
@@ -36,16 +42,15 @@ describe('index exports', () => {
     const code = await runCases({
       server: {
         cmd: 'node',
-        args: ['tests/fixtures/echo-server/server/index.js'],
+        args: ['server/index.js'],
         cwd: '.',
         env: { FOO: 'BAR' },
       },
-      globs: [path.join(tmp, '**/*.json')],
+      globs: [path.join(tmp, '**/*.json').replace(/\\/g, '/')],
       concurrency: 1,
       timeoutMs: 10000,
       failFast: true,
-      reportPath: undefined,
-      hooks: undefined,
+      rootDir: path.join(process.cwd(), 'tests/fixtures/echo-server'),
     })
     expect(code).toBe(0)
   })

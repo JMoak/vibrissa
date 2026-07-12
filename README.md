@@ -1,10 +1,10 @@
-## vibrissa (whisker) — JSON‑Driven MCP Integration Test Runner
+﻿## vibrissa (whisker) â€” JSONâ€‘Driven MCP Integration Test Runner
 
-End‑to‑end test your MCP server over stdio using declarative JSON cases. Ship stable, contract‑focused integration suites that humans can review and LLMs can author.
+Endâ€‘toâ€‘end test your MCP server over stdio using declarative JSON cases. Ship stable, contractâ€‘focused integration suites that humans can review and LLMs can author.
 
 ### Why Vibrissa?
-- Integration‑first: validates real I/O over MCP stdio
-- JSON cases: simple, diff‑friendly, easy to generate
+- Integrationâ€‘first: validates real I/O over MCP stdio
+- JSON cases: simple, diffâ€‘friendly, easy to generate
 - Powerful matching: exact, partial, regex, wildcard, unordered arrays
 - Flexible: CLI (`vib-test`) or library API
 
@@ -18,6 +18,18 @@ npm i -D vibrissa
 ```
 
 ### Quickstart
+```bash
+npm i -D vibrissa
+vib init
+# edit vibrissa.json server block if needed
+vib tools
+vib call echo --arg text=hello --arg uppercase=true
+vib record echo --arg text=hello --arg uppercase=true --name "echo uppercase"
+vib run
+```
+
+Or scaffold by hand:
+
 1) Create `vibrissa.json` in your MCP server repo (root):
 ```json
 {
@@ -49,14 +61,14 @@ npm i -D vibrissa
 
 3) Run
 ```bash
-vib-test
+vib-test run
 ```
 
 Optional: add an NPM script
 ```json
 {
   "scripts": {
-    "test:integration": "vib-test"
+    "test:integration": "vib-test run"
   }
 }
 ```
@@ -92,7 +104,7 @@ Optional: add an NPM script
   }
 }
 ```
-- Wildcard (glob‑like)
+- Wildcard (globâ€‘like)
 ```json
 {
   "expect": {
@@ -134,13 +146,50 @@ Optional: add an NPM script
 }
 ```
 
-### CLI — vib-test
-Usage:
+### CLI â€” vib / vib-test
+
+Subcommands (default is `run` when omitted):
+
 ```bash
-vib-test [--config ./path/to/vibrissa.json] [--server-cwd .]
+vib init
+vib tools
+vib call echo --arg text=hello --arg uppercase=true
+vib record echo --arg text=hello --arg uppercase=true --name "echo uppercase"
+vib run
+vib inspect          # opens MCP Inspector with the same server config
 ```
-- **--config**: path to your config file (otherwise auto-discovered)
-- **--server-cwd**: working directory for starting the server
+
+| Command | Purpose |
+|--------|---------|
+| `run` | Execute JSON cases (CI gate) |
+| `tools` | List tools + argument shapes |
+| `call` | One-shot `tools/call`, print result |
+| `record` | One-shot call â†’ write a golden case file |
+| `init` | Scaffold `vibrissa.json` + sample case + npm script |
+| `inspect` | Launch [MCP Inspector](https://modelcontextprotocol.io/docs/tools/inspector) against this server |
+
+**Division of labor:** use Inspector for visual exploration and debugging; use Vibrissa `tools` â†’ `call` â†’ `record` â†’ `run` for the authoring/regression loop. `inspect` reuses your `vibrissa.json` server block so you do not re-type command/args/env.
+
+Shared options:
+- **--config**: path to your config file (otherwise auto-discovered from the current directory)
+- **--server**: override server command (quoted argv ok), e.g. `--server "node dist/index.js"`
+- **--server-cwd**: working directory for starting the server (overrides `server.cwd`; relative paths resolve from the shell cwd)
+- **--env KEY=VALUE**: extra environment (repeatable)
+- **--timeout**: per-call / spawn timeout in ms
+- **--json**: machine-readable output for `tools` / `call` / `record`
+
+`run` options:
+- **--cases**: glob of JSON cases (relative to the shell cwd when passed on the CLI)
+- **--allow-empty**: exit 0 when no cases match (by default, zero matches is a failure)
+- **--fail-fast**, **--pretty** / **--no-pretty**
+
+`record` options: `--out`, `--name`, `--partial`, `--force`
+
+Notes:
+- Globs in `vibrissa.json` resolve relative to the config file's directory.
+- Relative `server.cwd` values in config also resolve from that directory.
+- Matching zero case files exits `1` unless `--allow-empty` / `allowEmpty: true` is set.
+- Recorded cases include `$schema` pointing at `schema/case.schema.json` for editor validation.
 
 ### Case Layout (recommended)
 ```
@@ -229,7 +278,7 @@ jobs:
 ### What to Test
 - Tools contract: `listTools`, `tools/call`
 - Arg validation: codes/messages for bad inputs
-- Multi‑step flows: sequences across tools
+- Multiâ€‘step flows: sequences across tools
 - Streaming/long ops: use partial/regex for stability
 - Optional performance thresholds per case
 
@@ -241,4 +290,28 @@ jobs:
 ### License
 MIT
 
+### Authoring from tdd-dsl
+
+You can author Vibrissa cases from a shared `.tdd` contract and emit JSON with [tdd-dsl](https://github.com/JMoak/tdd-dsl):
+
+```text
+suite "Echo MCP contract"
+target vibrissa "echo-server"
+
+case "echo basic":
+  given input:
+    {"text": "hello"}
+  when call "echo"
+  then equals:
+    {"content": [{"type": "text", "text": "hello"}]}
+```
+
+```bash
+tdd-dsl emit --target vibrissa --out-dir tests/integration contract.tdd
+vib run
+```
+
+Mapping: `when call` → `tool`, `given input` → `args`, `then equals` → `expect`. Prefer recording once with `vib record` so `expect` matches the real MCP `tools/call` envelope.
+
+**Layering:** keep Vitest/Jest for unit tests of Vibrissa itself and of MCP handler logic. Use Vibrissa JSON for protocol e2e. Do **not** pull Python / tdd-dsl into Vibrissa CI — emit cases in the contract repo (or regenerate locally) and commit the JSON that `vib run` executes.
 

@@ -19,6 +19,8 @@ export interface RunCasesOptions {
   display?: 'plain' | 'pretty'
   reportPath?: string
   hooks?: HooksConfig
+  rootDir?: string
+  allowEmpty?: boolean
 }
 
 export type JsonValue =

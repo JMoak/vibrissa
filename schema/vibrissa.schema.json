@@ -24,6 +24,10 @@
     "concurrency": { "type": "integer", "minimum": 1 },
     "timeoutMs": { "type": "integer", "minimum": 0 },
     "failFast": { "type": "boolean" },
+    "allowEmpty": {
+      "type": "boolean",
+      "description": "If true, matching zero case files exits 0. Default false (fail loud)."
+    },
     "reportPath": { "type": "string" },
     "hooks": {
       "type": "object",

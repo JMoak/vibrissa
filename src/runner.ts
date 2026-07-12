@@ -5,6 +5,7 @@ import type { ResultsDisplay } from './display.js'
 import { ConsoleResultsDisplay } from './display.js'
 import { type Mismatch, matchValue } from './match.js'
 import { McpSession, type ToolError } from './mcp-session.js'
+import { resolveRootDir, resolveServerConfig } from './paths.js'
 import type { JsonValue, RunCasesOptions, TestCase } from './types.js'
 
 interface CaseResult {
@@ -127,12 +128,22 @@ export class Runner {
   }
 
   async run(): Promise<number> {
-    const casesBaseDir = process.cwd()
-    const files = await resolveCaseFiles(this.options.globs, casesBaseDir)
-    if (files.length === 0) return 0
+    const rootDir = resolveRootDir(this.options)
+    const files = await resolveCaseFiles(this.options.globs, rootDir)
+    if (files.length === 0) {
+      const pattern = this.options.globs.join(', ')
+      const message = `No test cases matched globs: ${pattern} (from ${rootDir})`
+      if (this.options.allowEmpty) {
+        console.warn(message)
+        return 0
+      }
+      console.error(message)
+      return 1
+    }
     this.display.onStart(files.length)
     const spawnTimeoutMs = Math.max(2000, Math.min(10000, this.options.timeoutMs))
-    const session = await McpSession.start(this.options.server, spawnTimeoutMs)
+    const server = resolveServerConfig(this.options)
+    const session = await McpSession.start(server, spawnTimeoutMs)
     try {
       let failures = 0
       const startedAt = Date.now()

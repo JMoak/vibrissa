@@ -21,15 +21,62 @@ describe('Runner', () => {
   it('returns 0 when all cases pass (echo server)', async () => {
     const configPath = resolveFixtureConfig()
     const { resolveOptions } = await import('../src/config')
-    const options = resolveOptions(path.dirname(configPath))
+    const options = resolveOptions(path.dirname(configPath), configPath)
     const code = await runCases(options)
     expect(code).toBe(0)
+  })
+
+  it('resolves globs and server.cwd relative to config rootDir', async () => {
+    const configPath = resolveFixtureConfig()
+    const { resolveOptions } = await import('../src/config')
+    const options = resolveOptions(process.cwd(), configPath)
+    expect(options.rootDir).toBe(path.dirname(configPath))
+    expect(options.globs[0]).toBe('cases/**/*.json')
+    const code = await runCases(options)
+    expect(code).toBe(0)
+  })
+
+  it('returns 1 when no cases match', async () => {
+    const spy = jest.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const code = await runCases({
+        server: { cmd: 'node', args: ['server/index.js'] },
+        globs: ['does-not-exist/**/*.json'],
+        concurrency: 1,
+        timeoutMs: 1000,
+        failFast: true,
+        rootDir: path.join(process.cwd(), 'tests/fixtures/echo-server'),
+      })
+      expect(code).toBe(1)
+      expect(spy).toHaveBeenCalledWith(expect.stringMatching(/No test cases matched globs/))
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('returns 0 with allowEmpty when no cases match', async () => {
+    const spy = jest.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const code = await runCases({
+        server: { cmd: 'node', args: ['server/index.js'] },
+        globs: ['does-not-exist/**/*.json'],
+        concurrency: 1,
+        timeoutMs: 1000,
+        failFast: true,
+        allowEmpty: true,
+        rootDir: path.join(process.cwd(), 'tests/fixtures/echo-server'),
+      })
+      expect(code).toBe(0)
+      expect(spy).toHaveBeenCalledWith(expect.stringMatching(/No test cases matched globs/))
+    } finally {
+      spy.mockRestore()
+    }
   })
 
   it('respects failFast by stopping after first failure and logs once', async () => {
     const configPath = resolveFixtureConfig()
     const { resolveOptions } = await import('../src/config')
-    const options = resolveOptions(path.dirname(configPath))
+    const options = resolveOptions(path.dirname(configPath), configPath)
 
     const tmp = mkTmpDir()
     writeCase(tmp, 'fail-1', {
@@ -49,7 +96,7 @@ describe('Runner', () => {
     try {
       const code = await runCases({
         ...options,
-        globs: [path.join(tmp, '**/*.json')],
+        globs: [path.join(tmp, '**/*.json').replace(/\\/g, '/')],
         failFast: true,
       })
       expect(code).toBe(1)
@@ -62,7 +109,7 @@ describe('Runner', () => {
   it('processes all cases when failFast=false and logs for each failure', async () => {
     const configPath = resolveFixtureConfig()
     const { resolveOptions } = await import('../src/config')
-    const options = resolveOptions(path.dirname(configPath))
+    const options = resolveOptions(path.dirname(configPath), configPath)
 
     const tmp = mkTmpDir()
     writeCase(tmp, 'fail-1', {
@@ -82,7 +129,7 @@ describe('Runner', () => {
     try {
       const code = await runCases({
         ...options,
-        globs: [path.join(tmp, '**/*.json')],
+        globs: [path.join(tmp, '**/*.json').replace(/\\/g, '/')],
         failFast: false,
       })
       expect(code).toBe(1)
@@ -101,6 +148,7 @@ describe('Runner', () => {
         globs: ['tests/fixtures/echo-server/cases/echo.basic.json'],
         failFast: true,
         timeoutMs: 1000,
+        rootDir: process.cwd(),
       }),
     ).rejects.toMatchObject({
       message: expect.stringMatching(/ENOENT|Server spawn timeout|Server exited early/i),

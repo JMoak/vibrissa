@@ -7,4 +7,5 @@ export const defaultRunCasesOptions: RunCasesOptions = {
   timeoutMs: 15000,
   failFast: false,
   display: 'pretty',
+  allowEmpty: false,
 }
