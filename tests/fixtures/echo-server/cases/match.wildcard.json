@@ -1,0 +1,8 @@
+{
+  "name": "wildcard match",
+  "tool": "echo",
+  "args": { "text": "hello brave new world" },
+  "expect": {
+    "content": [{ "type": "text", "text": { "$wildcard": "hello*world" } }]
+  }
+}

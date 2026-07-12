@@ -1,0 +1,11 @@
+{
+  "name": "unordered content match",
+  "tool": "echo",
+  "args": { "text": "solo" },
+  "expect": {
+    "content": {
+      "$unordered": true,
+      "value": [{ "type": "text", "text": "solo" }]
+    }
+  }
+}

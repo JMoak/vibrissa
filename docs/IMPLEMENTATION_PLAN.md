@@ -56,10 +56,10 @@ vib-test \
 - Files: `dist`, `bin`, `README.md`, `LICENSE`.
 
 ### 9. Milestones
-- M1: Minimal runner executing one JSON case via stdio; exact match.
-- M2: Partial/regex/wildcard/unordered semantics.
+- M1 (done): Minimal runner executing JSON cases via real MCP stdio (`@modelcontextprotocol/sdk` client); exact match plus `expectError` (code + message/`$regex`).
+- M2 (done): Partial/regex/wildcard/unordered semantics via a structured matcher engine (`src/match.ts`) that reports path-level mismatches (e.g. `content[0].text`). `$partial` cascades to its subtree; `$unordered` uses backtracking multiset matching and combines with `$partial`.
 - M3: JUnit reporting + before/after hooks.
-- M4: Library API parity with CLI.
+- M4: Library API parity with CLI; dev-loop subcommands (`tools`, `call`, `record`, `init`).
 - M5: Performance thresholds + streaming guidance.
 
 

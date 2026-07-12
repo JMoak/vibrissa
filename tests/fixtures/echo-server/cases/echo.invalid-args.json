@@ -1,0 +1,9 @@
+{
+  "name": "echo rejects missing text",
+  "tool": "echo",
+  "args": { "uppercase": true },
+  "expectError": {
+    "code": "InvalidParams",
+    "message": { "$regex": "Invalid.*echo" }
+  }
+}

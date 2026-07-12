@@ -1,11 +1,18 @@
-import { type ChildProcess, spawn } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import fg from 'fast-glob'
 import type { ResultsDisplay } from './display.js'
 import { ConsoleResultsDisplay } from './display.js'
-import type { RunCasesOptions, TestCase } from './types.js'
-import { deepEqual } from './utils.js'
+import { type Mismatch, matchValue } from './match.js'
+import { McpSession, type ToolError } from './mcp-session.js'
+import type { JsonValue, RunCasesOptions, TestCase } from './types.js'
+
+interface CaseResult {
+  ok: boolean
+  error?: string
+  expected?: unknown
+  actual?: unknown
+}
 
 async function resolveCaseFiles(globs: string[], cwd: string): Promise<string[]> {
   const patterns = globs.map((g) => {
@@ -17,59 +24,85 @@ async function resolveCaseFiles(globs: string[], cwd: string): Promise<string[]>
   return await fg(patterns, { dot: false, onlyFiles: true, unique: true })
 }
 
-async function waitForSpawn(proc: ChildProcess, timeoutMs: number): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    let done = false
-    const timer = setTimeout(() => {
-      if (done) return
-      done = true
-      reject(new Error('Server spawn timeout'))
-    }, timeoutMs)
-    proc.once('spawn', () => {
-      if (done) return
-      done = true
-      clearTimeout(timer)
-      resolve()
-    })
-    proc.once('error', (err) => {
-      if (done) return
-      done = true
-      clearTimeout(timer)
-      reject(err)
-    })
-    proc.once('exit', (code) => {
-      if (done) return
-      done = true
-      clearTimeout(timer)
-      reject(new Error(`Server exited early with code ${code}`))
-    })
-  })
+function summarizeMismatches(mismatches: Mismatch[], label: string): string {
+  const first = mismatches[0]
+  const suffix = mismatches.length > 1 ? ` (+${mismatches.length - 1} more)` : ''
+  return `${label} at ${first.path}: ${first.message}${suffix}`
+}
+
+function matchExpectedError(
+  expected: NonNullable<TestCase['expectError']>,
+  actual: ToolError,
+): CaseResult {
+  const observed = {
+    code: actual.codeName ?? (actual.code !== undefined ? String(actual.code) : undefined),
+    message: actual.message,
+  }
+  if (expected.code !== undefined) {
+    const codeMatches =
+      expected.code === actual.codeName || expected.code === String(actual.code ?? '')
+    if (!codeMatches) {
+      return {
+        ok: false,
+        error: `Error code mismatch: expected ${JSON.stringify(expected.code)}, got ${JSON.stringify(observed.code)}`,
+        expected: expected as JsonValue,
+        actual: observed,
+      }
+    }
+  }
+  if (expected.message !== undefined) {
+    const mismatches = matchValue(expected.message as JsonValue, actual.message)
+    if (mismatches.length > 0) {
+      return {
+        ok: false,
+        error: summarizeMismatches(mismatches, 'Error message mismatch'),
+        expected: expected as JsonValue,
+        actual: observed,
+      }
+    }
+  }
+  return { ok: true }
 }
 
 async function executeCase(
-  _proc: ChildProcess,
+  session: McpSession,
   testCase: TestCase,
-): Promise<{ ok: boolean; error?: string; expected?: unknown; actual?: unknown }> {
-  try {
-    const tool = testCase.tool ?? ''
-    const args = testCase.args ?? {}
-    const simulated = { tool, args }
-    if (testCase.expect !== undefined) {
-      const ok = deepEqual(simulated, testCase.expect)
-      if (!ok)
-        return {
-          ok: false,
-          error: 'Expectation failed',
-          expected: testCase.expect,
-          actual: simulated,
-        }
-    }
-    return { ok: true }
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    if (testCase.expectError) return { ok: true }
-    return { ok: false, error: msg }
+  timeoutMs: number,
+): Promise<CaseResult> {
+  if (!testCase.tool) {
+    return { ok: false, error: 'Case is missing required "tool" field' }
   }
+  const outcome = await session.callTool(testCase.tool, testCase.args ?? {}, timeoutMs)
+
+  if (testCase.expectError !== undefined) {
+    if (outcome.kind === 'result') {
+      return {
+        ok: false,
+        error: 'Expected an error but tool call succeeded',
+        expected: testCase.expectError as JsonValue,
+        actual: outcome.result,
+      }
+    }
+    return matchExpectedError(testCase.expectError, outcome.error)
+  }
+
+  if (outcome.kind === 'error') {
+    const label = outcome.error.codeName ? ` [${outcome.error.codeName}]` : ''
+    return { ok: false, error: `Tool call failed${label}: ${outcome.error.message}` }
+  }
+
+  if (testCase.expect !== undefined) {
+    const mismatches = matchValue(testCase.expect, outcome.result)
+    if (mismatches.length > 0) {
+      return {
+        ok: false,
+        error: summarizeMismatches(mismatches, 'Expectation failed'),
+        expected: testCase.expect,
+        actual: outcome.result,
+      }
+    }
+  }
+  return { ok: true }
 }
 
 async function runWithTimeout<T>(fn: () => Promise<T>, timeoutMs: number): Promise<T> {
@@ -81,18 +114,6 @@ async function runWithTimeout<T>(fn: () => Promise<T>, timeoutMs: number): Promi
     return await Promise.race([fn(), timeoutPromise])
   } finally {
     if (timeoutHandle) clearTimeout(timeoutHandle)
-  }
-}
-
-async function gracefulKill(proc: ChildProcess, waitMs: number): Promise<void> {
-  try {
-    proc.kill('SIGTERM')
-  } catch {}
-  await new Promise((resolve) => setTimeout(resolve, waitMs))
-  if (proc.exitCode == null) {
-    try {
-      proc.kill('SIGKILL')
-    } catch {}
   }
 }
 
@@ -110,14 +131,9 @@ export class Runner {
     const files = await resolveCaseFiles(this.options.globs, casesBaseDir)
     if (files.length === 0) return 0
     this.display.onStart(files.length)
-    const { cmd, args = [], env = {}, cwd = '.' } = this.options.server
-    const proc = spawn(cmd, args, {
-      cwd,
-      env: { ...process.env, ...env },
-      stdio: ['pipe', 'pipe', 'inherit'],
-    })
+    const spawnTimeoutMs = Math.max(2000, Math.min(10000, this.options.timeoutMs))
+    const session = await McpSession.start(this.options.server, spawnTimeoutMs)
     try {
-      await waitForSpawn(proc, Math.max(2000, Math.min(10000, this.options.timeoutMs)))
       let failures = 0
       const startedAt = Date.now()
       let processed = 0
@@ -125,7 +141,7 @@ export class Runner {
         const raw = fs.readFileSync(file, 'utf8')
         const data = JSON.parse(raw) as TestCase
         const { ok, error, expected, actual } = await runWithTimeout(
-          () => executeCase(proc, data),
+          () => executeCase(session, data, this.options.timeoutMs),
           this.options.timeoutMs,
         )
         if (!ok) {
@@ -149,7 +165,7 @@ export class Runner {
       })
       return failures === 0 ? 0 : 1
     } finally {
-      await gracefulKill(proc, 500)
+      await session.close()
     }
   }
 }

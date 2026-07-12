@@ -36,13 +36,13 @@ describe('Runner', () => {
       name: 'fail 1',
       tool: 'echo',
       args: { text: 'hello' },
-      expect: { tool: 'echo', args: { text: 'nope' } },
+      expect: { content: [{ type: 'text', text: 'nope' }] },
     })
     writeCase(tmp, 'fail-2', {
       name: 'fail 2',
       tool: 'echo',
       args: { text: 'world' },
-      expect: { tool: 'echo', args: { text: 'nope' } },
+      expect: { content: [{ type: 'text', text: 'nope' }] },
     })
 
     const spy = jest.spyOn(console, 'error').mockImplementation(() => {})
@@ -69,13 +69,13 @@ describe('Runner', () => {
       name: 'fail 1',
       tool: 'echo',
       args: { text: 'a' },
-      expect: { tool: 'echo', args: { text: 'x' } },
+      expect: { content: [{ type: 'text', text: 'x' }] },
     })
     writeCase(tmp, 'fail-2', {
       name: 'fail 2',
       tool: 'echo',
       args: { text: 'b' },
-      expect: { tool: 'echo', args: { text: 'y' } },
+      expect: { content: [{ type: 'text', text: 'y' }] },
     })
 
     const spy = jest.spyOn(console, 'error').mockImplementation(() => {})

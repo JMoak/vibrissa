@@ -1,0 +1,9 @@
+{
+  "name": "partial match allows extra fields",
+  "tool": "echo",
+  "args": { "text": "hello" },
+  "expect": {
+    "$partial": true,
+    "content": [{ "type": "text" }]
+  }
+}

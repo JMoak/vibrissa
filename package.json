@@ -25,7 +25,8 @@
     "typecheck": "tsc --noEmit",
     "test": "jest --config ./jest.config.cjs --runInBand --colors",
     "test:ci": "jest --config ./jest.config.cjs --reporters=default --reporters=jest-junit",
-    "e2e": "npm run build && node bin/vib-test.js --config tests/fixtures/echo-server/vibrissa.json --cases \"tests/fixtures/echo-server/cases/**/*.json\"",
+    "e2e": "npm run build && node bin/vib-test.js --config tests/fixtures/echo-server/vibrissa.json",
+    "e2e:demo": "npm run build && node bin/vib-test.js --config tests/fixtures/echo-server/vibrissa.json --cases \"tests/fixtures/echo-server/cases/**/*.json\"",
     "lint": "biome check . --write",
     "lint:fix": "biome check . --write --unsafe"
   },
@@ -42,6 +43,7 @@
   "homepage": "https://github.com/JMoak/vibrissa#readme",
   "devDependencies": {
     "@biomejs/biome": "^1.8.3",
+    "@swc/core": "^1.15.43",
     "@swc/jest": "^0.2.39",
     "@types/jest": "^30.0.0",
     "@types/node": "^20.19.13",
@@ -51,6 +53,7 @@
     "typescript": "^5.9.2"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "fast-glob": "^3.3.2",
     "jest-diff": "^30.1.3"
   }

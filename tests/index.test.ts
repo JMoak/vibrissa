@@ -28,16 +28,21 @@ describe('index exports', () => {
         name: 'pass',
         tool: 'echo',
         args: { text: 'x' },
-        expect: { tool: 'echo', args: { text: 'x' } },
+        expect: { content: [{ type: 'text', text: 'x' }] },
       }),
       'utf8',
     )
 
     const code = await runCases({
-      server: { cmd: 'node', args: ['dist/index.js'], cwd: '.', env: { FOO: 'BAR' } },
+      server: {
+        cmd: 'node',
+        args: ['tests/fixtures/echo-server/server/index.js'],
+        cwd: '.',
+        env: { FOO: 'BAR' },
+      },
       globs: [path.join(tmp, '**/*.json')],
       concurrency: 1,
-      timeoutMs: 1000,
+      timeoutMs: 10000,
       failFast: true,
       reportPath: undefined,
       hooks: undefined,

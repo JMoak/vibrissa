@@ -1,0 +1,8 @@
+{
+  "name": "fail tool reports execution error",
+  "tool": "fail",
+  "args": { "message": "boom goes the reactor" },
+  "expectError": {
+    "message": { "$regex": "boom" }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "name": "regex match with flags",
+  "tool": "echo",
+  "args": { "text": "hello", "uppercase": true },
+  "expect": {
+    "content": [{ "type": "text", "text": { "$regex": "^hel+o$", "flags": "i" } }]
+  }
+}

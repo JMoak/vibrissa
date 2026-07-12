@@ -1,6 +1,6 @@
 {
-  "name": "echo mismatch",
+  "name": "echo uppercase",
   "tool": "echo",
-  "args": { "text": "hello" },
+  "args": { "text": "hello", "uppercase": true },
   "expect": { "content": [{ "type": "text", "text": "HELLO" }] }
 }
