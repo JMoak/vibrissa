@@ -24,16 +24,23 @@ export class ConsoleResultsDisplay implements ResultsDisplay {
 
 const RESET = '\x1b[0m'
 const BOLD = '\x1b[1m'
-const DIM = '\x1b[2m'
 const FG_RED = '\x1b[31m'
 const FG_GREEN = '\x1b[32m'
 const FG_CYAN = '\x1b[36m'
 const FG_GRAY = '\x1b[90m'
-const BG_RED = '\x1b[41m'
-const BG_GREEN = '\x1b[42m'
 
 function color(text: string, code: string): string {
   return `${code}${text}${RESET}`
+}
+
+function visibleLength(text: string): number {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping ANSI escapes
+  return text.replace(/\x1b\[[0-9;]*m/g, '').length
+}
+
+function boxLine(content: string, width: number): string {
+  const pad = Math.max(0, width - 2 - visibleLength(content))
+  return `|${content}${' '.repeat(pad)}|`
 }
 
 function padCenter(text: string, width: number): string {
@@ -81,20 +88,23 @@ export class PrettyConsoleResultsDisplay implements ResultsDisplay {
     const width = 64
     const top = `+${'='.repeat(width - 2)}+`
     const mid = `+${'-'.repeat(width - 2)}+`
-    const titleRaw = padCenter('vib-test results', width - 2)
-    const title = `|${color(BOLD + color(titleRaw, FG_CYAN), '')}|`
+    const title = boxLine(color(padCenter('vib-test results', width - 2), BOLD + FG_CYAN), width)
 
-    const totalsLine = `| Total: ${color(String(summary.total), FG_CYAN)}  | Passed: ${color(String(summary.passed), FG_GREEN)}  | Failed: ${color(String(summary.failed), FG_RED)}  | Duration: ${color(formatDuration(summary.durationMs), FG_GRAY)}${' '.repeat(Math.max(0, width - 2 - ('| Total:  | Passed:   | Failed:   | Duration: '.length + String(summary.total).length + String(summary.passed).length + String(summary.failed).length + formatDuration(summary.durationMs).length)))}|`
+    const totals = [
+      ` Total: ${color(String(summary.total), FG_CYAN)} `,
+      ` Passed: ${color(String(summary.passed), FG_GREEN)} `,
+      ` Failed: ${color(String(summary.failed), FG_RED)} `,
+      ` Duration: ${color(formatDuration(summary.durationMs), FG_GRAY)}`,
+    ].join(' |')
 
     console.log(top)
     console.log(title)
     console.log(mid)
-    console.log(totalsLine)
+    console.log(boxLine(totals, width))
 
     if (this.failed.length > 0) {
       console.log(mid)
-      const header = `| Failures (${this.failed.length}):${' '.repeat(width - 14 - String(this.failed.length).length)}|`
-      console.log(color(header, FG_RED))
+      console.log(color(boxLine(` Failures (${this.failed.length}):`, width), FG_RED))
       const maxList = 10
       for (let i = 0; i < Math.min(this.failed.length, maxList); i++) {
         const f = this.failed[i]
@@ -102,8 +112,7 @@ export class PrettyConsoleResultsDisplay implements ResultsDisplay {
         const maxContent = width - 3
         const trimmed =
           lineRaw.length > maxContent ? `${lineRaw.slice(0, maxContent - 3)}...` : lineRaw
-        const line = `| ${trimmed}${' '.repeat(Math.max(0, width - 3 - trimmed.length))}|`
-        console.log(color(line, FG_RED))
+        console.log(color(boxLine(` ${trimmed}`, width), FG_RED))
 
         if (f.error?.includes('::')) {
           const idx = f.error.indexOf('::')
@@ -124,8 +133,7 @@ export class PrettyConsoleResultsDisplay implements ResultsDisplay {
         }
       }
       if (this.failed.length > maxList) {
-        const more = `| ...and ${this.failed.length - maxList} more${' '.repeat(Math.max(0, width - 14 - String(this.failed.length - maxList).length))}|`
-        console.log(color(more, FG_RED))
+        console.log(color(boxLine(` ...and ${this.failed.length - maxList} more`, width), FG_RED))
       }
     }
 

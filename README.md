@@ -146,6 +146,12 @@ Optional: add an NPM script
 }
 ```
 
+Note: `expect` is matched against the **entire** `tools/call` result object. If your server
+returns fields beyond `content` (e.g. `structuredContent`, `_meta`), an exact match will fail
+with an "unexpected key" mismatch — either include those fields in `expect` or set
+`"$partial": true` to assert only the fields you care about. `vib record` captures the full
+result, so recorded cases are always exact-match ready.
+
 ### CLI â€” vib / vib-test
 
 Subcommands (default is `run` when omitted):

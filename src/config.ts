@@ -49,7 +49,6 @@ export function stripJsonComments(input: string): string {
         stringQuote = null
       }
       escaped = !escaped && char === '\\'
-      if (escaped && stringQuote === '\\') escaped = false
       continue
     }
 

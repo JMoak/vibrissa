@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { describe, expect, it, vi } from 'vitest'
 import { callCommand } from '../src/cli/call'
 import { initCommand } from '../src/cli/init'
 import { recordCommand } from '../src/cli/record'
@@ -14,7 +15,7 @@ function mkTmpDir(): string {
 
 describe('dev-loop CLI commands', () => {
   it('tools lists echo and fail', async () => {
-    const log = jest.spyOn(console, 'log').mockImplementation(() => {})
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
     try {
       const code = await toolsCommand(['--config', fixtureConfig, '--json'])
       expect(code).toBe(0)
@@ -26,7 +27,7 @@ describe('dev-loop CLI commands', () => {
   })
 
   it('call returns the tool result', async () => {
-    const log = jest.spyOn(console, 'log').mockImplementation(() => {})
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
     try {
       const code = await callCommand([
         'echo',
@@ -51,7 +52,7 @@ describe('dev-loop CLI commands', () => {
   it('record writes a case file from a live call', async () => {
     const tmp = mkTmpDir()
     const out = path.join(tmp, 'echo.recorded.json')
-    const log = jest.spyOn(console, 'log').mockImplementation(() => {})
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
     try {
       const code = await recordCommand([
         'echo',
@@ -81,7 +82,7 @@ describe('dev-loop CLI commands', () => {
     const tmp = mkTmpDir()
     const out = path.join(tmp, 'exists.json')
     fs.writeFileSync(out, '{}\n', 'utf8')
-    const err = jest.spyOn(console, 'error').mockImplementation(() => {})
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {})
     try {
       const code = await recordCommand([
         'echo',
@@ -106,7 +107,7 @@ describe('dev-loop CLI commands', () => {
       JSON.stringify({ name: 'demo', version: '0.0.0', scripts: {} }),
       'utf8',
     )
-    const log = jest.spyOn(console, 'log').mockImplementation(() => {})
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
     try {
       const code = await initCommand(['--dir', tmp, '--server', 'node server/index.js'])
       expect(code).toBe(0)

@@ -1,3 +1,4 @@
+import { describe, expect, it } from 'vitest'
 import { matchValue, matches } from '../src/match'
 import type { JsonValue } from '../src/types'
 

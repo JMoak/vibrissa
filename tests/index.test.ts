@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { describe, expect, it, vi } from 'vitest'
 import { defaultRunCasesOptions, runCases } from '../src/index'
 
 describe('index exports', () => {
@@ -15,7 +16,7 @@ describe('index exports', () => {
   })
 
   it('runCases fails loud when defaults match no cases', async () => {
-    const spy = jest.spyOn(console, 'error').mockImplementation(() => {})
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
     try {
       const code = await runCases(defaultRunCasesOptions)
       expect(code).toBe(1)

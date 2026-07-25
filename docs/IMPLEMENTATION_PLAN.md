@@ -23,16 +23,15 @@
 - Core flags:
   - `--server`, `--server-cwd`, `--env FOO=bar`
   - `--cases "tests/integration/**/*.json"`
-  - `--fail-fast`, `--concurrency N`, `--timeout ms`
-  - `--report junit.xml` (optional)
-  - `--before <script>`, `--after <script>` hooks
+  - `--fail-fast`, `--timeout ms`, `--allow-empty`
+  - Future (see FUTURE.md): concurrency, reporting, before/after hooks
 - Example:
 
 ```bash
 vib-test \
   --server "node dist/index.js" \
   --cases "tests/integration/**/*.json" \
-  --fail-fast --concurrency 4 --timeout 15000
+  --fail-fast --timeout 15000
 ```
 
 ### 5. Scope coverage
@@ -44,7 +43,7 @@ vib-test \
 
 ### 6. Library API
 - Export `runCases(options)` for programmatic control.
-- Mirrors CLI options (`server`, `globs`, `concurrency`, `failFast`, `timeoutMs`).
+- Mirrors CLI options (`server`, `globs`, `failFast`, `timeoutMs`).
 
 ### 7. CI integration
 - Build then run vib-test.

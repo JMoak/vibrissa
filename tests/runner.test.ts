@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { describe, expect, it, vi } from 'vitest'
 import { runCases } from '../src'
 
 function resolveFixtureConfig(): string {
@@ -37,7 +38,7 @@ describe('Runner', () => {
   })
 
   it('returns 1 when no cases match', async () => {
-    const spy = jest.spyOn(console, 'error').mockImplementation(() => {})
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
     try {
       const code = await runCases({
         server: { cmd: 'node', args: ['server/index.js'] },
@@ -54,7 +55,7 @@ describe('Runner', () => {
   })
 
   it('returns 0 with allowEmpty when no cases match', async () => {
-    const spy = jest.spyOn(console, 'warn').mockImplementation(() => {})
+    const spy = vi.spyOn(console, 'warn').mockImplementation(() => {})
     try {
       const code = await runCases({
         server: { cmd: 'node', args: ['server/index.js'] },
@@ -90,7 +91,7 @@ describe('Runner', () => {
       expect: { content: [{ type: 'text', text: 'nope' }] },
     })
 
-    const spy = jest.spyOn(console, 'error').mockImplementation(() => {})
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
     try {
       const code = await runCases({
         ...options,
@@ -123,7 +124,7 @@ describe('Runner', () => {
       expect: { content: [{ type: 'text', text: 'y' }] },
     })
 
-    const spy = jest.spyOn(console, 'error').mockImplementation(() => {})
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
     try {
       const code = await runCases({
         ...options,
@@ -151,7 +152,7 @@ describe('Runner', () => {
       expect: { content: [{ type: 'text', text: 'ok' }] },
     })
 
-    const spy = jest.spyOn(console, 'error').mockImplementation(() => {})
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
     try {
       const code = await runCases({
         ...options,

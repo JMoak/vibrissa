@@ -1,3 +1,4 @@
+import { describe, expect, it } from 'vitest'
 import { parseArgValue, parseEnvPairs, parseToolArgs, splitCommandLine } from '../src/cli/args'
 
 describe('cli args helpers', () => {
