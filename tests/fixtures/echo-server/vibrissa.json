@@ -2,7 +2,6 @@
   "$schema": "../../../schema/vibrissa.schema.json",
   "server": { "cmd": "node", "args": ["server/index.js"], "cwd": "." },
   "globs": ["cases/**/*.json", "!cases/**/*.fail.json"],
-  "concurrency": 1,
   "timeoutMs": 3000,
   "failFast": false
 }

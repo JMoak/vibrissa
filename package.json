@@ -25,7 +25,9 @@
     "dev": "tsup src/cli.ts src/index.ts --format esm --target node20 --dts --watch --sourcemap --external fast-glob",
     "typecheck": "tsc --noEmit",
     "test": "jest --config ./jest.config.cjs --runInBand --colors",
-    "test:ci": "jest --config ./jest.config.cjs --reporters=default --reporters=jest-junit",
+    "test:ci": "jest --config ./jest.config.cjs --runInBand --reporters=default --reporters=jest-junit",
+    "prepublishOnly": "npm run build && npm run typecheck && npm test",
+    "changeset": "changeset",
     "e2e": "npm run build && node bin/vib-test.js --config tests/fixtures/echo-server/vibrissa.json",
     "e2e:demo": "npm run build && node bin/vib-test.js --config tests/fixtures/echo-server/vibrissa.json --cases \"tests/fixtures/echo-server/cases/**/*.json\"",
     "lint": "biome check . --write",
@@ -36,14 +38,18 @@
     "url": "git+https://github.com/JMoak/vibrissa.git"
   },
   "keywords": ["mcp", "integration", "testing"],
-  "author": "",
+  "author": "Jordan Moak",
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "bugs": {
     "url": "https://github.com/JMoak/vibrissa/issues"
   },
   "homepage": "https://github.com/JMoak/vibrissa#readme",
   "devDependencies": {
     "@biomejs/biome": "^1.8.3",
+    "@changesets/cli": "^2.31.1",
     "@swc/core": "^1.15.43",
     "@swc/jest": "^0.2.39",
     "@types/jest": "^30.0.0",

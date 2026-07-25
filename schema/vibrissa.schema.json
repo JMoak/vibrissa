@@ -21,34 +21,11 @@
       }
     },
     "globs": { "type": "array", "items": { "type": "string" } },
-    "concurrency": { "type": "integer", "minimum": 1 },
     "timeoutMs": { "type": "integer", "minimum": 0 },
     "failFast": { "type": "boolean" },
     "allowEmpty": {
       "type": "boolean",
       "description": "If true, matching zero case files exits 0. Default false (fail loud)."
-    },
-    "reportPath": { "type": "string" },
-    "hooks": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "before": { "type": "string" },
-        "after": { "type": "string" }
-      }
-    },
-    "profiles": {
-      "type": "object",
-      "additionalProperties": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "concurrency": { "type": "integer", "minimum": 1 },
-          "timeoutMs": { "type": "integer", "minimum": 0 },
-          "failFast": { "type": "boolean" },
-          "reportPath": { "type": "string" }
-        }
-      }
     }
   }
 }

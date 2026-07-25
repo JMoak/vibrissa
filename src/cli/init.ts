@@ -49,7 +49,6 @@ export async function initCommand(argv: string[]): Promise<number> {
       cwd: '.',
     },
     globs: ['tests/integration/**/*.json'],
-    concurrency: 1,
     timeoutMs: 15000,
     failFast: false,
   }

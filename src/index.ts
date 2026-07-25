@@ -1,4 +1,4 @@
-export type { HooksConfig, RunCasesOptions, ServerConfig, TestCase, JsonValue } from './types.js'
+export type { RunCasesOptions, ServerConfig, TestCase, JsonValue } from './types.js'
 export { defaultRunCasesOptions } from './defaults.js'
 export { matches, matchValue } from './match.js'
 export type { Mismatch } from './match.js'

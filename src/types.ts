@@ -5,20 +5,12 @@ export interface ServerConfig {
   env?: Record<string, string>
 }
 
-export interface HooksConfig {
-  before?: string
-  after?: string
-}
-
 export interface RunCasesOptions {
   server: ServerConfig
   globs: string[]
-  concurrency: number
   timeoutMs: number
   failFast: boolean
   display?: 'plain' | 'pretty'
-  reportPath?: string
-  hooks?: HooksConfig
   rootDir?: string
   allowEmpty?: boolean
 }

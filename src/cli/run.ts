@@ -7,7 +7,6 @@ import { mergeCliOptions, parseCommonFlags } from './resolve.js'
 export async function runCommand(argv: string[]): Promise<number> {
   const flags = parseCommonFlags(argv)
   const casesGlob = takeFlag(argv, '--cases')
-  const concurrencyRaw = takeFlag(argv, '--concurrency')
   const failFast = hasFlag(argv, '--fail-fast')
   const allowEmpty = hasFlag(argv, '--allow-empty')
   let display: 'plain' | 'pretty' | undefined
@@ -15,11 +14,6 @@ export async function runCommand(argv: string[]): Promise<number> {
   if (hasFlag(argv, '--no-pretty')) display = 'plain'
   const displayFlag = takeFlag(argv, '--display')
   if (displayFlag === 'plain' || displayFlag === 'pretty') display = displayFlag
-
-  const concurrency =
-    concurrencyRaw !== undefined && Number.isFinite(Number(concurrencyRaw))
-      ? Number(concurrencyRaw)
-      : undefined
 
   const options = mergeCliOptions(flags, {
     ...(display ? { display } : {}),
@@ -32,7 +26,6 @@ export async function runCommand(argv: string[]): Promise<number> {
           ],
         }
       : {}),
-    ...(typeof concurrency === 'number' ? { concurrency } : {}),
     ...(failFast ? { failFast: true } : {}),
     ...(allowEmpty ? { allowEmpty: true } : {}),
   })

@@ -42,7 +42,6 @@ describe('Runner', () => {
       const code = await runCases({
         server: { cmd: 'node', args: ['server/index.js'] },
         globs: ['does-not-exist/**/*.json'],
-        concurrency: 1,
         timeoutMs: 1000,
         failFast: true,
         rootDir: path.join(process.cwd(), 'tests/fixtures/echo-server'),
@@ -60,7 +59,6 @@ describe('Runner', () => {
       const code = await runCases({
         server: { cmd: 'node', args: ['server/index.js'] },
         globs: ['does-not-exist/**/*.json'],
-        concurrency: 1,
         timeoutMs: 1000,
         failFast: true,
         allowEmpty: true,
@@ -134,6 +132,35 @@ describe('Runner', () => {
       })
       expect(code).toBe(1)
       expect(spy).toHaveBeenCalledTimes(2)
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('reports a malformed case file as a failure and keeps running', async () => {
+    const configPath = resolveFixtureConfig()
+    const { resolveOptions } = await import('../src/config')
+    const options = resolveOptions(path.dirname(configPath), configPath)
+
+    const tmp = mkTmpDir()
+    fs.writeFileSync(path.join(tmp, 'a-broken.json'), '{ not valid json', 'utf8')
+    writeCase(tmp, 'b-pass', {
+      name: 'pass after broken',
+      tool: 'echo',
+      args: { text: 'ok' },
+      expect: { content: [{ type: 'text', text: 'ok' }] },
+    })
+
+    const spy = jest.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const code = await runCases({
+        ...options,
+        globs: [path.join(tmp, '**/*.json').replace(/\\/g, '/')],
+        failFast: false,
+      })
+      expect(code).toBe(1)
+      expect(spy).toHaveBeenCalledTimes(1)
+      expect(spy).toHaveBeenCalledWith(expect.stringMatching(/Failed to load case file/))
     } finally {
       spy.mockRestore()
     }

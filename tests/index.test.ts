@@ -9,7 +9,6 @@ describe('index exports', () => {
     expect(defaultRunCasesOptions.server.cwd).toBe('.')
     expect(Array.isArray(defaultRunCasesOptions.globs)).toBe(true)
     expect(defaultRunCasesOptions.globs[0]).toBe('tests/integration/**/*.json')
-    expect(defaultRunCasesOptions.concurrency).toBeGreaterThan(0)
     expect(defaultRunCasesOptions.timeoutMs).toBeGreaterThanOrEqual(0)
     expect(defaultRunCasesOptions.failFast).toBe(false)
     expect(defaultRunCasesOptions.allowEmpty).toBe(false)
@@ -47,7 +46,6 @@ describe('index exports', () => {
         env: { FOO: 'BAR' },
       },
       globs: [path.join(tmp, '**/*.json').replace(/\\/g, '/')],
-      concurrency: 1,
       timeoutMs: 10000,
       failFast: true,
       rootDir: path.join(process.cwd(), 'tests/fixtures/echo-server'),

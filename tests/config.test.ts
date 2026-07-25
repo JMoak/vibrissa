@@ -13,10 +13,8 @@ describe('config resolution', () => {
     const json = JSON.stringify({
       server: { cmd: 'node', args: ['custom.js'], env: { FOO: 'bar' } },
       globs: ['tests/**/*.json'],
-      concurrency: 2,
       timeoutMs: 12345,
       failFast: true,
-      reportPath: 'reports/junit.xml',
     })
     fs.writeFileSync(path.join(tmp, 'vibrissa.json'), json, 'utf8')
 
@@ -28,10 +26,8 @@ describe('config resolution', () => {
     expect(resolved.server.cwd).toBe('.')
     expect(resolved.server.env?.FOO).toBe('bar')
     expect(resolved.globs).toEqual(['tests/**/*.json'])
-    expect(resolved.concurrency).toBe(2)
     expect(resolved.timeoutMs).toBe(12345)
     expect(resolved.failFast).toBe(true)
-    expect(resolved.reportPath).toBe('reports/junit.xml')
   })
 
   it('sets rootDir to the config file directory for explicit paths', () => {

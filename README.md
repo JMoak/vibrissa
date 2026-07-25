@@ -218,14 +218,8 @@ Create a `vibrissa.json` in your project root to avoid repeating flags and enabl
   "globs": [
     "tests/integration/**/*.json"
   ],
-  "concurrency": 4,
   "timeoutMs": 15000,
-  "failFast": false,
-  "reportPath": "reports/junit/junit.xml",
-  "hooks": {
-    "before": "node scripts/before.js",
-    "after": "node scripts/after.js"
-  }
+  "failFast": false
 }
 ```
 
@@ -245,10 +239,8 @@ import { runCases } from "vibrissa";
 await runCases({
   server: { cmd: process.execPath, args: ["dist/index.js"], env: {} },
   globs: ["tests/integration/**/*.json"],
-  concurrency: 4,
   failFast: true,
-  timeoutMs: 15000,
-  reportPath: "reports/junit/junit.xml"
+  timeoutMs: 15000
 });
 ```
 

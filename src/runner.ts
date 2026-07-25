@@ -149,8 +149,17 @@ export class Runner {
       const startedAt = Date.now()
       let processed = 0
       for (const file of files) {
-        const raw = fs.readFileSync(file, 'utf8')
-        const data = JSON.parse(raw) as TestCase
+        let data: TestCase
+        try {
+          data = JSON.parse(fs.readFileSync(file, 'utf8')) as TestCase
+        } catch (err) {
+          failures++
+          const reason = err instanceof Error ? err.message : String(err)
+          this.display.onCaseFail(path.basename(file), `Failed to load case file: ${reason}`)
+          processed++
+          if (this.options.failFast) break
+          continue
+        }
         const { ok, error, expected, actual } = await runWithTimeout(
           () => executeCase(session, data, this.options.timeoutMs),
           this.options.timeoutMs,
