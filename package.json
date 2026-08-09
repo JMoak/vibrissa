@@ -37,11 +37,21 @@
     "type": "git",
     "url": "git+https://github.com/JMoak/vibrissa.git"
   },
-  "keywords": ["mcp", "integration", "testing"],
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "mcp-testing",
+    "integration",
+    "testing",
+    "test-runner",
+    "cli",
+    "claude"
+  ],
   "author": "Jordan Moak",
   "license": "MIT",
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "provenance": true
   },
   "bugs": {
     "url": "https://github.com/JMoak/vibrissa/issues"

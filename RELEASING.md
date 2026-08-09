@@ -10,15 +10,20 @@ exist anywhere). This document covers the one-time setup and the day-to-day flow
    - Enable 2FA with a **passkey/FIDO** authenticator (TOTP is being phased out).
    - Do not create any long-lived automation tokens; none are needed.
 
-2. **First publish must be local** (first-ever OIDC publishes of a new package are flaky —
-   see [npm/cli#8976](https://github.com/npm/cli/issues/8976)):
+2. **First publish must be local** — trusted publishing cannot bootstrap a package that does not
+   exist yet ([npm/cli#8544](https://github.com/npm/cli/issues/8544), still open as of Aug 2026);
+   the trusted-publisher config can only be created on an existing package.
 
    ```bash
    npm login
-   npm publish --access public
+   npm publish --access public --provenance false
    ```
 
-   `prepublishOnly` builds, typechecks, and tests automatically, so a stale `dist/` cannot ship.
+   `--provenance false` is required for this one local publish: `publishConfig.provenance` is
+   enabled in package.json for CI, and provenance generation fails outside a supported CI
+   environment. `prepublishOnly` builds, typechecks, and tests automatically, so a stale `dist/`
+   cannot ship. Local publishes use a short-lived (2-hour) session with 2FA; classic tokens no
+   longer exist on npm (revoked Dec 2025).
 
 3. **Configure the trusted publisher** on the package's npmjs.com settings page
    (Settings → Trusted Publisher):
@@ -27,13 +32,18 @@ exist anywhere). This document covers the one-time setup and the day-to-day flow
    - Repository: `vibrissa`
    - Workflow filename: `release.yml`
    - Environment: leave blank (or create one and add it here *and* in the workflow)
+   - **Allowed actions**: configs created after May 20, 2026 must explicitly select
+     `npm publish`, `npm stage publish`, or both. Select **`npm stage publish`** (see step 4).
 
 4. **Lock it down** (package Settings → Publishing access):
    - Set publishing access to **"Require two-factor authentication and disallow tokens"**
      equivalent — with trusted publishing configured, choose the option that disallows tokens.
-   - Optional extra gate: enable [staged publishing](https://docs.npmjs.com/staged-publishing/)
-     so CI stages the tarball and a human approves each release with 2FA before it goes live.
-     If enabled, change the workflow publish command to `npm stage publish` semantics per the docs.
+   - Enable [staged publishing](https://docs.npmjs.com/staged-publishing/) — **GA since
+     May 2026** (npm CLI >= 11.15.0): CI runs `npm stage publish` via OIDC, then a human
+     approves with 2FA (`npm stage list` / `npm stage view` / `npm stage approve`) before the
+     version goes live. This is the single best defense against CI-credential-theft worms
+     (Shai-Hulud class), which republish instantly with stolen credentials. When enabling,
+     change the workflow publish command to `npm stage publish` semantics per the docs.
 
 ## Day-to-day flow
 
@@ -53,6 +63,15 @@ exist anywhere). This document covers the one-time setup and the day-to-day flow
    `changeset publish`, authenticating via OIDC. Provenance attestations are generated
    automatically (npm ≥ 11.5.1) and appear on the npm package page, linking the artifact to the
    exact commit and workflow run.
+
+4. With staged publishing enabled, the CI publish lands in the staging queue instead of going
+   live. Review and release it with 2FA:
+
+   ```bash
+   npm stage list
+   npm stage view vibrissa@<version>
+   npm stage approve vibrissa@<version>
+   ```
 
 ## Invariants
 

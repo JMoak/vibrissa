@@ -1,10 +1,10 @@
-﻿## vibrissa (whisker) â€” JSONâ€‘Driven MCP Integration Test Runner
+## vibrissa (whisker) — JSON‑Driven MCP Integration Test Runner
 
-Endâ€‘toâ€‘end test your MCP server over stdio using declarative JSON cases. Ship stable, contractâ€‘focused integration suites that humans can review and LLMs can author.
+End‑to‑end test your MCP server over stdio using declarative JSON cases. Ship stable, contract‑focused integration suites that humans can review and LLMs can author.
 
 ### Why Vibrissa?
-- Integrationâ€‘first: validates real I/O over MCP stdio
-- JSON cases: simple, diffâ€‘friendly, easy to generate
+- Integration‑first: validates real I/O over MCP stdio
+- JSON cases: simple, diff‑friendly, easy to generate
 - Powerful matching: exact, partial, regex, wildcard, unordered arrays
 - Flexible: CLI (`vib-test`) or library API
 
@@ -104,7 +104,7 @@ Optional: add an NPM script
   }
 }
 ```
-- Wildcard (globâ€‘like)
+- Wildcard (glob‑like)
 ```json
 {
   "expect": {
@@ -152,7 +152,7 @@ with an "unexpected key" mismatch — either include those fields in `expect` or
 `"$partial": true` to assert only the fields you care about. `vib record` captures the full
 result, so recorded cases are always exact-match ready.
 
-### CLI â€” vib / vib-test
+### CLI — vib / vib-test
 
 Subcommands (default is `run` when omitted):
 
@@ -170,11 +170,11 @@ vib inspect          # opens MCP Inspector with the same server config
 | `run` | Execute JSON cases (CI gate) |
 | `tools` | List tools + argument shapes |
 | `call` | One-shot `tools/call`, print result |
-| `record` | One-shot call â†’ write a golden case file |
+| `record` | One-shot call → write a golden case file |
 | `init` | Scaffold `vibrissa.json` + sample case + npm script |
 | `inspect` | Launch [MCP Inspector](https://modelcontextprotocol.io/docs/tools/inspector) against this server |
 
-**Division of labor:** use Inspector for visual exploration and debugging; use Vibrissa `tools` â†’ `call` â†’ `record` â†’ `run` for the authoring/regression loop. `inspect` reuses your `vibrissa.json` server block so you do not re-type command/args/env.
+**Division of labor:** use Inspector for visual exploration and debugging; use Vibrissa `tools` → `call` → `record` → `run` for the authoring/regression loop. `inspect` reuses your `vibrissa.json` server block so you do not re-type command/args/env.
 
 Shared options:
 - **--config**: path to your config file (otherwise auto-discovered from the current directory)
@@ -276,7 +276,7 @@ jobs:
 ### What to Test
 - Tools contract: `listTools`, `tools/call`
 - Arg validation: codes/messages for bad inputs
-- Multiâ€‘step flows: sequences across tools
+- Multi‑step flows: sequences across tools
 - Streaming/long ops: use partial/regex for stability
 - Optional performance thresholds per case
 
