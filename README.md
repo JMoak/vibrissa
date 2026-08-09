@@ -14,12 +14,12 @@ End‑to‑end test your MCP server over stdio using declarative JSON cases. Shi
 
 ### Install
 ```bash
-npm i -D vibrissa
+npm i -D @jmoak/vibrissa
 ```
 
 ### Quickstart
 ```bash
-npm i -D vibrissa
+npm i -D @jmoak/vibrissa
 vib init
 # edit vibrissa.json server block if needed
 vib tools
@@ -33,7 +33,7 @@ Or scaffold by hand:
 1) Create `vibrissa.json` in your MCP server repo (root):
 ```json
 {
-  "$schema": "./node_modules/vibrissa/schema/vibrissa.schema.json",
+  "$schema": "./node_modules/@jmoak/vibrissa/schema/vibrissa.schema.json",
   "server": { "cmd": "node", "args": ["dist/index.js"] },
   "globs": ["tests/integration/**/*.json"]
 }
@@ -212,7 +212,7 @@ Create a `vibrissa.json` in your project root to avoid repeating flags and enabl
 
 ```json
 {
-  "$schema": "./node_modules/vibrissa/schema/vibrissa.schema.json",
+  "$schema": "./node_modules/@jmoak/vibrissa/schema/vibrissa.schema.json",
   "server": {
     "cmd": "node",
     "args": ["dist/index.js"],

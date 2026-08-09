@@ -1,5 +1,5 @@
 {
-  "name": "vibrissa",
+  "name": "@jmoak/vibrissa",
   "version": "0.1.0",
   "description": "Ultra-light JSON-driven MCP integration test runner",
   "type": "module",

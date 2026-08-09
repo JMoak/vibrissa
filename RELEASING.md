@@ -69,8 +69,8 @@ exist anywhere). This document covers the one-time setup and the day-to-day flow
 
    ```bash
    npm stage list
-   npm stage view vibrissa@<version>
-   npm stage approve vibrissa@<version>
+   npm stage view @jmoak/vibrissa@<version>
+   npm stage approve @jmoak/vibrissa@<version>
    ```
 
 ## Invariants
