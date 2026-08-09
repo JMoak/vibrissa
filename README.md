@@ -184,7 +184,7 @@ protocol surface. The suite is data, so it lives in your repo and reviews like c
 
 ## Authoring from tdd-dsl
 
-Cases can be emitted from a shared [`tdd-dsl`](https://github.com/JMoak/tdd-dsl)
+Cases can be emitted from a shared [`tdd-dsl`](https://github.com/Rosavera-I/tdd-dsl)
 contract (`when call` → `tool`, `given input` → `args`, `then equals` → `expect`):
 
 ```text
