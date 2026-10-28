@@ -1,6 +1,6 @@
 {
   "name": "@jmoak/vibrissa",
-  "version": "2.0.0-alpha.0",
+  "version": "2.0.0",
   "description": "Ultra-light JSON-driven MCP integration test runner",
   "type": "module",
   "engines": {
@@ -23,7 +23,13 @@
       "types": "./dist/vitest.d.ts"
     }
   },
-  "files": ["dist", "bin", "schema", "README.md", "LICENSE"],
+  "files": [
+    "dist",
+    "bin",
+    "schema",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsup src/cli.ts src/index.ts src/vitest.ts --format esm --target node20 --dts --clean --sourcemap --external fast-glob --external vitest",
     "dev": "tsup src/cli.ts src/index.ts src/vitest.ts --format esm --target node20 --dts --watch --sourcemap --external fast-glob --external vitest",
