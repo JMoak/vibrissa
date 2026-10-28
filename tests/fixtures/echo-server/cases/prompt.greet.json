@@ -1,0 +1,12 @@
+{
+  "name": "prompt: greet tersely",
+  "tags": ["prompts"],
+  "prompt": "greet",
+  "args": { "name": "Ada", "style": "terse" },
+  "expect": {
+    "description": "Greeting prompt",
+    "messages": [
+      { "role": "user", "content": { "type": "text", "text": "Say hello to Ada in a terse way." } }
+    ]
+  }
+}

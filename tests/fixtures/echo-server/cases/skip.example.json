@@ -1,0 +1,6 @@
+{
+  "name": "skipped: documents a known gap",
+  "skip": "the fixture has no streaming tool yet",
+  "tool": "echo",
+  "args": { "text": "never sent" }
+}

@@ -1,31 +1,539 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://unpkg.com/vibrissa/schema/vibrissa.schema.json",
+  "$id": "https://unpkg.com/@jmoak/vibrissa/schema/vibrissa.schema.json",
   "title": "Vibrissa Config",
+  "description": "Vibrissa config (vibrissa.json, vibrissa.jsonc, or package.json#vibrissa). Strings support ${ENV_VAR} and ${ENV_VAR:-fallback} interpolation. Precedence: defaults, then this file, then the selected profile, then CLI flags.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
-    "$schema": { "type": "string" },
-    "server": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["cmd"],
-      "properties": {
-        "cmd": { "type": "string" },
-        "args": { "type": "array", "items": { "type": "string" } },
-        "cwd": { "type": "string" },
-        "env": {
-          "type": "object",
-          "additionalProperties": { "type": "string" }
-        }
-      }
+    "$schema": {
+      "type": "string",
+      "description": "Path or URL of this schema (for editor completion)."
     },
-    "globs": { "type": "array", "items": { "type": "string" } },
-    "timeoutMs": { "type": "integer", "minimum": 0 },
-    "failFast": { "type": "boolean" },
+    "server": {
+      "$ref": "#/$defs/server",
+      "description": "v1 shorthand for servers.default."
+    },
+    "servers": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/server"
+      },
+      "description": "Named servers under test. Cases pick one with \"server\"; otherwise defaultServer is used."
+    },
+    "defaultServer": {
+      "type": "string",
+      "description": "Key into servers used when a case names no server. Default: \"default\", or the only server."
+    },
+    "globs": {
+      "description": "Case file globs relative to the config file. Prefix with ! to exclude. Default [\"tests/integration/**/*.json\"].",
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "manifest": {
+      "type": "string",
+      "description": "Manifest lock file path. Default \"tests/integration/__manifest__.json\"."
+    },
+    "manifestIgnore": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Dotted manifest paths ignored when diffing against the lock (e.g. \"server.version\", \"tools.*.description\"). Default [\"server.version\"]."
+    },
+    "outDir": {
+      "type": "string",
+      "description": "Directory for reporter artifacts (junit.xml, results.json, traces/), relative to the config file. Default \"reports\"."
+    },
+    "checks": {
+      "$ref": "#/$defs/checks"
+    },
+    "normalize": {
+      "$ref": "#/$defs/normalize"
+    },
+    "timeoutMs": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Per-request timeout in ms. Default 15000."
+    },
+    "budgetMs": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Default latency budget per case/step in ms; slower fails."
+    },
+    "failFast": {
+      "type": "boolean",
+      "description": "Stop at the first failing case. Default false."
+    },
     "allowEmpty": {
       "type": "boolean",
       "description": "If true, matching zero case files exits 0. Default false (fail loud)."
+    },
+    "reporters": {
+      "description": "Reporters to run: console, json, junit, github, tap. Default [\"console\"].",
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Run only cases carrying at least one of these tags."
+    },
+    "excludeTags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Skip cases carrying any of these tags."
+    },
+    "grep": {
+      "type": "string",
+      "description": "Run only cases whose name matches this regular expression."
+    },
+    "repeat": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Run every case N times and report pass rates (flake detection)."
+    },
+    "shard": {
+      "$ref": "#/$defs/shard"
+    },
+    "concurrency": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Parallel workers (one server session each). Default 1."
+    },
+    "update": {
+      "type": "boolean",
+      "description": "Rewrite failing goldens from live output (like jest -u)."
+    },
+    "trace": {
+      "type": "boolean",
+      "description": "Write JSON-RPC transcripts for every case, not only failures."
+    },
+    "check": {
+      "type": "boolean",
+      "description": "Also run spec-sanity checks and description lint."
+    },
+    "baseline": {
+      "type": "string",
+      "description": "Previous results file; fail only on regressions against it."
+    },
+    "hooks": {
+      "$ref": "#/$defs/hooks"
+    },
+    "profiles": {
+      "type": "object",
+      "description": "Named overlays merged over the base config with --profile <name>.",
+      "additionalProperties": {
+        "type": "object",
+        "description": "A profile: any config key except profiles; servers entries patch the base by name.",
+        "additionalProperties": false,
+        "properties": {
+          "server": {
+            "$ref": "#/$defs/serverPatch",
+            "description": "Override for servers.default (v1 sugar)."
+          },
+          "servers": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/$defs/serverPatch"
+            },
+            "description": "Per-server overrides, merged into the base servers by name."
+          },
+          "defaultServer": {
+            "type": "string",
+            "description": "Key into servers used when a case names no server. Default: \"default\", or the only server."
+          },
+          "globs": {
+            "description": "Case file globs relative to the config file. Prefix with ! to exclude. Default [\"tests/integration/**/*.json\"].",
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            ]
+          },
+          "manifest": {
+            "type": "string",
+            "description": "Manifest lock file path. Default \"tests/integration/__manifest__.json\"."
+          },
+          "manifestIgnore": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Dotted manifest paths ignored when diffing against the lock (e.g. \"server.version\", \"tools.*.description\"). Default [\"server.version\"]."
+          },
+          "outDir": {
+            "type": "string",
+            "description": "Directory for reporter artifacts (junit.xml, results.json, traces/), relative to the config file. Default \"reports\"."
+          },
+          "checks": {
+            "$ref": "#/$defs/checks"
+          },
+          "normalize": {
+            "$ref": "#/$defs/normalize"
+          },
+          "timeoutMs": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Per-request timeout in ms. Default 15000."
+          },
+          "budgetMs": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Default latency budget per case/step in ms; slower fails."
+          },
+          "failFast": {
+            "type": "boolean",
+            "description": "Stop at the first failing case. Default false."
+          },
+          "allowEmpty": {
+            "type": "boolean",
+            "description": "If true, matching zero case files exits 0. Default false (fail loud)."
+          },
+          "reporters": {
+            "description": "Reporters to run: console, json, junit, github, tap. Default [\"console\"].",
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            ]
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Run only cases carrying at least one of these tags."
+          },
+          "excludeTags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Skip cases carrying any of these tags."
+          },
+          "grep": {
+            "type": "string",
+            "description": "Run only cases whose name matches this regular expression."
+          },
+          "repeat": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Run every case N times and report pass rates (flake detection)."
+          },
+          "shard": {
+            "$ref": "#/$defs/shard"
+          },
+          "concurrency": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Parallel workers (one server session each). Default 1."
+          },
+          "update": {
+            "type": "boolean",
+            "description": "Rewrite failing goldens from live output (like jest -u)."
+          },
+          "trace": {
+            "type": "boolean",
+            "description": "Write JSON-RPC transcripts for every case, not only failures."
+          },
+          "check": {
+            "type": "boolean",
+            "description": "Also run spec-sanity checks and description lint."
+          },
+          "baseline": {
+            "type": "string",
+            "description": "Previous results file; fail only on regressions against it."
+          },
+          "hooks": {
+            "$ref": "#/$defs/hooks"
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "protocol": {
+      "description": "Protocol era negotiation. \"auto\" (default) probes server/discover and falls back to the 2025 initialize handshake; \"legacy\" forces the 2025 handshake; \"modern\" requires the 2026-07-28 era; a revision string or { \"pin\": \"<revision>\" } requires exactly that revision.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": ["auto", "legacy", "modern"]
+        },
+        {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+          "description": "Pin to this revision, e.g. \"2026-07-28\"."
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["pin"],
+          "properties": {
+            "pin": {
+              "type": "string",
+              "description": "Exact protocol revision to require, e.g. \"2026-07-28\"."
+            }
+          }
+        }
+      ]
+    },
+    "stdioServer": {
+      "type": "object",
+      "description": "A server spawned as a child process and spoken to over stdio.",
+      "additionalProperties": false,
+      "required": ["cmd"],
+      "properties": {
+        "cmd": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Executable to spawn (stdio transport), e.g. \"node\"."
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Arguments passed to cmd."
+        },
+        "cwd": {
+          "type": "string",
+          "description": "Working directory for the server process, relative to the config file."
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Extra environment variables for the server process (merged over the current environment)."
+        },
+        "protocol": {
+          "$ref": "#/$defs/protocol"
+        },
+        "spawnTimeoutMs": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Max time (ms) to spawn/connect and finish the handshake. Default: timeoutMs clamped to 2000..10000."
+        }
+      }
+    },
+    "httpServer": {
+      "type": "object",
+      "description": "A server reached over the Streamable HTTP transport.",
+      "additionalProperties": false,
+      "required": ["url"],
+      "properties": {
+        "url": {
+          "type": "string",
+          "pattern": "^(https?://|\\$\\{)",
+          "description": "Streamable HTTP endpoint, e.g. \"https://mcp.example.com/mcp\" (may use ${ENV} interpolation)."
+        },
+        "headers": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Static HTTP headers sent on every request, e.g. { \"Authorization\": \"Bearer ${MCP_TOKEN}\" }."
+        },
+        "protocol": {
+          "$ref": "#/$defs/protocol"
+        },
+        "spawnTimeoutMs": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Max time (ms) to spawn/connect and finish the handshake. Default: timeoutMs clamped to 2000..10000."
+        }
+      }
+    },
+    "server": {
+      "description": "A server under test: { \"cmd\": ... } for stdio or { \"url\": ... } for Streamable HTTP.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/stdioServer"
+        },
+        {
+          "$ref": "#/$defs/httpServer"
+        }
+      ]
+    },
+    "serverPatch": {
+      "type": "object",
+      "description": "Profile override for a named server. Include cmd or url to replace the entry; otherwise the listed fields patch the base entry.",
+      "additionalProperties": false,
+      "properties": {
+        "cmd": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Executable to spawn (stdio transport), e.g. \"node\"."
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Arguments passed to cmd."
+        },
+        "cwd": {
+          "type": "string",
+          "description": "Working directory for the server process, relative to the config file."
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Extra environment variables for the server process (merged over the current environment)."
+        },
+        "url": {
+          "type": "string",
+          "pattern": "^(https?://|\\$\\{)",
+          "description": "Streamable HTTP endpoint, e.g. \"https://mcp.example.com/mcp\" (may use ${ENV} interpolation)."
+        },
+        "headers": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Static HTTP headers sent on every request, e.g. { \"Authorization\": \"Bearer ${MCP_TOKEN}\" }."
+        },
+        "protocol": {
+          "$ref": "#/$defs/protocol"
+        },
+        "spawnTimeoutMs": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Max time (ms) to spawn/connect and finish the handshake. Default: timeoutMs clamped to 2000..10000."
+        }
+      }
+    },
+    "normalize": {
+      "type": "object",
+      "description": "Result envelope normalization applied before matching and recording.",
+      "additionalProperties": false,
+      "properties": {
+        "stripMeta": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Glob-ish keys to strip from every _meta object. Default [\"io.modelcontextprotocol/*\"]."
+        },
+        "dropKeys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Top-level result keys to drop. Default [\"resultType\"]."
+        },
+        "ttlMs": {
+          "type": "string",
+          "enum": ["keep", "ignore"],
+          "description": "Whether list results keep their ttlMs/cacheScope cache hints. Default \"ignore\"."
+        }
+      }
+    },
+    "shard": {
+      "description": "Run only one shard of the suite: \"<index>/<total>\" (1-based) or { \"index\", \"total\" }.",
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^\\d+/\\d+$"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["index", "total"],
+          "properties": {
+            "index": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "1-based shard index."
+            },
+            "total": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Total number of shards."
+            }
+          }
+        }
+      ]
+    },
+    "checks": {
+      "type": "object",
+      "description": "Tuning for spec-sanity checks and description lint (vib check, vib run --check). Profiles extend allow and merge severity.",
+      "additionalProperties": false,
+      "properties": {
+        "allow": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Check ids to skip, e.g. [\"desc/embedded-url\"]."
+        },
+        "severity": {
+          "type": "object",
+          "description": "Per-check severity override: check id -> \"failed\" (fails the run) or \"warned\" (reported only).",
+          "additionalProperties": {
+            "type": "string",
+            "enum": ["failed", "warned"]
+          }
+        }
+      }
+    },
+    "hooks": {
+      "type": "object",
+      "description": "Suite-level steps run once per server session.",
+      "additionalProperties": false,
+      "properties": {
+        "setup": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "description": "Steps run before the first case (step shape: case.schema.json#/$defs/step)."
+        },
+        "teardown": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "description": "Steps run after the last case, even on failure (step shape: case.schema.json#/$defs/step)."
+        }
+      }
     }
   }
 }

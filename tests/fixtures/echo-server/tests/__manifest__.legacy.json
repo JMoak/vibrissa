@@ -1,0 +1,163 @@
+{
+  "vibrissa": 2,
+  "protocolVersion": "2025-11-25",
+  "server": {
+    "name": "vibrissa-echo-fixture",
+    "version": "2.0.0"
+  },
+  "capabilities": {
+    "tools": {},
+    "resources": {},
+    "prompts": {},
+    "extensions": {
+      "io.modelcontextprotocol/tasks": {}
+    }
+  },
+  "instructions": "Fixture server for Vibrissa tests.",
+  "tools": [
+    {
+      "name": "confirm",
+      "description": "Asks the client to confirm an action (MRTR elicitation), then reports the answer",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "echo",
+      "title": "Echo",
+      "description": "Echo text back, optionally uppercased",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string"
+          },
+          "uppercase": {
+            "type": "boolean"
+          }
+        },
+        "required": ["text"]
+      },
+      "annotations": {
+        "readOnlyHint": true
+      }
+    },
+    {
+      "name": "fail",
+      "description": "Always returns a tool execution error",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "sleep",
+      "description": "Waits `ms` milliseconds, then answers",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "ms": {
+            "type": "number"
+          }
+        }
+      }
+    },
+    {
+      "name": "slow",
+      "description": "Long-running work: returns a task on modern clients that support the tasks extension",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "ms": {
+            "type": "number"
+          },
+          "text": {
+            "type": "string"
+          },
+          "fail": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    {
+      "name": "typed",
+      "description": "Adds two numbers and returns structured output",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "a": {
+            "type": "number"
+          },
+          "b": {
+            "type": "number"
+          },
+          "broken": {
+            "type": "boolean",
+            "description": "Return structuredContent that violates outputSchema"
+          }
+        },
+        "required": ["a", "b"]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "sum": {
+            "type": "number"
+          }
+        },
+        "required": ["sum"]
+      }
+    }
+  ],
+  "resources": [
+    {
+      "uri": "fixture://readme",
+      "name": "readme",
+      "title": "Readme",
+      "mimeType": "text/plain"
+    }
+  ],
+  "resourceTemplates": [
+    {
+      "uriTemplate": "fixture://users/{id}",
+      "name": "user",
+      "description": "A user by id",
+      "mimeType": "application/json"
+    }
+  ],
+  "prompts": [
+    {
+      "name": "greet",
+      "title": "Greeting",
+      "description": "Ask the model to greet someone",
+      "arguments": [
+        {
+          "name": "name",
+          "description": "Who to greet",
+          "required": true
+        },
+        {
+          "name": "style",
+          "description": "Tone of the greeting",
+          "required": false
+        }
+      ]
+    }
+  ],
+  "listMeta": {
+    "tools": {},
+    "resources": {},
+    "resourceTemplates": {},
+    "prompts": {}
+  }
+}

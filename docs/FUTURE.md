@@ -1,48 +1,26 @@
-## FUTURE — Roadmap ideas for Vibrissa
+# After 2.0
 
-### Tags and filters
-- Add case metadata: `tags: string[]` on each case JSON.
-- CLI selection:
-  - `--tag <tag>`: include only cases with tag
-  - `--exclude-tag <tag>`: exclude cases with tag
-- Support multiple occurrences; combine with globs.
+The v1 roadmap that lived here (tags and filters, failure transcripts, profiles, the echo
+fixture, the Inspector wrapper) shipped in 2.0, along with most of
+[V2_SCOPE.md](./V2_SCOPE.md). What is left, roughly in priority order:
 
-Example case snippet:
-```json
-{
-  "name": "echo basic",
-  "tags": ["smoke", "tools"],
-  "tool": "echo",
-  "args": { "text": "hello" },
-  "expect": { "content": [{ "type": "text", "text": "hello" }] }
-}
-```
+| Item | Notes | Scope ref |
+|---|---|---|
+| `vib show-trace <file>` | Pretty-print `reports/traces/*.ndjson`. Transcripts are written today; only the viewer is missing. | §3.8 |
+| `vib run --watch` | Re-run affected cases on file changes; debounce; works with `--tag`. | §3.8 |
+| `vib run --perf` | p50 / p95 per tool into `reports/perf.json`. Budgets and baseline latency gating already ship. | §3.7 |
+| Matcher plugins | `registerMatcher('$semver', fn)`, mirroring `registerReporter`. | §3.11 |
+| GitHub Action | `jmoak/vibrissa-action` wrapping `vib run` with artifact upload and baseline download. `vib init --ci` covers the common case today. | §3.8 |
+| `@jmoak/vibrissa-evals` | Model-in-the-loop tool-selection evals (`expectToolCall`, `passRate`, description A/B), as a separate package so the core stays deterministic. | §3.10 |
+| `vib gen` | Opt-in LLM proposals for a starter suite; every proposal still goes through `record`. Lives with the evals package. | §3.9 |
+| Pluggable transports | Beyond stdio and Streamable HTTP. | §3.11 |
+| OAuth client credentials | Minimal non-interactive grant for HTTP servers. Today: static headers with `${ENV}` tokens. | §8 Q4 |
+| Single-binary build | For teams without Node (`npx` works today). | §8 Q6 |
 
-### Transcripts and record mode
-- On failure, persist MCP stdio transcript per case to `artifacts/transcripts/<case>.ndjson`.
-- `--record` flag to save transcripts for all runs, not just failures.
-- Include server stderr/stdout capture and a minimal HTML or JSON summary index.
+Settled by 2.0 (from V2_SCOPE §8):
 
-### Profiles
-- Extend config with `profiles` (already in schema) and load via `--profile <name>`.
-- Merge strategy: `defaults` → `config` → `profiles[name]` → CLI flags.
-- Common profiles: `smoke`, `ci`, `slow`, `perf`.
-
-Example run:
-```bash
-vib-test --profile ci
-```
-
-### Fixtures: echo server
-- Done: `tests/fixtures/echo-server/` dogfoods Vibrissa end-to-end.
-
-### MCP Inspector integration
-- `vib-test inspect` launches `@modelcontextprotocol/inspector` using the resolved Vibrissa server block (command/args/cwd/env).
-- Positioning: Inspector for visual exploration; Vibrissa for authoring (`tools`/`call`/`record`) and regression (`run`).
-- Optional CLI mode: `vib-test inspect --cli -- --method tools/list`
-
-### Watch mode
-- `vib-test --watch` to re-run affected cases on file changes.
-- Debounce changes; show succinct pass/fail summary; support `--tag` with watch.
-
-
+- Normalization strips the whole `io.modelcontextprotocol/serverInfo` stamp by default;
+  the manifest lock records server identity instead.
+- A changed description fails the manifest check by default; `--update-manifest` accepts.
+- Flows run on one session per worker and are never split across workers or shards.
+- HTTP auth is static headers only.

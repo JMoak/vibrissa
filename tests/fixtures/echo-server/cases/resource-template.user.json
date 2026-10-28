@@ -1,0 +1,9 @@
+{
+  "name": "resourceTemplate: expand and read a user",
+  "tags": ["resources"],
+  "resourceTemplate": "fixture://users/{id}",
+  "args": { "id": "7" },
+  "expect": {
+    "contents": [{ "$ref": "../shared/user-json-content.json" }]
+  }
+}

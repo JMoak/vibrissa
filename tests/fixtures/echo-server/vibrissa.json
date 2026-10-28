@@ -1,7 +1,19 @@
 {
   "$schema": "../../../schema/vibrissa.schema.json",
-  "server": { "cmd": "node", "args": ["server/index.js"], "cwd": "." },
+  "servers": {
+    "echo": { "cmd": "node", "args": ["server/index.js"], "cwd": "." }
+  },
+  "defaultServer": "echo",
   "globs": ["cases/**/*.json", "!cases/**/*.fail.json"],
+  "manifest": "tests/__manifest__.json",
   "timeoutMs": 3000,
-  "failFast": false
+  "failFast": false,
+  "profiles": {
+    "ci": { "check": true, "reporters": ["console", "junit"] },
+    "legacy": {
+      "servers": { "echo": { "protocol": "legacy" } },
+      "manifest": "tests/__manifest__.legacy.json",
+      "excludeTags": ["tasks"]
+    }
+  }
 }

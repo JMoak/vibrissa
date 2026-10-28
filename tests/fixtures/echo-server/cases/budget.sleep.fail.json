@@ -1,0 +1,7 @@
+{
+  "name": "budget: a slow call breaches its budget",
+  "tags": ["perf"],
+  "tool": "sleep",
+  "args": { "ms": 150 },
+  "budgetMs": 20
+}

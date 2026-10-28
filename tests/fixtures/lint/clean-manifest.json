@@ -1,0 +1,301 @@
+{
+  "vibrissa": 2,
+  "protocolVersion": "2026-07-28",
+  "server": {
+    "name": "notes-server",
+    "version": "1.4.2"
+  },
+  "capabilities": {
+    "tools": {
+      "listChanged": true
+    },
+    "resources": {
+      "subscribe": false,
+      "listChanged": true
+    },
+    "prompts": {
+      "listChanged": false
+    },
+    "completions": {},
+    "extensions": {
+      "io.modelcontextprotocol/tasks": {}
+    }
+  },
+  "instructions": "Notes server. Prefer notes.search over browsing the index; call session.create once per conversation and pass the returned handle to the other tools.",
+  "tools": [
+    {
+      "name": "session.create",
+      "title": "Create session",
+      "description": "Create a session and return an opaque handle. You must first call this tool before using notes.create or notes.delete; pass the returned handle as `sessionId`.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "user": {
+            "type": "string",
+            "description": "Display name for the session owner."
+          }
+        },
+        "required": ["user"],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          }
+        },
+        "required": ["sessionId"]
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "notes.search",
+      "title": "Search notes",
+      "description": "Full-text search over notes. Returns up to `limit` matches ordered by relevance, plus a `nextPageToken`; pass that token back as `cursor` to fetch the next page. Query syntax follows https://www.sqlite.org/fts5.html#full_text_query_syntax.\n\nIMPORTANT: timestamps are UTC.\n\nExample:\n\n    {\"query\": \"groceries\", \"limit\": 5}",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Search terms, e.g. \"meeting notes\"."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 20
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Opaque page token from a previous call."
+          },
+          "filter": {
+            "$ref": "#/$defs/filter"
+          }
+        },
+        "required": ["query"],
+        "$defs": {
+          "filter": {
+            "type": "object",
+            "properties": {
+              "tag": {
+                "type": "string"
+              },
+              "since": {
+                "type": "string",
+                "format": "date-time",
+                "description": "ISO-8601 timestamp (RFC 3339)."
+              }
+            }
+          }
+        }
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "notes.get",
+      "title": "Get note",
+      "description": "Fetch one note by id. Use this instead of `notes.search` when you already know the id. Call `notes.search` first if you only know the title.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z0-9]{8}$"
+          }
+        },
+        "required": ["id"]
+      },
+      "outputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "note": {
+            "$ref": "#/$defs/note"
+          },
+          "related": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/note"
+            }
+          }
+        },
+        "$defs": {
+          "note": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "body": {
+                "type": "string"
+              },
+              "tags": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": ["id", "title"]
+          }
+        }
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "notes.create",
+      "title": "Create note",
+      "description": "Create a note in the current session. Tags may include emoji such as 👩\u200d💻 or 🏳\ufe0f\u200d🌈. Very long notes (over 1 MB) are rejected.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string",
+            "description": "Handle returned by session.create."
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 200
+          },
+          "body": {
+            "type": "string",
+            "description": "Markdown body."
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "uniqueItems": true
+          }
+        },
+        "required": ["sessionId", "title"]
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "notes.delete",
+      "title": "Delete note",
+      "description": "Permanently delete a note. This cannot be undone; confirm with the user before calling this tool.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": ["sessionId", "id"]
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "notes.export",
+      "title": "Export notes (ייצוא\u200f)",
+      "description": "Export notes as a zip archive. The archive is written to the server's configured export directory; the API key for the storage backend is read from the NOTES_STORAGE_KEY environment variable on the server, never from tool arguments. Commit 3b87d0a1f2c4e5d6a7b8c9d0e1f2a3b4c5d6e7f8 introduced the format.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "format": {
+            "type": "string",
+            "enum": ["zip", "tar"]
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "bytes": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      }
+    }
+  ],
+  "resources": [
+    {
+      "uri": "notes://index",
+      "name": "index",
+      "description": "Index of all note ids and titles.",
+      "mimeType": "application/json"
+    }
+  ],
+  "resourceTemplates": [
+    {
+      "uriTemplate": "notes://{id}",
+      "name": "note",
+      "description": "A single note as Markdown.",
+      "mimeType": "text/markdown"
+    }
+  ],
+  "prompts": [
+    {
+      "name": "summarize",
+      "title": "Summarize note",
+      "description": "Summarize a note. (Persian: خلاصه\u200cسازی)",
+      "arguments": [
+        {
+          "name": "id",
+          "description": "Note id to summarize",
+          "required": true
+        },
+        {
+          "name": "style",
+          "description": "\"terse\" or \"detailed\""
+        }
+      ]
+    }
+  ],
+  "listMeta": {
+    "tools": {
+      "ttlMs": 300000,
+      "cacheScope": "public"
+    },
+    "resources": {
+      "ttlMs": 0,
+      "cacheScope": "private"
+    },
+    "resourceTemplates": {
+      "ttlMs": 60000,
+      "cacheScope": "public"
+    },
+    "prompts": {
+      "ttlMs": 60000,
+      "cacheScope": "public"
+    }
+  }
+}

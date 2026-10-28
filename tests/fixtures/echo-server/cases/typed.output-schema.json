@@ -1,0 +1,10 @@
+{
+  "name": "typed: structuredContent matches outputSchema",
+  "tags": ["schema", "smoke"],
+  "tool": "typed",
+  "args": { "a": 1, "b": 2 },
+  "expect": {
+    "content": [{ "type": "text", "text": "{\"sum\":3}" }],
+    "structuredContent": { "sum": 3 }
+  }
+}

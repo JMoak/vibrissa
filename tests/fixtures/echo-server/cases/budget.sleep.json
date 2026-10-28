@@ -1,0 +1,13 @@
+{
+  "name": "budget: a quick call stays within its budget",
+  "tags": ["perf"],
+  "steps": [
+    { "name": "short sleep", "tool": "sleep", "args": { "ms": 5 }, "budgetMs": 2000 },
+    {
+      "tool": "echo",
+      "args": { "text": "after" },
+      "expect": { "content": [{ "type": "text", "text": "after" }] }
+    }
+  ],
+  "budgetMs": 2500
+}

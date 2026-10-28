@@ -1,0 +1,7 @@
+{
+  "name": "resourceTemplate: unknown user is not found",
+  "tags": ["resources"],
+  "resourceTemplate": "fixture://users/{id}",
+  "args": { "id": "404" },
+  "expectError": { "code": "ResourceNotFound" }
+}

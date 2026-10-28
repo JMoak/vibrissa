@@ -1,43 +1,434 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://unpkg.com/vibrissa/schema/case.schema.json",
+  "$id": "https://unpkg.com/@jmoak/vibrissa/schema/case.schema.json",
   "title": "Vibrissa Test Case",
+  "description": "One Vibrissa test case: a single operation (tool, resource, resourceTemplate or prompt) with expectations, or a multi-step flow under \"steps\".",
   "type": "object",
   "additionalProperties": false,
-  "required": ["tool"],
+  "anyOf": [
+    {
+      "required": ["tool"]
+    },
+    {
+      "required": ["resource"]
+    },
+    {
+      "required": ["resourceTemplate"]
+    },
+    {
+      "required": ["prompt"]
+    },
+    {
+      "required": ["steps"]
+    }
+  ],
   "properties": {
-    "$schema": { "type": "string" },
-    "name": { "type": "string" },
-    "tool": { "type": "string", "minLength": 1 },
+    "$schema": {
+      "type": "string",
+      "description": "Path or URL of this schema (for editor completion)."
+    },
+    "name": {
+      "type": "string",
+      "description": "Human-readable name shown in reports."
+    },
+    "tool": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Tool to call (tools/call)."
+    },
+    "resource": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Resource URI to read (resources/read)."
+    },
+    "resourceTemplate": {
+      "type": "string",
+      "minLength": 1,
+      "description": "RFC 6570 URI template, expanded with args, then read (resources/read)."
+    },
+    "prompt": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Prompt to get (prompts/get)."
+    },
     "args": {
       "type": "object",
-      "additionalProperties": true
+      "additionalProperties": true,
+      "description": "Tool arguments, template variables, or prompt arguments. Strings may use {{capture}} and {{env.NAME}}."
     },
-    "expect": {},
+    "expect": {
+      "description": "Expected (normalized) result. Exact match by default; matchers start with $ ($partial, $regex, $wildcard, $unordered, $any, $type, ...)."
+    },
     "expectError": {
       "type": "object",
       "additionalProperties": false,
+      "description": "Expect the operation to fail (protocol error or tool isError result).",
       "properties": {
-        "code": { "type": "string" },
-        "message": {
+        "code": {
+          "description": "Error code name (InvalidParams, MethodNotFound, ResourceNotFound, RequestTimeout, UnsupportedProtocolVersion, ...) or numeric JSON-RPC code.",
           "oneOf": [
-            { "type": "string" },
+            {
+              "type": "string"
+            },
+            {
+              "type": "integer"
+            }
+          ]
+        },
+        "message": {
+          "description": "Exact error message, or { \"$regex\": \"...\", \"flags\": \"i\" }.",
+          "oneOf": [
+            {
+              "type": "string"
+            },
             {
               "type": "object",
               "additionalProperties": false,
+              "required": ["$regex"],
               "properties": {
-                "$regex": { "type": "string" },
-                "flags": { "type": "string" }
-              },
-              "required": ["$regex"]
+                "$regex": {
+                  "type": "string",
+                  "description": "Regular expression the message must match."
+                },
+                "flags": {
+                  "type": "string",
+                  "description": "RegExp flags, e.g. \"i\"."
+                }
+              }
             }
           ]
         }
       }
     },
+    "respond": {
+      "type": "object",
+      "description": "Scripted answers for server input requests (MRTR input_required rounds or legacy server requests), keyed by method: \"elicitation/create\", \"sampling/createMessage\", \"roots/list\". Values are the bare result, e.g. { \"action\": \"accept\", \"content\": { ... } }.",
+      "additionalProperties": true
+    },
+    "expectInputRequired": {
+      "description": "Matcher over the InputRequests map(s) the server sent before completing."
+    },
+    "expectTask": {
+      "description": "Matcher over the CreateTaskResult when the server answers with a task (tasks extension)."
+    },
+    "await": {
+      "description": "Tasks extension: poll tasks/get until the task is terminal, then match the final result. true = defaults.",
+      "oneOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "pollMs": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Poll interval in ms. Default: the task pollIntervalMs, else 500."
+            },
+            "timeoutMs": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Give up after this many ms. Default 30000."
+            }
+          }
+        }
+      ]
+    },
+    "capture": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Save values for later steps: name -> dotted path into the normalized result (e.g. \"structuredContent.id\")."
+    },
+    "budgetMs": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Fail if this step takes longer than this many ms."
+    },
+    "timeoutMs": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Per-request timeout for this step (overrides config)."
+    },
+    "ignoreErrors": {
+      "type": "boolean",
+      "description": "Never fail the case because of this step (teardown)."
+    },
+    "validateOutput": {
+      "type": "boolean",
+      "description": "Validate structuredContent against the tool's outputSchema. Default true when one is declared."
+    },
+    "normalize": {
+      "description": "Override config normalization for this step, or false to match the raw wire result.",
+      "oneOf": [
+        {
+          "const": false
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "stripMeta": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Glob-ish keys to strip from every _meta object."
+            },
+            "dropKeys": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Top-level result keys to drop."
+            },
+            "ttlMs": {
+              "type": "string",
+              "enum": ["keep", "ignore"],
+              "description": "Keep or ignore list cache hints."
+            }
+          }
+        }
+      ]
+    },
     "tags": {
       "type": "array",
-      "items": { "type": "string" }
+      "items": {
+        "type": "string"
+      },
+      "description": "Tags for --tag / --exclude-tag filtering."
+    },
+    "server": {
+      "type": "string",
+      "description": "Key into config servers; default is defaultServer."
+    },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/step"
+      },
+      "description": "Multi-step flow run on one session; top-level operation fields are ignored when present."
+    },
+    "setup": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/step"
+      },
+      "description": "Steps run before the case."
+    },
+    "teardown": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/step"
+      },
+      "description": "Steps run after the case, even when it failed."
+    },
+    "flaky": {
+      "type": "boolean",
+      "description": "Known-flaky: with --repeat, judged by pass rate instead of 100%."
+    },
+    "skip": {
+      "description": "Skip this case (true, or a reason string).",
+      "oneOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "step": {
+      "type": "object",
+      "description": "One operation in a flow, with its expectations.",
+      "additionalProperties": false,
+      "anyOf": [
+        {
+          "required": ["tool"]
+        },
+        {
+          "required": ["resource"]
+        },
+        {
+          "required": ["resourceTemplate"]
+        },
+        {
+          "required": ["prompt"]
+        }
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Human-readable name shown in reports."
+        },
+        "tool": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Tool to call (tools/call)."
+        },
+        "resource": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Resource URI to read (resources/read)."
+        },
+        "resourceTemplate": {
+          "type": "string",
+          "minLength": 1,
+          "description": "RFC 6570 URI template, expanded with args, then read (resources/read)."
+        },
+        "prompt": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Prompt to get (prompts/get)."
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Tool arguments, template variables, or prompt arguments. Strings may use {{capture}} and {{env.NAME}}."
+        },
+        "expect": {
+          "description": "Expected (normalized) result. Exact match by default; matchers start with $ ($partial, $regex, $wildcard, $unordered, $any, $type, ...)."
+        },
+        "expectError": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Expect the operation to fail (protocol error or tool isError result).",
+          "properties": {
+            "code": {
+              "description": "Error code name (InvalidParams, MethodNotFound, ResourceNotFound, RequestTimeout, UnsupportedProtocolVersion, ...) or numeric JSON-RPC code.",
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "message": {
+              "description": "Exact error message, or { \"$regex\": \"...\", \"flags\": \"i\" }.",
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["$regex"],
+                  "properties": {
+                    "$regex": {
+                      "type": "string",
+                      "description": "Regular expression the message must match."
+                    },
+                    "flags": {
+                      "type": "string",
+                      "description": "RegExp flags, e.g. \"i\"."
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        },
+        "respond": {
+          "type": "object",
+          "description": "Scripted answers for server input requests (MRTR input_required rounds or legacy server requests), keyed by method: \"elicitation/create\", \"sampling/createMessage\", \"roots/list\". Values are the bare result, e.g. { \"action\": \"accept\", \"content\": { ... } }.",
+          "additionalProperties": true
+        },
+        "expectInputRequired": {
+          "description": "Matcher over the InputRequests map(s) the server sent before completing."
+        },
+        "expectTask": {
+          "description": "Matcher over the CreateTaskResult when the server answers with a task (tasks extension)."
+        },
+        "await": {
+          "description": "Tasks extension: poll tasks/get until the task is terminal, then match the final result. true = defaults.",
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "pollMs": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "description": "Poll interval in ms. Default: the task pollIntervalMs, else 500."
+                },
+                "timeoutMs": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "description": "Give up after this many ms. Default 30000."
+                }
+              }
+            }
+          ]
+        },
+        "capture": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Save values for later steps: name -> dotted path into the normalized result (e.g. \"structuredContent.id\")."
+        },
+        "budgetMs": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Fail if this step takes longer than this many ms."
+        },
+        "timeoutMs": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Per-request timeout for this step (overrides config)."
+        },
+        "ignoreErrors": {
+          "type": "boolean",
+          "description": "Never fail the case because of this step (teardown)."
+        },
+        "validateOutput": {
+          "type": "boolean",
+          "description": "Validate structuredContent against the tool's outputSchema. Default true when one is declared."
+        },
+        "normalize": {
+          "description": "Override config normalization for this step, or false to match the raw wire result.",
+          "oneOf": [
+            {
+              "const": false
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "stripMeta": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Glob-ish keys to strip from every _meta object."
+                },
+                "dropKeys": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Top-level result keys to drop."
+                },
+                "ttlMs": {
+                  "type": "string",
+                  "enum": ["keep", "ignore"],
+                  "description": "Keep or ignore list cache hints."
+                }
+              }
+            }
+          ]
+        }
+      }
     }
   }
 }

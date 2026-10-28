@@ -1,0 +1,5 @@
+{
+  "$partial": true,
+  "mimeType": "application/json",
+  "text": { "$regex": "^\\{\"id\":\"\\d+\",\"name\":\"user-\\d+\"\\}$" }
+}

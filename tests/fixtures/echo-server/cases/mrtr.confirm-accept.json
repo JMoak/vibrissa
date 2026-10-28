@@ -1,0 +1,13 @@
+{
+  "name": "MRTR: confirm answered with accept",
+  "tags": ["mrtr"],
+  "tool": "confirm",
+  "args": { "action": "deploy" },
+  "respond": {
+    "elicitation/create": { "action": "accept", "content": { "confirm": true } }
+  },
+  "expectInputRequired": {
+    "elicitation/create": { "$partial": true, "message": "Proceed with deploy?" }
+  },
+  "expect": { "content": [{ "type": "text", "text": "confirmed: deploy" }] }
+}

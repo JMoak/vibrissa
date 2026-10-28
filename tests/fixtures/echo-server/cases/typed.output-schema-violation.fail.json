@@ -1,0 +1,10 @@
+{
+  "name": "typed: structuredContent violates outputSchema",
+  "tags": ["schema"],
+  "tool": "typed",
+  "args": { "a": 1, "b": 2, "broken": true },
+  "expect": {
+    "content": [{ "type": "text", "text": "{\"sum\":\"3\"}" }],
+    "structuredContent": { "sum": "3" }
+  }
+}

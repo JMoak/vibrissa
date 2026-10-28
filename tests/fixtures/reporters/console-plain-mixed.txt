@@ -1,0 +1,114 @@
+vibrissa: running 6 cases on local
+  > local: echo-server 1.2.0, modern protocol 2026-07-28
+FAIL manifest drift tests/integration/__manifest__.json: 1 tool changed: echo (description)
+PASS check: tools/list is stable
+WARN check: list results carry ttlMs
+    tools/list has no ttlMs
+FAIL check: description lint
+    echo: hidden instruction "<IMPORTANT>"
+PASS echo returns input (12ms)
+FAIL create then fetch (14ms)
+    PASS 1. create [tool session.create] (5ms)
+    FAIL 2. get [tool session.get] (9ms)
+    SKIP 3. tool session.close (skipped)
+FAIL upper mismatch (8ms)
+SKIP not ready yet (skipped: waiting on server fix)
+UPD  record greeting (golden updated, 4ms)
+FAIL slow call (812ms) over 800ms budget
+WARN warning: cases/legacy.json uses the v1 "error" key; run vib migrate
+
+-- Failures (3) ------------------------------------------------
+
+FAIL create then fetch cases/flow.json
+  Step 2 (get) failed: expected "jordan", got "jo"
+
+  Steps:
+    PASS 1. create [tool session.create] (5ms)
+    FAIL 2. get [tool session.get] (9ms)
+        Expectation failed at structuredContent.user: expected "jordan", got "jo"
+    SKIP 3. tool session.close (skipped)
+
+  Mismatches (1):
+    - structuredContent.user: expected "jordan", got "jo"
+
+    - expected  - 1
+    + actual    + 1
+
+      {
+        "structuredContent": {
+    -     "user": "jordan"
+    +     "user": "jo"
+        }
+      }
+
+FAIL upper mismatch cases/upper.json
+  Expectation failed at content[0].text: expected "HELLO", got "hello"
+
+  Mismatches (2):
+    - content[0].text: expected "HELLO", got "hello"
+    - (root): unexpected key "isError" (use "$partial": true to allow extra fields)
+
+    - expected  - 2
+    + actual    + 3
+
+    @@ -2,7 +2,8 @@
+        "content": [
+          {
+            "type": "text",
+    -       "text": "HELLO"
+    +       "text": "hello"
+          }
+    -   ]
+    +   ],
+    +   "isError": false
+      }
+
+  Trace: reports/traces/upper.ndjson
+  Stderr: reports/traces/upper.stderr.log
+
+FAIL slow call cases/slow.json
+  Budget exceeded: took 812ms, budget 800ms
+
+Tip: if the new output is correct, rerun with --update to accept it.
+
+-- Manifest drift (1) ------------------------------------------
+
+FAIL tests/integration/__manifest__.json
+  1 tool changed: echo (description)
+
+    {
+      "tools": {
+        "changed": [
+          {
+            "name": "echo",
+            "field": "description",
+            "before": "Echo",
+            "after": "Echo <IMPORTANT>"
+          }
+        ]
+      }
+    }
+
+Tip: review the change, then rerun with --update-manifest to accept it.
+
+-- Updated goldens (1) -----------------------------------------
+
+UPD  record greeting cases/greet.json
+
+    - previous  - 1
+    + updated   + 1
+
+    @@ -2,7 +2,7 @@
+        "content": [
+          {
+            "type": "text",
+    -       "text": "hi"
+    +       "text": "hello there"
+          }
+        ]
+      }
+
+Checks: 1 passed, 1 failed, 1 warned
+Manifest: drift in 1 of 1
+Warnings: 1
+Result: FAILED - 6 cases: 1 passed, 3 failed, 1 skipped, 1 updated in 1.23s

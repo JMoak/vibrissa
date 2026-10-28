@@ -1,0 +1,32 @@
+{
+  "name": "flow: capture a value and reuse it",
+  "tags": ["flow", "smoke"],
+  "steps": [
+    {
+      "name": "make a handle",
+      "tool": "echo",
+      "args": { "text": "handle-42" },
+      "capture": { "handle": "content[0].text" },
+      "expect": { "content": [{ "type": "text", "text": "handle-42" }] }
+    },
+    {
+      "name": "inline interpolation",
+      "tool": "echo",
+      "args": { "text": "using {{handle}}", "uppercase": true },
+      "expect": { "content": [{ "type": "text", "text": "USING HANDLE-42" }] }
+    },
+    {
+      "name": "capture a number",
+      "tool": "typed",
+      "args": { "a": 2, "b": 3 },
+      "capture": { "sum": "structuredContent.sum" }
+    },
+    {
+      "name": "exact placeholder keeps the JSON type",
+      "tool": "typed",
+      "args": { "a": "{{sum}}", "b": 1 },
+      "expect": { "$partial": true, "structuredContent": { "sum": 6 } }
+    }
+  ],
+  "teardown": [{ "tool": "echo", "args": { "text": "bye {{handle}}" }, "ignoreErrors": true }]
+}

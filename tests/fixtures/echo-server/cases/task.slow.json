@@ -1,0 +1,9 @@
+{
+  "name": "tasks: slow work is polled to completion",
+  "tags": ["tasks"],
+  "tool": "slow",
+  "args": { "ms": 40, "text": "job" },
+  "await": { "pollMs": 10, "timeoutMs": 5000 },
+  "expectTask": { "$partial": true, "taskId": { "$type": "string" }, "status": "working" },
+  "expect": { "content": [{ "type": "text", "text": "done: job" }] }
+}

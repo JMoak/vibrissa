@@ -1,64 +1,65 @@
-## Implementation Plan — Vibrissa (vib-test)
+# Implementation plan: status
 
-### 1. Integration-first via MCP stdio
-- Exercise the server end-to-end over stdio; prioritize integration tests over unit tests.
-- Outcome: deterministic, transport-accurate validation of MCP contracts.
+Vibrissa is a JSON-driven contract tester for MCP servers. This file tracks what is built.
+The design lives in [V2_SCOPE.md](./V2_SCOPE.md) (why) and
+[V2_ARCHITECTURE.md](./V2_ARCHITECTURE.md) (how). Remaining work is in
+[FUTURE.md](./FUTURE.md).
 
-### 2. JSON-driven test cases (LLM-friendly)
-- Case schema: `name`, `tool`, `args`, `expect` (and `expectError`).
-- Store under `tests/integration/**/*.json`.
-- Encourage LLM generation and human review.
+## v1 (0.1.x): delivered
 
-### 3. Matching semantics for assertions
-- Default exact deep equality.
-- Extensions:
-  - `$partial`: allow extra fields, assert provided ones.
-  - `$regex`: regex match with flags.
-  - `$wildcard`: glob-like string matching.
-  - `$unordered`: treat arrays as sets; combine with partial.
-  - `expectError`: explicit error codes/messages.
+| Milestone | Status |
+|---|---|
+| M1: runner over MCP stdio, exact match, `expectError` | Delivered |
+| M2: `$partial`, `$regex`, `$wildcard`, `$unordered` with path-level mismatches | Delivered |
+| M3: JUnit reporting + before/after hooks | Delivered in 2.0 (`junit` reporter, `setup` / `teardown`, config `hooks`) |
+| M4: `run`, `tools`, `call`, `record`, `init`, `inspect`; case schema; `vib` / `vib-test` bins | Delivered |
+| M5: performance thresholds + streaming guidance | Delivered in 2.0 (`budgetMs`, `--baseline` latency gating, [CASES.md recipes](./CASES.md#recipes)) |
 
-### 4. CLI runner (vib-test)
-- Binary: `vib-test`.
-- Core flags:
-  - `--server`, `--server-cwd`, `--env FOO=bar`
-  - `--cases "tests/integration/**/*.json"`
-  - `--fail-fast`, `--timeout ms`, `--allow-empty`
-  - Future (see FUTURE.md): concurrency, reporting, before/after hooks
-- Example:
+## v2 (2.0.0): delivered
 
-```bash
-vib-test \
-  --server "node dist/index.js" \
-  --cases "tests/integration/**/*.json" \
-  --fail-fast --timeout 15000
-```
+From V2_SCOPE §7.
 
-### 5. Scope coverage
-- Contracts: `listTools`, `tools/call`.
-- Validation: invalid args → error codes/messages.
-- Flows: multi-step tool sequences.
-- Streaming/long ops: supported; prefer partial/regex.
-- Optional performance thresholds per case.
+**Must**
 
-### 6. Library API
-- Export `runCases(options)` for programmatic control.
-- Mirrors CLI options (`server`, `globs`, `failFast`, `timeoutMs`).
+| Item | Where |
+|---|---|
+| `@modelcontextprotocol/client` 2.x with era negotiation (`auto` / `legacy` / `modern` / pin) | `src/session/` |
+| Streamable HTTP servers | `src/session/`, [CONFIG.md](./CONFIG.md#servers) |
+| Envelope normalization | `src/normalize.ts` |
+| Resources, resource templates, prompts as cases; `discover`, `resources`, `prompts`, `read`, `get-prompt` | `src/runner.ts`, `src/cli/` |
+| Manifest lock (`vib manifest`, drift check in `vib run`, `--update-manifest`) | `src/manifest.ts` |
+| Flows with `capture` and `{{name}}` interpolation; `setup` / `teardown` / `hooks` | `src/cases.ts`, `src/runner.ts` |
+| MRTR scripting (`respond`, `expectInputRequired`) | `src/session/`, `src/runner.ts` |
+| Reporters: console, json, junit, github, tap | `src/reporters/` |
+| Transcripts on failure (`--trace` for all) | `src/runner.ts` |
+| `--update` (and `--update=all`) | `src/runner.ts` |
+| Tags, grep, profiles, shards, concurrency | `src/config.ts`, `src/cases.ts` |
+| `vib migrate` | `src/cli/migrate.ts` |
 
-### 7. CI integration
-- Build then run vib-test.
-- Non-zero exit gates merges.
-- Cache dependencies; shard suites by glob patterns when large.
+**Should**
 
-### 8. Packaging
-- Reusable module with CLI (`vib-test`) and library.
-- Files: `dist`, `bin`, `README.md`, `LICENSE`.
+| Item | Where |
+|---|---|
+| `outputSchema` enforcement; `inputSchema` pre-validation warnings | `src/runner.ts`, `src/schema.ts` |
+| `vib fuzz` | `src/fuzz/`, `src/cli/fuzz.ts` |
+| `vib check` (spec sanity + description lint) and `vib run --check` | `src/lint/` |
+| `vib tap` and `vib record --from-tap` | `src/tap/`, `src/cli/record.ts` |
+| `vib diff --against` | `src/cli/diff.ts` |
+| Budgets, `--repeat` flake rates, `--baseline` delta gating | `src/runner.ts` |
+| Tasks polling (`await`, `expectTask`) | `src/session/`, `src/runner.ts` |
+| Matchers v2 | `src/match.ts` |
+| Vitest bridge (`describeCases`) | `src/vitest.ts` |
 
-### 9. Milestones
-- M1 (done): Minimal runner executing JSON cases via real MCP stdio (`@modelcontextprotocol/sdk` client); exact match plus `expectError` (code + message/`$regex`).
-- M2 (done): Partial/regex/wildcard/unordered semantics via a structured matcher engine (`src/match.ts`) that reports path-level mismatches (e.g. `content[0].text`). `$partial` cascades to its subtree; `$unordered` uses backtracking multiset matching and combines with `$partial`.
-- M3: JUnit reporting + before/after hooks.
-- M4 (done): Dev-loop CLI subcommands — `run` (default), `tools`, `call`, `record`, `init`, plus `inspect` to launch MCP Inspector with the same server config. Case JSON schema at `schema/case.schema.json`. Binary aliases: `vib` and `vib-test`.
-- M5: Performance thresholds + streaming guidance.
+**Could**
 
+| Item | Status |
+|---|---|
+| `vib explain` | Delivered |
+| `vib conformance` wrapper | Delivered |
+| Output-injection probes (`vib fuzz --inject`) | Delivered |
+| `vib init --ci`, `--from-claude-config`, Python / Go detection | Delivered |
+| `vib record --flow` | Delivered |
+| Evals plugin, `vib gen`, GitHub Action, matcher plugins | After 2.0, see [FUTURE.md](./FUTURE.md) |
 
+**Not delivered from Must / Should:** `--watch`, `--perf` reports, `vib show-trace`. All
+three are in [FUTURE.md](./FUTURE.md).

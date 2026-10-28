@@ -1,0 +1,131 @@
+TAP version 14
+# vibrissa: running 6 cases on local
+# session local: echo-server 1.2.0, modern protocol 2026-07-28
+not ok 1 - manifest drift tests/integration/__manifest__.json (local)
+  ---
+  message: "1 tool changed: echo (description)"
+  severity: fail
+  diff: |-
+    {
+      "tools": {
+        "changed": [
+          {
+            "name": "echo",
+            "field": "description",
+            "before": "Echo",
+            "after": "Echo <IMPORTANT>"
+          }
+        ]
+      }
+    }
+  ...
+ok 2 - check: tools/list is stable
+ok 3 - check: list results carry ttlMs
+  ---
+  message: "tools/list has no ttlMs"
+  severity: warn
+  ...
+not ok 4 - check: description lint (local)
+  ---
+  message: "echo: hidden instruction \"<IMPORTANT>\""
+  severity: fail
+  ...
+ok 5 - echo returns input
+  ---
+  duration_ms: 12
+  ...
+# Subtest: create then fetch
+    ok 1 - 1. create [tool session.create]
+      ---
+      duration_ms: 5
+      ...
+    not ok 2 - 2. get [tool session.get]
+      ---
+      duration_ms: 9
+      message: "Expectation failed at structuredContent.user: expected \"jordan\", got \"jo\""
+      severity: fail
+      ...
+    ok 3 - 3. tool session.close # SKIP
+      ---
+      duration_ms: 0
+      ...
+    1..3
+not ok 6 - create then fetch
+  ---
+  duration_ms: 14
+  message: "Step 2 (get) failed: expected \"jordan\", got \"jo\""
+  severity: fail
+  file: "cases/flow.json"
+  server: local
+  mismatches:
+    - path: "structuredContent.user"
+      message: "expected \"jordan\", got \"jo\""
+  diff: |-
+    - expected  - 1
+    + actual    + 1
+
+      {
+        "structuredContent": {
+    -     "user": "jordan"
+    +     "user": "jo"
+        }
+      }
+  ...
+not ok 7 - upper mismatch
+  ---
+  duration_ms: 8
+  message: "Expectation failed at content[0].text: expected \"HELLO\", got \"hello\""
+  severity: fail
+  file: "cases/upper.json"
+  server: local
+  line: 3
+  error_kind: assertion
+  mismatches:
+    - path: "content[0].text"
+      message: "expected \"HELLO\", got \"hello\""
+    - path: "(root)"
+      message: "unexpected key \"isError\" (use \"$partial\": true to allow extra fields)"
+  diff: |-
+    - expected  - 2
+    + actual    + 3
+
+    @@ -2,7 +2,8 @@
+        "content": [
+          {
+            "type": "text",
+    -       "text": "HELLO"
+    +       "text": "hello"
+          }
+    -   ]
+    +   ],
+    +   "isError": false
+      }
+  trace: "reports/traces/upper.ndjson"
+  stderr: "reports/traces/upper.stderr.log"
+  ...
+ok 8 - not ready yet # SKIP waiting on server fix
+ok 9 - record greeting
+  ---
+  duration_ms: 4
+  status: updated
+  ...
+not ok 10 - slow call
+  ---
+  duration_ms: 812
+  message: "Budget exceeded: took 812ms, budget 800ms"
+  severity: fail
+  file: "cases/slow.json"
+  server: local
+  error_kind: budget
+  budget_ms: 800
+  ...
+# warning: cases/legacy.json uses the v1 "error" key; run vib migrate
+1..10
+# tests 6
+# pass 1
+# fail 3
+# skip 1
+# updated 1
+# checks 1 passed, 1 failed, 1 warned
+# manifest drift 1 of 1
+# duration_ms 1234

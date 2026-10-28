@@ -1,0 +1,13 @@
+{
+  "name": "MRTR: assert the input request alone",
+  "tags": ["mrtr"],
+  "tool": "confirm",
+  "args": { "action": "rollback" },
+  "expectInputRequired": {
+    "elicitation/create": {
+      "$partial": true,
+      "message": "Proceed with rollback?",
+      "requestedSchema": { "$partial": true, "required": ["confirm"] }
+    }
+  }
+}

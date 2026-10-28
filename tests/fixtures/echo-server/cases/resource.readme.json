@@ -1,0 +1,10 @@
+{
+  "name": "resource: read the readme",
+  "tags": ["resources"],
+  "resource": "fixture://readme",
+  "expect": {
+    "contents": [
+      { "uri": "fixture://readme", "mimeType": "text/plain", "text": "Vibrissa echo fixture" }
+    ]
+  }
+}

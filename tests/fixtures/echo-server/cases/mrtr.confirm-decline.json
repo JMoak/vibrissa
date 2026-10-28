@@ -1,0 +1,8 @@
+{
+  "name": "MRTR: confirm answered with decline",
+  "tags": ["mrtr"],
+  "tool": "confirm",
+  "args": { "action": "drop tables" },
+  "respond": { "elicitation/create": { "action": "decline" } },
+  "expect": { "content": [{ "type": "text", "text": "decline: drop tables" }] }
+}
