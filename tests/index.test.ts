@@ -43,7 +43,18 @@ describe('index exports', () => {
       expect(typeof api[name], name).toBe('function')
     }
     expect(api.BUILTIN_REPORTERS).toEqual(['console', 'json', 'junit', 'github', 'tap'])
-    expect(api.DEFAULT_MANIFEST_IGNORE).toEqual(['server.version'])
+    expect(api.DEFAULT_MANIFEST_IGNORE).toEqual(['server.version', 'protocolVersion', 'listMeta'])
+    for (const name of ['suggestRespond', 'toPointer', 'wordDiff', 'isMatcherObject'] as const) {
+      expect(typeof api[name], name).toBe('function')
+    }
+    expect(api.toPointer(['steps', 1, 'expect', 'a/b'])).toBe('/steps/1/expect/a~1b')
+    expect(api.matcherPathSegments('_meta["io.x/y"].content[0].text')).toEqual([
+      '_meta',
+      'io.x/y',
+      'content',
+      '0',
+      'text',
+    ])
   })
 
   it('exposes sensible defaults (v1 alias kept)', () => {

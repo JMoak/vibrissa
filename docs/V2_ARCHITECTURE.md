@@ -225,53 +225,75 @@ export function diffManifest(locked: Manifest, live: Manifest): ManifestDiff   /
 As built: `Manifest` also has `instructions?` and `listMeta` (`ttlMs` / `cacheScope` per list
 fetched). Tools are sorted by name, resources by `uri`, templates by `uriTemplate`, prompts by
 name; item keys come in a fixed order and `io.modelcontextprotocol/*` `_meta` keys are
-stripped. `ManifestDiff = { identical, changes: FieldChange[] (protocolVersion, instructions,
-server.*, capabilities.*, listMeta.*), tools|resources|resourceTemplates|prompts: { added,
-removed, changed: [{ key, fields: [{ path, before?, after? }] }] } }`; comparison ignores
-object key order. `diffManifest(a, b, { ignore })` drops dotted paths first (default
-`["server.version"]`; sections are keyed by item name/uri, `*` matches any key, item keys may
-contain dots: `tools.*.annotations`, `tools.notes.search.description`). `summarizeDiff` gives
-the one-liner used in `manifest:diff` events; `formatDiff` the multi-line console view.
-`captureManifest(session, { toolsListSamples })` also returns the raw tools/list samples for
-`spec/tools-list-stable`. Lock path: config `manifest` for the default server, a sibling
-`<name>.<server>.json` (`__manifest__.staging.json`) for any other server.
+stripped. Machine shape (empty lists and unchanged sections omitted):
+`ManifestDiff = { identical, breaking, changes?: FieldChange[], tools?|resources?|resourceTemplates?|prompts?: { added?, removed?, changed?: [{ key, breaking, fields: FieldChange[] }] } }`
+with `FieldChange = { path, before?, after?, breaking }`. `path` is the deepest changed
+sub-path (`inputSchema.required`, `inputSchema.properties.city.type`, `description`); prompt
+arguments are keyed by name. **Breaking**: a removed item, a removed/renamed input property, a
+newly required property or prompt argument, a type change, removed enum values, a tightened
+`additionalProperties`, any `outputSchema` change, a changed resource `mimeType`, a removed
+capability, a `protocolVersion` change. Descriptions, titles and annotations are not breaking.
+Comparison ignores object key order. `diffManifest(a, b, { ignore })` drops dotted paths first
+(default `["server.version", "protocolVersion", "listMeta"]`, so one lock serves both protocol
+eras; `vib manifest diff --strict` = `ignore: []`; sections are keyed by item name/uri, `*`
+matches any key, item keys may contain dots: `tools.*.annotations`,
+`tools.notes.search.description`). `summarizeDiff` gives the one-liner (ending ` (breaking)`
+when it is); `formatDiff` the console view: one line per sub-path, `[-old-]{+new+}` word diffs
+for prose, `(breaking)` tags. `captureManifest(session, { toolsListSamples })` also returns the
+raw tools/list samples for `spec/tools-list-stable`. Lock path: config `manifest` for the
+default server, a sibling `<name>.<server>.json` (`__manifest__.staging.json`) for any other.
 
 ### Runner — `src/runner.ts`, `src/cases.ts`
 
 Loading (`loadCases`): globs (relative to rootDir, `!` negates) → files → JSONC parse →
-shape validation (unknown keys get a did-you-mean; errors read `<file>: <problem>. <hint>`) →
-`$ref` expansion in `expect` / `expectInputRequired` / `expectTask` relative to the case file →
-`lintExpectation` → static `{{name}}` check (every name must be captured by an earlier step,
-by suite `hooks.setup`, or be `env.X` with X set; teardown may use any capture of the case).
-A bad file never throws: it becomes a failed case with `errorKind: "load"`. Case id = posix path
-relative to rootDir (absolute when outside it), `line: 1`. Filters: `tags` (any), `excludeTags`
-(any), `grep` (case-insensitive regex over name and id; substring if the regex is invalid),
-then `shard i/n` (every n-th case of the id-sorted selection, starting at i). `skip: true |
-"reason"` reports `skipped` with that reason. Unparseable files are kept by tag filters.
-Manifest locks are never cases: the configured `manifest` path, its per-server siblings, and
-any file shaped like a lock (`"vibrissa": 2` + a `tools` array) are dropped even when the
-globs match them (`LoadCasesOptions.manifest` / `exclude`).
+shape validation (unknown keys get a did-you-mean; errors read `<file>: <problem>. <hint>`;
+`expectError.code` names must be known — did-you-mean against `knownCodeNames()`, numbers
+always pass) → `$ref` expansion in `expect` / `expectInputRequired` / `expectTask` relative to
+the case file → `lintExpectation` (unknown `$` keys such as `$partail` fail with a
+did-you-mean; data with literal `$`-keys goes in `$literal`) → static `{{name}}` check (every
+name must be captured by an earlier step, by suite `hooks.setup`, or be `env.X` with X set;
+teardown may use any capture of the case). A bad file never throws: it becomes a failed case
+with `errorKind: "load"`. Case id = posix path relative to rootDir (absolute when outside it),
+`line: 1`. Filters: `tags` (any), `excludeTags` (any), `grep` (case-insensitive regex over name
+and id; substring if the regex is invalid), then `shard i/n` (every n-th case of the id-sorted
+selection, starting at i). `skip: true | "reason"` reports `skipped` with that reason.
+Unparseable files are kept by tag filters. Manifest locks are never cases: the configured
+`manifest` path, its per-server siblings, and any file shaped like a lock (`"vibrissa": 2` + a
+`tools` array) are dropped even when the globs match them (`LoadCasesOptions.manifest` /
+`exclude`). So are `$ref` fragments: a JSON file with no operation key and no `steps` that is
+the target of a `$ref` from another matched file, or lives in a `shared/` or `fragments/`
+directory (`LoadCasesResult.fragments`; the runner prints one `info:` line listing them).
 
 Execution: cases are grouped by server; each server gets `concurrency` workers, one
 McpSession each (a dead session is restarted before the next case); a case — every step of a
 flow — runs on one worker. Before cases run, the first session verifies the manifest lock and
-(with `check`) runs `runChecks` over the live manifest + two tools/list samples, honoring
-`checks.allow` / `checks.severity`. Per case: `setup` → `steps` (or the case's own operation) →
-`teardown` (always). `ignoreErrors: true` works on any step (and on a single-op case): a
-failure is recorded on the step as `failed` with reason `ignored (ignoreErrors): ...`, but it
-never fails the case and never stops the flow (non-teardown ignores also emit a warning). Each step
-is interpolated, called with `timeoutMs` / `respond` / `await`, then evaluated in this order:
-unanswered `input_required` (fails with the requests and a `respond` example, unless the step
-asserts only `expectInputRequired`, i.e. has no `expect` / `expectError`), `expectInputRequired`,
-`expectTask`, `expectError` (code via `errorMatchesCode`, message via the matcher), otherwise
-`outputSchema` (validates the raw `structuredContent` when the tool declares one and
-`validateOutput !== false`; violations are assertion mismatches at `structuredContent.<path>`)
-and `expect` against the normalized result (case/step `normalize` merge over config; `false`
-disables). A tool `isError` result with an `expect` is compared as data. `capture` reads dotted
-paths (`a.b[0].c` or `a.b.0.c`) from the normalized result (from `{ kind, codeName, code,
-message, data }` for an expected error). Step `budgetMs` checks the operation time; case
-`budgetMs` (default: config `budgetMs`) checks the summed operation time of setup + steps.
-Both fail with `errorKind: "budget"`. Steps after a failure are reported `skipped`.
+(with `check`) runs `runChecks` over the live manifest + two tools/list samples + `transport` +
+`session.stdoutNoise`, honoring `checks.allow` / `checks.severity`. Non-JSON-RPC stdout lines
+are a run warning even without `check`. Per case: `setup` → `steps` (or the case's own
+operation) → `teardown` (always). `ignoreErrors: true` works on any step (and on a single-op
+case): a failure is recorded on the step as `failed` with reason `ignored (ignoreErrors): ...`,
+but it never fails the case and never stops the flow (non-teardown ignores also emit a
+warning). A teardown step whose `{{capture}}` never happened (its step failed) is `skipped`,
+not failed. Each step is interpolated, called with `timeoutMs` / `respond` / `await`, then
+evaluated in this order: unanswered `input_required` (fails with the requests and a
+paste-ready `"respond": {...}` derived from the `requestedSchema`, unless the step asserts only
+`expectInputRequired`, i.e. has no `expect` / `expectError`), `expectInputRequired`,
+`expectTask`, `expectError` (code via `errorMatchesCode`, message via the matcher; a success
+that also violated outputSchema says so), otherwise `outputSchema` (validates the raw
+`structuredContent` when the tool declares one and `validateOutput !== false`; violations are
+assertion mismatches at `structuredContent.<path>`) and `expect` against the normalized result
+(case/step `normalize` merge over config; `false` disables). A tool `isError` result with an
+`expect` is compared as data. A call to a tool the server does not list adds `Tool "x" is not
+on the server; did you mean "y"? Available: ...`. `capture` reads dotted paths (`a.b[0].c` or
+`a.b.0.c`) from the normalized result (from `{ kind, codeName, code, message, data }` for an
+expected error). Step `budgetMs` checks the operation time; case `budgetMs` (default: config
+`budgetMs`) checks the summed operation time of setup + steps. Both fail with
+`errorKind: "budget"`. Steps after a failure are reported `skipped`.
+
+Mismatches are patchable: each carries `field` (`expect` | `expectError` |
+`expectInputRequired` | `expectTask` | `structuredContent`), `pointer` (RFC 6901 into the case
+file, e.g. `/steps/1/expect/content/0/text`; none for server-side `structuredContent`) and, in
+flows, `stepIndex` (0-based plan index, as `StepRef.index`).
 
 **`expectInputRequired` shape.** It is matched against a view of every InputRequests round the
 server sent during the call (`Outcome.inputRequests`, so it works whether or not `respond`
@@ -297,39 +319,57 @@ exactly one placeholder becomes the raw captured JSON value; otherwise values ar
 Run-level behavior:
 
 - `repeat: N` runs every case N times in rounds (ids `<id>#<n>`); `summary.passRates` per case
-  id. A case passes overall at 100 %, or at `>= flakyFloor` (default 0.5) when `flaky: true`.
-  `run:end.ok` and the exit code use that verdict.
-- `update` rewrites a failing *plain* `expect` (case or step) with the normalized actual run
-  through `escapeDirectives`, keeping key order, 2-space JSON and the file's EOL; status
-  `updated`, and a flow keeps going after an accepted step. Never rewritten: `expectError`,
-  expectations containing `{{...}}`, files with comments, and — unless `updateAll`
-  (`--update=all`) — expectations containing any `$` matcher (a warning names each). `--update`
-  forces `repeat` to 1.
+  id and `summary.runs` (case runs); `summary.total` / `passed` / `failed` count cases by
+  verdict. A case passes overall at 100 %, or at `>= flakyFloor` (default 0.5) when
+  `flaky: true`. `run:end.ok` and the exit code use that verdict. `run:start` carries `repeat`
+  and, under `--shard`, `shard: { index, total }`.
+- `update` is leaf-level: only mismatched plain leaves of a failing `expect` (case or step)
+  take the normalized live value (`escapeDirectives`); subtrees that still match — matchers
+  included — are kept verbatim, and the file keeps its indent, key order and EOL. A mismatched
+  matcher or `$ref` blocks the rewrite (the reason names it) unless `updateAll`
+  (`--update=all`), which replaces it with the literal value and warns what it replaced.
+  Never rewritten: `expectError`, `expectInputRequired`, `expectTask`, `{{captured}}` leaves,
+  files with comments. A failing case that was not rewritten carries
+  `outcome.updateSkipped: { reason }` (plus a warning). Without `update`, a golden failure ends
+  with `Use --update to accept the new output.` only when `--update` would rewrite it, else with
+  why not; `ExecuteContext.updateHint: false` (vitest bridge, `vib diff`) drops the hint.
+  `--update` forces `repeat` to 1; a flow keeps going after an accepted step.
 - `baseline: <results.json>` (the json reporter's file): only regressions fail — case ids
   failing now that did not fail in the baseline (new cases included), and passing cases whose
   mean durationMs grew by more than `baselineLatencyPct` (default 50 %) and at least
   `baselineLatencyMinMs` (default 10 ms). Reported as a `baseline/regressions` check event;
   still-failing known cases are a warning. An unreadable baseline falls back to normal gating.
-- Manifest lock: lock present → `manifest:ok` or `manifest:diff` (fails the run) — with
-  `updateManifest` the lock is rewritten (or created) and a warning + `manifest:ok` are emitted;
-  lock absent → a warning suggesting `vib manifest record`. `lockManifest: false` turns it off.
+- Manifest lock: lock present → `manifest:ok` or `manifest:diff` (fails the run; `summary` =
+  one-liner, then the `formatDiff` body, then the `--update-manifest` tip; `diff` = the machine
+  shape) — with `updateManifest` the lock is rewritten (or created) and a warning +
+  `manifest:ok` are emitted; lock absent → a warning naming `vib manifest record [--server x]`,
+  or, with `requireManifest: true`, a `manifest:diff` (`diff.errorKind: "load"`) that fails the
+  run. `lockManifest: false` turns it off.
 - `trace` (or any failure) writes `<outDir>/traces/<id without .json>[.run<n>].ndjson` (the
   case's JSON-RPC messages as TranscriptEntry lines) and `.stderr.txt` when the server wrote
-  to stderr during the case; runner sessions use `stderr: 'capture'`.
-- Exit code: 0 ok, 1 failures / drift / failed checks / regressions, 2 configuration error (an
-  invalid server entry). A server that cannot start fails its cases (`errorKind: "error"`); no
-  case matching is exit 1 unless `allowEmpty`. `failFast` stops pulling new cases after the
-  first failure.
+  to stderr during the case; cases outside rootDir use `traces/_external/<name>-<hash>`.
+  Runner sessions use `stderr: 'capture'`.
+- Exit code: 0 ok, 1 failures / drift / failed checks / regressions / empty selection, 2
+  configuration error (an invalid server entry). A server that cannot start fails its cases
+  (`errorKind: "error"`); an empty selection (no glob match, or nothing left after filters) is
+  an `error:` on stderr and exit 1 unless `allowEmpty`. `failFast` stops pulling new cases
+  after the first failure.
 
 Library: `new Runner(options).execute()` → `{ exitCode, ok, summary, cases, checks, manifests,
 warnings }`; `runCases(partial)` → exit code (v1 `server` is sugar for `servers.default`);
 `executeCase(data, ctx)` runs one case on a session (used by `vib diff` and
-`@jmoak/vibrissa/vitest`'s `describeCases`). `checks`, `manifestIgnore` and `outDir` come from
-config (`RunOptions`); `pretty`, `stdout`/`stderr`, `extraReporters`, `updateAll`,
+`@jmoak/vibrissa/vitest`'s `describeCases`, which also registers a manifest-lock test and,
+with `checks: true`, a checks test). `checks`, `manifestIgnore`, `requireManifest` and `outDir`
+come from config (`RunOptions`; unknown config keys are a ConfigError with a did-you-mean, all
+problems reported at once); `pretty`, `stdout`/`stderr`, `extraReporters`, `updateAll`,
 `updateManifest`, `lockManifest`, `flakyFloor`, `baselineLatencyPct`, `baselineLatencyMinMs`,
-`serverStderr`, `env` live on `RunnerOptions`. `vib run --json` prints exactly one JSON object
-on stdout (the JsonReport, also written to `<outDir>/results.json`; `{ ok: false, error }` on a
-usage error) and sends console reporter output and warnings to stderr.
+`serverStderr`, `env` live on `RunnerOptions` (`reporters: []` means none). CLI: unknown flags
+on `vib run` / `manifest` / `diff` exit 2 with a did-you-mean. `vib run --json` prints exactly
+one JSON object on stdout (the JsonReport, also written to `<outDir>/results.json`;
+`{ ok: false, error }` on a usage error) and keeps stderr to warnings and errors; `--brief`
+shows only failures, warnings and drift (with `--json`: no passing cases, no empty arrays).
+`vib diff` compares observed results through each case's matchers (a value its matcher accepts
+reads `"<matches $type>"`, `$partial` drops unasserted keys) and reports observations only.
 
 ## CLI surface (phase 2)
 

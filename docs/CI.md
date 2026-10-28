@@ -11,6 +11,7 @@ Related: [CLI.md](./CLI.md#vib-run), [CONFIG.md](./CONFIG.md#reporters).
 - [A `ci` profile](#a-ci-profile)
 - [GitHub Actions](#github-actions)
 - [GitLab and Jenkins (JUnit)](#gitlab-and-jenkins-junit)
+- [Inside a Vitest suite](#inside-a-vitest-suite)
 - [Sharding across jobs](#sharding-across-jobs)
 - [Delta gating](#delta-gating)
 - [Repeat and flaky policy](#repeat-and-flaky-policy)
@@ -20,17 +21,25 @@ Related: [CLI.md](./CLI.md#vib-run), [CONFIG.md](./CONFIG.md#reporters).
 ## A `ci` profile
 
 Keep CI settings in config so local and CI runs differ only by `--profile ci`. `vib init`
-writes this one (`json` keeps `results.json` for baselines):
+writes this one:
 
 ```json
 {
   "servers": { "default": { "cmd": "node", "args": ["dist/index.js"] } },
-  "globs": ["tests/integration/**/*.json", "!tests/integration/**/__manifest__*.json"],
+  "globs": ["tests/integration/**/*.json"],
   "profiles": {
-    "ci": { "reporters": ["console", "github", "junit", "json"], "check": true }
+    "ci": { "reporters": ["console", "github", "junit", "json"], "check": true, "requireManifest": true }
   }
 }
 ```
+
+| Key | Why |
+|---|---|
+| `reporters` | Console log, GitHub annotations and job summary, `reports/junit.xml`, and `reports/results.json` (the [baseline](#delta-gating) input). |
+| `check` | Spec sanity and description lint gate the run. |
+| `requireManifest` | A missing lock fails the run instead of warning, so an unrecorded surface cannot pass. |
+
+`vib init` also adds `reports/` to `.gitignore`.
 
 The `github` reporter emits annotations only when `GITHUB_ACTIONS=true`, so the same
 profile stays quiet on a laptop; there it writes its summary to `reports/summary.md`.
@@ -60,7 +69,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build --if-present
-      - run: npx vib run --profile ci --check --reporter console,github,junit,json
+      - run: npx vib run --profile ci
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
@@ -71,15 +80,15 @@ jobs:
 | Step | Why |
 |---|---|
 | `npm run build --if-present` | Cases test the built server, the artifact your users run. |
-| `vib run --profile ci --check --reporter ...` | The gate: cases, manifest lock, and checks; console log, annotations, `reports/junit.xml`, `reports/results.json`. |
+| `vib run --profile ci` | The gate. The profile carries the flags: reporters, checks, `requireManifest`. |
 | `upload-artifact` with `if: failure()` | Keeps `junit.xml`, `results.json`, and traces from failing runs, which are the runs you need them from. Use `if: always()` to keep green runs too (for [baselines](#delta-gating)). |
 
 For Python projects the workflow adds `setup-python` and `pip install -e .`; for Go,
 `setup-go`. Projects without a `package.json` run Vibrissa with
 `npx --yes --package @jmoak/vibrissa vib`.
 
-The flags on the run line repeat what the scaffolded `ci` profile already sets, so the
-workflow works even if you trim the profile. Common edits: add
+`vib init --ci` in a project that already has `vibrissa.json` writes only the workflow (and
+reports whether the `ci` profile is present). Common edits: add
 `permissions: { contents: read }` and SHA-pinned actions if your org requires them.
 
 The `github` reporter produces:
@@ -136,6 +145,33 @@ pipeline {
 
 Anything that reads JUnit works the same way. For TAP consumers use `--reporter tap`
 alone: it writes to stdout, as `console` does.
+
+## Inside a Vitest suite
+
+Teams that already gate on Vitest can run the contract suite as Vitest tests and get one
+report. Vitest is an optional peer dependency.
+
+```ts
+// tests/mcp.contract.test.ts
+import { describeCases } from '@jmoak/vibrissa/vitest'
+
+await describeCases({ profile: 'ci', checks: true, title: 'mcp contract' })
+```
+
+One `describe` block holds, in order:
+
+- `manifest lock (<path>)` for each server with a lock (a failing test when the lock is
+  missing and `requireManifest` is on), failing on drift with the rendered diff;
+- `checks (<server>)` when `checks` is set (or config `check: true`), failing on failed
+  checks;
+- one `it` per case (`it.skip` for `skip`), failing with the reason and mismatches.
+
+`DescribeCasesOptions` (all optional): `globs` (default: config globs), `config` (a path,
+or `false` to pass `servers` and `globs` yourself), `profile`, `cwd`, `title` (default
+`"vibrissa"`), `checks` (`true`, or `{ allow, severity }`), `lockManifest` (default `true`),
+`api` (`{ describe, it, beforeAll, afterAll }`; default Vitest globals, else a lazy
+`import('vitest')`, hence the `await`), and the runner options (`timeoutMs`, `normalize`, ...).
+There is one server session per server for the whole block.
 
 ## Sharding across jobs
 
@@ -201,19 +237,23 @@ compare cleanly. The shape, abridged:
   "startedAt": "2026-10-28T12:00:00.000Z",
   "finishedAt": "2026-10-28T12:00:00.840Z",
   "servers": [{ "name": "default", "era": "modern", "protocolVersion": "2026-07-28" }],
-  "summary": { "total": 12, "passed": 12, "failed": 0, "skipped": 0, "updated": 0, "durationMs": 840, "flaky": [], "manifestDrift": 0, "warnings": 0 },
+  "summary": { "total": 12, "passed": 12, "failed": 0, "skipped": 0, "updated": 0, "durationMs": 840, "checks": { "passed": 0, "failed": 0, "warned": 0 }, "manifestDrift": 0, "warnings": 0 },
   "cases": [
-    { "id": "tests/integration/echo.basic.json", "caseId": "tests/integration/echo.basic.json", "name": "echo basic", "file": "tests/integration/echo.basic.json", "server": "default", "tags": [], "status": "passed", "durationMs": 4 }
+    { "id": "tests/integration/echo.basic.json", "caseId": "tests/integration/echo.basic.json", "name": "echo basic", "file": "tests/integration/echo.basic.json", "server": "default", "line": 1, "status": "passed", "durationMs": 4 }
   ],
-  "checks": [],
-  "manifests": [{ "path": "tests/integration/__manifest__.json", "server": "default", "status": "ok" }],
-  "warnings": []
+  "manifests": [{ "path": "tests/integration/__manifest__.json", "server": "default", "status": "ok" }]
 }
 ```
 
-Failed cases also carry `errorKind`, `reason`, `mismatches`, `expected`, `actual`,
-`steps`, `budget`, `tracePath`, and `stderrPath`. The full type is `JsonReport`, exported
-from the package.
+Empty arrays (`checks`, `warnings`, `tags`, `flaky`) are omitted. A repeated or sharded run
+adds top-level `repeat` and `shard: { index, total }`, plus `summary.runs` (executions) and
+`summary.passRates`. Failed cases also carry `errorKind`, `reason`, `mismatches`,
+`expected`, `actual`, `steps`, `budget`, `updateSkipped`, `tracePath`, and `stderrPath`.
+Each mismatch is patchable: `{ path, message, expected, actual, field, pointer, stepIndex? }`,
+where `field` is the case key (`expect`, `expectError`, `expectInputRequired`,
+`expectTask`, or `structuredContent` for an `outputSchema` violation), `pointer` is an
+RFC 6901 pointer into the case file (`/steps/1/expect/content/0/text`), and `stepIndex` is
+the flow step. The full type is `JsonReport`, exported from the package.
 
 Producing the baseline on `main` and using it in PRs with GitHub Actions:
 
@@ -270,8 +310,11 @@ transcript of a CI-only failure is one click away. (A `vib show-trace` pretty-pr
 
 ## Manifest and checks in CI
 
-- Commit the manifest lock. A run whose live surface differs fails with a field-level diff
-  (annotated on GitHub). A missing lock is only a warning, so record one.
+- Commit the manifest lock. A run whose live surface differs fails with a per-field diff
+  that marks breaking changes (annotated on GitHub). A missing lock is a warning, or a
+  failure with `requireManifest: true` (the scaffolded `ci` profile sets it).
+- One lock serves every protocol era (`protocolVersion` and `listMeta` are ignored by
+  default), so a `legacy` profile job checks the same file.
 - Never pass `--update`, `--update=all`, or `--update-manifest` in CI. Accepting a change
   is a review decision: run it locally and commit the diff with the PR that caused it.
 - `--check` (or `check: true` in the profile) runs `vib check` as part of the gate.

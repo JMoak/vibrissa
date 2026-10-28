@@ -2,14 +2,33 @@ import fs from 'node:fs'
 import path from 'node:path'
 import type { JsonValue } from '../types.js'
 
+export interface CliErrorDetails {
+  /** Stable machine code: `unknown-option`, `unknown-command`, `unknown-tool`, `invalid-argument`, ... */
+  code?: string
+  /** What to do next (one sentence). Appended to the human message. */
+  hint?: string
+  /** Suggested next commands, for agents. */
+  next?: string[]
+}
+
 /**
- * A command-line mistake (bad flag, missing argument). The dispatcher maps it to exit
- * code 2 and prints the message, which always ends with what to do next.
+ * A command-line mistake (bad flag, missing argument, unknown tool). The dispatcher maps
+ * it to exit code 2. `message` is the full human text (detail + hint); `detail` and `hint`
+ * are kept apart for the `--json` error envelope.
  */
 export class UsageError extends Error {
-  constructor(message: string) {
-    super(message)
+  readonly code: string
+  readonly detail: string
+  readonly hint?: string
+  readonly next?: string[]
+
+  constructor(message: string, details: CliErrorDetails = {}) {
+    super(details.hint ? `${message} ${details.hint}` : message)
     this.name = 'UsageError'
+    this.code = details.code ?? 'usage'
+    this.detail = message
+    if (details.hint) this.hint = details.hint
+    if (details.next) this.next = details.next
   }
 }
 
@@ -175,6 +194,61 @@ export function flagTokens(
   return out
 }
 
+/**
+ * Throw a UsageError (code `unknown-option`, with a did-you-mean) for the first `--flag`
+ * in `argv` (before a bare `--`) that is not in `accepted`. `--help`, `--json` and
+ * `--compact` are always accepted.
+ */
+export function assertKnownFlags(
+  argv: string[],
+  accepted: Iterable<string>,
+  command: string,
+  valueFlags: ReadonlySet<string> = VALUE_FLAGS,
+): void {
+  const known = new Set([...accepted, '--help', '--json', '--compact'])
+  for (const flag of flagTokens(argv, valueFlags)) {
+    if (known.has(flag)) continue
+    throw unknownOptionError(flag, known, command)
+  }
+}
+
+export function unknownOptionError(
+  flag: string,
+  accepted: Iterable<string>,
+  command: string,
+): UsageError {
+  const suggestion = closest(flag, [...accepted])
+  return new UsageError(`Unknown option ${flag} for vib ${command}.`, {
+    code: 'unknown-option',
+    hint: `${suggestion ? `Did you mean ${suggestion}? ` : ''}Run vib ${command} --help for its options.`,
+    next: [`vib ${command} --help`],
+  })
+}
+
+/**
+ * A UsageError for a name the server does not list (tool, prompt, resource): did-you-mean
+ * plus the available names.
+ */
+export function unknownNameError(
+  kind: string,
+  name: string,
+  available: string[],
+  listCommand?: string,
+): UsageError {
+  const suggestion = closest(name, available)
+  const shown = available.slice(0, 12)
+  const more =
+    available.length > shown.length ? `, … (${available.length - shown.length} more)` : ''
+  const have = available.length
+    ? `Available: ${shown.join(', ')}${more}.`
+    : `The server lists no ${kind}s.`
+  return new UsageError(`Unknown ${kind} "${name}" on this server.`, {
+    code: `unknown-${kind.replace(/\s+/g, '-')}`,
+    hint: `${suggestion ? `Did you mean "${suggestion}"? ` : ''}${have} Pass --expect-missing to send it anyway.`,
+    ...(listCommand ? { next: [listCommand] } : {}),
+  })
+}
+
 /** Closest candidate by edit distance (for "did you mean" hints), or undefined. */
 export function closest(input: string, candidates: readonly string[]): string | undefined {
   let best: string | undefined
@@ -237,7 +311,11 @@ export function parseEnvPairs(pairs: string[]): Record<string, string> {
   const env: Record<string, string> = {}
   for (const pair of pairs) {
     const eq = pair.indexOf('=')
-    if (eq <= 0) throw new Error(`Invalid --env value "${pair}" (expected KEY=VALUE)`)
+    if (eq <= 0)
+      throw new UsageError(`Invalid --env value "${pair}" (expected KEY=VALUE).`, {
+        code: 'invalid-argument',
+        hint: 'Example: --env API_TOKEN=abc123.',
+      })
     env[pair.slice(0, eq)] = pair.slice(eq + 1)
   }
   return env
@@ -271,16 +349,29 @@ export function parseToolArgs(argv: string[]): Record<string, JsonValue> {
     try {
       parsed = JSON.parse(json)
     } catch (err) {
-      throw new Error(`Invalid --args JSON: ${err instanceof Error ? err.message : String(err)}`)
+      throw new UsageError(
+        `Invalid --args JSON: ${err instanceof Error ? err.message : String(err)}.`,
+        {
+          code: 'invalid-argument',
+          hint: `Quote the object in single quotes: --args '{"text": "hi"}'.`,
+        },
+      )
     }
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-      throw new Error('--args must be a JSON object')
+      throw new UsageError('--args must be a JSON object.', {
+        code: 'invalid-argument',
+        hint: `Example: --args '{"text": "hi"}'.`,
+      })
     }
     args = { ...(parsed as Record<string, JsonValue>) }
   }
   for (const pair of pairs) {
     const eq = pair.indexOf('=')
-    if (eq <= 0) throw new Error(`Invalid --arg value "${pair}" (expected key=value)`)
+    if (eq <= 0)
+      throw new UsageError(`Invalid --arg value "${pair}" (expected key=value).`, {
+        code: 'invalid-argument',
+        hint: 'Example: --arg text=hello (true, 3, null and JSON values are parsed).',
+      })
     args[pair.slice(0, eq)] = parseArgValue(pair.slice(eq + 1))
   }
   return args
@@ -347,8 +438,71 @@ export function resolvePathFromCwd(value: string): string {
   return path.isAbsolute(value) ? value : path.resolve(process.cwd(), value)
 }
 
+let jsonStyle: 'auto' | 'compact' | 'pretty' = 'auto'
+
+/** `--compact` forces single-line JSON; `auto` = pretty on a TTY, compact otherwise. */
+export function setJsonStyle(style: 'auto' | 'compact' | 'pretty'): void {
+  jsonStyle = style
+}
+
+/** Print one JSON document on stdout (compact when piped or --compact, pretty on a TTY). */
 export function printJson(value: unknown): void {
-  console.log(JSON.stringify(value, null, 2))
+  const compact = jsonStyle === 'compact' || (jsonStyle === 'auto' && !process.stdout.isTTY)
+  console.log(compact ? JSON.stringify(value) : JSON.stringify(value, null, 2))
+}
+
+/** Drop empty arrays and undefined values (recursively) for terse --json payloads. */
+export function pruneEmpty<T>(value: T): T {
+  if (Array.isArray(value)) return value.map((v) => pruneEmpty(v)) as T
+  if (typeof value !== 'object' || value === null) return value
+  const out: Record<string, unknown> = {}
+  for (const [key, child] of Object.entries(value)) {
+    if (child === undefined || (Array.isArray(child) && child.length === 0)) continue
+    out[key] = pruneEmpty(child)
+  }
+  return out as T
+}
+
+/** Short `k=v` rendering of arguments for case names: `text=hello uppercase=true`. */
+export function argsSummary(args: Record<string, JsonValue> | undefined, max = 48): string {
+  const parts = Object.entries(args ?? {}).map(([key, value]) => {
+    const text = typeof value === 'string' ? value : JSON.stringify(value)
+    return `${key}=${text.length > 24 ? `${text.slice(0, 23)}…` : text}`
+  })
+  const joined = parts.join(' ')
+  return joined.length > max ? `${joined.slice(0, max - 1)}…` : joined
+}
+
+/**
+ * Where new case files go: the static directory of the first positive glob
+ * (`cases/**` + `/*.json` → `cases`) and the file suffix it expects (`.json`, `.case.json`).
+ */
+export function suiteLayout(globs: string[]): { dir: string; suffix: string } {
+  const glob = (globs.find((g) => !g.startsWith('!')) ?? 'tests/integration/**/*.json').replace(
+    /\\/g,
+    '/',
+  )
+  const segments = glob.split('/')
+  const dir: string[] = []
+  for (const segment of segments.slice(0, -1)) {
+    if (/[*?[\]{}()!]/.test(segment)) break
+    dir.push(segment)
+  }
+  const last = segments[segments.length - 1]
+  const star = last.lastIndexOf('*')
+  const tail = star === -1 ? '' : last.slice(star + 1)
+  const suffix = /^\.[\w.-]+$/.test(tail) ? tail : '.json'
+  return { dir: dir.join('/') || '.', suffix }
+}
+
+/** `file` itself, or `name-2.json`, `name-3.json`, ... when it already exists. */
+export function uniquePath(file: string, suffix = path.extname(file)): string {
+  if (!fs.existsSync(file)) return file
+  const base = file.endsWith(suffix) ? file.slice(0, -suffix.length) : file
+  for (let n = 2; ; n++) {
+    const candidate = `${base}-${n}${suffix}`
+    if (!fs.existsSync(candidate)) return candidate
+  }
 }
 
 export function slugify(input: string, max = 48): string {

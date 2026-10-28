@@ -80,6 +80,7 @@ export async function resourcesCommand(argv: string[]): Promise<number> {
     const { resources, resourceTemplates } = await listResourcesAndTemplates(session)
     if (flags.json) {
       printJson({
+        ok: true,
         resources: resources.items,
         resourceTemplates: resourceTemplates.items,
         listMeta: { resources: resources.meta, resourceTemplates: resourceTemplates.meta },

@@ -10,12 +10,21 @@ import {
   jsonEqual,
   summarizeDiff,
 } from '../manifest.js'
+import { isMatcherObject, matchValue } from '../match.js'
 import { resolveRootDir, resolveServerConfig } from '../paths.js'
 import { executeCase } from '../runner.js'
 import { McpSession } from '../session/index.js'
-import type { JsonValue, RunOptions, ServerConfig, ToolSummary } from '../types.js'
+import type {
+  JsonObject,
+  JsonValue,
+  RunOptions,
+  ServerConfig,
+  Step,
+  ToolSummary,
+} from '../types.js'
 import { isHttpServerConfig, isStdioServerConfig } from '../types.js'
 import {
+  UsageError,
   VALUE_FLAGS,
   hasFlag,
   normalizeArgv,
@@ -28,6 +37,7 @@ import {
 import { type CommandHelp, formatCommandHelp } from './format.js'
 import { manifestIgnoreOf } from './manifest.js'
 import { cliOverrides, describeServerTarget, parseCommonFlags } from './resolve.js'
+import { assertCommandFlags, usageFailure } from './run.js'
 
 const DIFF_VALUE_FLAGS: ReadonlySet<string> = new Set([...VALUE_FLAGS, '--against', '--cases'])
 
@@ -74,12 +84,20 @@ interface Side {
   tools?: Map<string, ToolSummary>
 }
 
+/** One step's observed result, as compared (see projectObservation). */
+export interface ObservedStep {
+  /** `tool echo`, `resource fixture://readme`, ... */
+  step: string
+  observed: JsonValue
+}
+
 export interface CaseComparison {
   id: string
   name: string
   same: boolean
-  base: { status: string; observed: JsonValue[]; reason?: string }
-  against: { status: string; observed: JsonValue[]; reason?: string }
+  /** Observed results only (no pass/fail status: vib diff compares servers, not goldens). */
+  base: ObservedStep[]
+  against: ObservedStep[]
   diff?: string
 }
 
@@ -132,12 +150,79 @@ function textDiff(a: unknown, b: unknown): string {
   )
 }
 
+function isObject(value: unknown): value is JsonObject {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function matcherLabel(expected: JsonObject): string {
+  return `<matches ${Object.keys(expected)
+    .filter((key) => key.startsWith('$'))
+    .join(' + ')}>`
+}
+
+/**
+ * Project an observed value through what the case asserts: values a matcher accepts become
+ * `"<matches $type>"` (so timestamps and ids that the case itself treats as variable do not
+ * count as differences), `{{captured}}` positions become `"<captured>"`, and keys a
+ * `$partial` expectation does not mention are dropped. Without an expectation the value is
+ * compared as is.
+ */
+export function projectThrough(
+  expected: JsonValue | undefined,
+  actual: JsonValue,
+  partial = false,
+): JsonValue {
+  if (expected === undefined) return actual
+  if (typeof expected === 'string' && expected.includes('{{')) return '<captured>'
+  if (isMatcherObject(expected)) {
+    return matchValue(expected, actual, { partial }).length === 0 && isObject(expected)
+      ? matcherLabel(expected)
+      : actual
+  }
+  if (isObject(expected) && isObject(actual)) {
+    const childPartial = typeof expected.$partial === 'boolean' ? expected.$partial : partial
+    const out: JsonObject = {}
+    for (const [key, value] of Object.entries(actual)) {
+      if (Object.hasOwn(expected, key))
+        out[key] = projectThrough(expected[key], value, childPartial)
+      else if (!childPartial) out[key] = value
+    }
+    return out
+  }
+  if (Array.isArray(expected) && Array.isArray(actual)) {
+    return actual.map((item, i) => projectThrough(expected[i], item, partial))
+  }
+  return actual
+}
+
+function projectObservation(step: Step, observed: JsonValue): JsonValue {
+  if (isObject(observed) && isObject(observed.error)) {
+    const error = observed.error
+    if (step.expectError === undefined) return observed
+    const message = typeof error.message === 'string' ? error.message : ''
+    const expected = step.expectError.message
+    return {
+      error: {
+        code: error.codeName ?? error.code ?? null,
+        message:
+          expected !== undefined && matchValue(expected as JsonValue, message).length === 0
+            ? typeof expected === 'string'
+              ? message
+              : '<matches $regex>'
+            : message,
+      },
+    }
+  }
+  if (isObject(observed) && observed.inputRequired !== undefined) return observed
+  return projectThrough(step.expect, observed)
+}
+
 async function observe(
   side: Side,
   loaded: LoadedCase,
   options: RunOptions,
-): Promise<CaseComparison['base']> {
-  if (!side.session || !loaded.data) return { status: 'failed', observed: [], reason: loaded.error }
+): Promise<ObservedStep[]> {
+  if (!side.session || !loaded.data) return []
   const execution = await executeCase(loaded.data, {
     session: side.session,
     normalize: options.normalize,
@@ -146,13 +231,13 @@ async function observe(
     tools: side.tools,
     env: process.env,
     update: 'off',
+    updateHint: false,
     caseId: loaded.ref.id,
   })
-  return {
-    status: execution.outcome.status,
-    observed: execution.observations.map((o) => o.observed),
-    ...(execution.outcome.reason ? { reason: execution.outcome.reason } : {}),
-  }
+  return execution.observations.map((o) => ({
+    step: `${o.step.kind} ${o.step.target}`,
+    observed: projectObservation(o.planned.step, o.observed),
+  }))
 }
 
 /** `vib diff --against`: exit 0 identical, 1 different, 2 usage / connection error. */
@@ -162,12 +247,26 @@ export async function diffCommand(rawArgv: string[]): Promise<number> {
     return 0
   }
   const argv = normalizeArgv(rawArgv, DIFF_VALUE_FLAGS)
+  const json = argv.includes('--json')
+  try {
+    assertCommandFlags(argv, diffHelp, DIFF_VALUE_FLAGS)
+  } catch (err) {
+    return usageFailure(err, 'diff', json)
+  }
   const against = takeFlag(argv, '--against')
   if (!against) {
-    console.error(
-      'Missing --against: pass the other server as a name from vibrissa.json, a command line, or a URL. Example: vib diff --against "node ../v1/dist/index.js"',
+    return usageFailure(
+      new UsageError(
+        'Missing --against: pass the other server as a name from vibrissa.json, a command line, or a URL.',
+        {
+          code: 'missing-argument',
+          hint: 'Example: vib diff --against "node ../v1/dist/index.js"',
+          next: ['vib diff --help'],
+        },
+      ),
+      'diff',
+      json,
     )
-    return 2
   }
   const manifestOnly = hasFlag(argv, '--manifest-only')
   let options: RunOptions
@@ -185,8 +284,7 @@ export async function diffCommand(rawArgv: string[]): Promise<number> {
     })
     options = loaded.options
   } catch (err) {
-    console.error(err instanceof Error ? err.message : String(err))
-    return 2
+    return usageFailure(err, 'diff', json)
   }
 
   const baseConfig = resolveServerConfig(options)
@@ -225,7 +323,7 @@ export async function diffCommand(rawArgv: string[]): Promise<number> {
         if (c.skip || c.ref.server !== options.defaultServer) continue
         const base = await observe(sides[0], c, options)
         const other = await observe(sides[1], c, options)
-        const same = base.status === other.status && jsonEqual(base.observed, other.observed)
+        const same = jsonEqual(base, other)
         comparisons.push({
           id: c.ref.id,
           name: c.ref.name,

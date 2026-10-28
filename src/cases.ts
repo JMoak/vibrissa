@@ -13,6 +13,7 @@ import { stripJsonComments, stripTrailingCommas } from './config.js'
 import type { CaseRef } from './events.js'
 import { manifestPathFor } from './manifest.js'
 import { RefResolutionError, lintExpectation, resolveRefs } from './match.js'
+import { canonicalCodeName, knownCodeNames } from './session/errors.js'
 import type { JsonObject, JsonValue, ShardSpec, Step, SuiteHooks, TestCase } from './types.js'
 
 export type OpKind = 'tool' | 'resource' | 'resourceTemplate' | 'prompt'
@@ -70,8 +71,12 @@ export interface LoadedCase {
   error?: string
   /** Set when the case declares `skip: true | "reason"`. */
   skip?: string
-  /** The file is not a case (a manifest lock matched by the globs); loadCases drops it. */
-  notACase?: 'manifest'
+  /**
+   * The file is not a case, and loadCases drops it: a manifest lock, or a `$ref` fragment (no
+   * operation / `steps`, and referenced by another matched file or kept in `shared/` /
+   * `fragments/`).
+   */
+  notACase?: 'manifest' | 'fragment'
 }
 
 export interface CaseFilters {
@@ -114,6 +119,8 @@ export interface LoadCasesResult {
   matched: number
   /** Non-fatal loader notes (ignored top-level op fields, ...). */
   warnings: string[]
+  /** Ids of `$ref` fragment files the globs matched and that were skipped (not cases). */
+  fragments?: string[]
 }
 
 // ---------------------------------------------------------------------------
@@ -361,6 +368,16 @@ class ShapeChecker {
       typeof value.code !== 'number'
     )
       this.problem(at, `"code" must be a code name or number, got ${describe(value.code)}`)
+    if (typeof value.code === 'string') {
+      const known = knownCodeNames()
+      if (!known.includes(canonicalCodeName(value.code))) {
+        const near = suggest(value.code, known)
+        this.problem(
+          at,
+          `"code" ${JSON.stringify(value.code)} is not a known error code;${near ? ` did you mean "${near}"?` : ` known names: ${known.join(', ')}.`} Use the numeric JSON-RPC code for anything else (e.g. -32000)`,
+        )
+      }
+    }
     const message = value.message
     if (
       message !== undefined &&
@@ -903,6 +920,40 @@ function pathKey(file: string): string {
   return process.platform === 'win32' ? resolved.toLowerCase() : resolved
 }
 
+/** Directory names whose JSON files are `$ref` fragments, not cases. */
+export const FRAGMENT_DIRS: readonly string[] = ['shared', 'fragments']
+
+const URL_REF = /^[a-z][a-z0-9+.-]*:\/\//i
+
+/** Absolute files referenced by `$ref`s anywhere in `doc` (pointers and URLs ignored). */
+function refTargets(doc: unknown, file: string, out: Set<string>): void {
+  if (Array.isArray(doc)) {
+    for (const item of doc) refTargets(item, file, out)
+    return
+  }
+  if (!isPlainObject(doc)) return
+  for (const [key, value] of Object.entries(doc)) {
+    if (key === '$ref' && typeof value === 'string') {
+      const target = value.split('#')[0]
+      if (target && !URL_REF.test(target)) {
+        out.add(pathKey(path.resolve(path.dirname(file), target.replace(/\\/g, '/'))))
+      }
+    } else refTargets(value, file, out)
+  }
+}
+
+/** A JSON document that cannot be a case: no operation key and no `steps`. */
+function hasNoOperation(raw: unknown): boolean {
+  if (!isPlainObject(raw)) return true
+  return raw.steps === undefined && OP_KINDS.every((kind) => raw[kind] === undefined)
+}
+
+function inFragmentDir(file: string, rootDir: string): boolean {
+  const rel = path.relative(rootDir, file)
+  const parts = (rel && !rel.startsWith('..') ? rel : file).split(/[\\/]/).slice(0, -1)
+  return parts.some((part) => FRAGMENT_DIRS.includes(part.toLowerCase()))
+}
+
 function loadAll(files: string[], options: LoadCasesOptions): LoadCasesResult {
   const warnings: string[] = []
   const excluded = new Set(
@@ -911,11 +962,49 @@ function loadAll(files: string[], options: LoadCasesOptions): LoadCasesResult {
       ...(options.exclude ?? []).map((file) => path.resolve(options.rootDir, file)),
     ].map(pathKey),
   )
-  const all = files
+  const loaded = files
     .filter((file) => !excluded.has(pathKey(file)))
-    .map((file) => loadCaseFile(file, options, warnings))
-    .filter((loaded) => loaded.notACase === undefined)
-  return { cases: filterCases(all, options), matched: all.length, warnings }
+    .map((file) => {
+      const notes: string[] = []
+      return { file, loaded: loadCaseFile(file, options, notes), notes }
+    })
+    .filter(({ loaded: l }) => l.notACase === undefined)
+
+  // `$ref` fragments matched by the globs: no operation, and either referenced by a `$ref`
+  // from another matched file or kept in a `shared/` / `fragments/` directory.
+  const docs = new Map<string, unknown>()
+  for (const { file, loaded: l } of loaded) {
+    if (l.text === undefined) continue
+    try {
+      docs.set(file, parseCaseText(l.text, l.ref.id))
+    } catch {
+      // unparseable: stays a load error
+    }
+  }
+  const referenced = new Set<string>()
+  for (const [file, doc] of docs) refTargets(doc, file, referenced)
+  const fragments: string[] = []
+  const all: LoadedCase[] = []
+  for (const { file, loaded: l, notes } of loaded) {
+    const doc = docs.get(file)
+    const fragment =
+      docs.has(file) &&
+      hasNoOperation(doc) &&
+      (referenced.has(pathKey(file)) || inFragmentDir(file, options.rootDir))
+    if (fragment) {
+      l.notACase = 'fragment'
+      fragments.push(l.ref.id)
+    } else {
+      all.push(l)
+      warnings.push(...notes)
+    }
+  }
+  return {
+    cases: filterCases(all, options),
+    matched: all.length,
+    warnings,
+    ...(fragments.length ? { fragments: fragments.sort() } : {}),
+  }
 }
 
 /** Resolve globs, load every case, apply filters. Never throws for bad case files. */

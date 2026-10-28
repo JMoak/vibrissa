@@ -1,6 +1,15 @@
 {
   "vibrissa": 2,
   "protocolVersion": "2026-07-28",
+  "transport": "stdio",
+  "stdoutNoise": {
+    "lines": 3,
+    "sample": [
+      "Server listening on stdio",
+      "[debug] loaded 17 tools",
+      "Warning: MATH_API_KEY not set"
+    ]
+  },
   "server": {
     "name": "totally-legit-math"
   },

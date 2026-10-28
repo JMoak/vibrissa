@@ -14,6 +14,11 @@ what the server returned. This page is meant to be enough on its own to write ca
      on the actual object fail. Arrays must have the same length and order.
    - **Matcher objects** are objects whose key is one of the `$` names on this page,
      e.g. `{"$type": "string"}`. They are interpreted, not compared literally.
+   - **Any other `$` key is an error**, caught when the case loads:
+     `"$partail" is not a matcher; did you mean "$partial"? Use {"$literal": ...} for data with a literal $-key`.
+     The one exception is a string-valued `$schema` (a JSON Schema dialect URI), which is
+     plain data. Wrap data that really has `$` keys (`$id`, `$defs`, Mongo operators) in
+     [`$literal`](#literal); `vib record` does it for you.
 4. Every failure is reported with a **path** into the result, `content[0].text` style.
    Unusual keys are quoted: `_meta["com.example/trace"]`. The whole result is `(root)`.
    Failures are listed together, up to 25 per expectation.
@@ -420,7 +425,11 @@ more `$ref`s:
 
 Rules:
 - Paths are relative to **the file that contains the `$ref`**: the case file, or the
-  fragment for nested refs. Absolute paths and URLs are passed to the loader as-is.
+  fragment for nested refs. Absolute paths work; remote URLs are rejected by the case
+  loader (vendor the fragment into the repo).
+- Fragment files may live under the case globs. A JSON file with no operation that a case
+  references, or that sits in a `shared/` or `fragments/` directory, is skipped as a
+  fragment, not run as a case.
 - `file.json#/json/pointer` selects part of a fragment file. Inside a fragment file,
   `"#/pointer"` refers to that same file. In a case file, a `#` ref with no file is an
   error.
@@ -448,7 +457,7 @@ inputSchema.$ref: expected "#/$defs/a", got "#/$defs/b"
 ```
 
 Notes: inherits partial mode from above. Must stand alone. `escapeDirectives()` does this
-wrapping automatically for goldens recorded from live output.
+wrapping automatically for goldens written by `vib record` and `vib run --update`.
 
 ## Invalid matchers
 
@@ -461,9 +470,10 @@ A malformed matcher never passes silently. It becomes a mismatch starting with
 n: invalid matcher: "$number" does not support "min" (use gt, gte, lt, lte, eq)
 ```
 
-Matchers in a `$oneOf` alternative that's never reached aren't evaluated. `lintExpectation()`
-checks the whole tree statically, including regex patterns and `$schema` compilation;
-it's meant to run when cases load and in `vib check`.
+Matchers in a `$oneOf` alternative that's never reached aren't evaluated, but
+`lintExpectation()` checks the whole tree statically (unknown `$` keys, regex patterns,
+`$schema` compilation) when cases load, in `vib run` and `vib explain`. A malformed or
+unknown matcher anywhere fails the case with `errorKind: "load"` before any call is made.
 
 ## Normalization
 

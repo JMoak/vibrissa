@@ -127,10 +127,16 @@ interface Pending {
  * `client` = messages the client wrote (our stdin); `server` = the server's stdout.
  */
 export class TapRecorder {
-  private seq = 0
+  private seq: number
   private readonly pending = new Map<string, Pending>()
 
-  constructor(private readonly write: (entry: TapEntry) => void) {}
+  /** `startSeq`: the last seq already in the capture file (appended sessions continue it). */
+  constructor(
+    private readonly write: (entry: TapEntry) => void,
+    startSeq = 0,
+  ) {
+    this.seq = startSeq
+  }
 
   observe(from: 'client' | 'server', message: unknown): void {
     if (!isObject(message)) return
@@ -214,6 +220,27 @@ export interface TapProxyResult {
   out: string
 }
 
+/** The highest `seq` in an existing capture (0 for a new or empty file). Reads the tail only. */
+export function lastSeq(file: string): number {
+  let fd: number | undefined
+  try {
+    fd = fs.openSync(file, 'r')
+    const size = fs.fstatSync(fd).size
+    const length = Math.min(size, 256 * 1024)
+    const buf = Buffer.alloc(length)
+    fs.readSync(fd, buf, 0, length, size - length)
+    let max = 0
+    for (const match of buf.toString('utf8').matchAll(/"seq":(\d+)/g)) {
+      max = Math.max(max, Number(match[1]))
+    }
+    return max
+  } catch {
+    return 0
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd)
+  }
+}
+
 const SIGNAL_NUMBERS: Record<string, number> = { SIGHUP: 1, SIGINT: 2, SIGKILL: 9, SIGTERM: 15 }
 
 function quoteForShell(arg: string): string {
@@ -228,6 +255,9 @@ export function runTapProxy(opts: TapProxyOptions): Promise<TapProxyResult> {
     if (!opts.quiet) stderr.write(`[vib tap] ${text}${os.EOL}`)
   }
   fs.mkdirSync(path.dirname(opts.out), { recursive: true })
+  const startSeq = lastSeq(opts.out)
+  // Create the capture up front, so an empty session still leaves a (0-entry) file.
+  fs.appendFileSync(opts.out, '', 'utf8')
   let written = 0
   let writeFailed = false
   const recorder = new TapRecorder((entry) => {
@@ -242,7 +272,7 @@ export function runTapProxy(opts: TapProxyOptions): Promise<TapProxyResult> {
         )
       }
     }
-  })
+  }, startSeq)
   const fromClient = new FrameParser((m) => recorder.observe('client', m))
   const fromServer = new FrameParser((m) => recorder.observe('server', m))
 
@@ -280,6 +310,8 @@ export function runTapProxy(opts: TapProxyOptions): Promise<TapProxyResult> {
       stdin.off('data', onClientData)
       stdin.off('end', onClientEnd)
       stdin.pause()
+      // Our own stdin (the client's pipe) would keep the process alive after the server exited.
+      if (!opts.stdin) stdin.destroy()
       for (const [signal, handler] of signalHandlers) process.off(signal, handler)
     }
 
@@ -343,8 +375,11 @@ export function runTapProxy(opts: TapProxyOptions): Promise<TapProxyResult> {
         recorder.flush()
         cleanup()
         const exitCode = code ?? (signal ? 128 + (SIGNAL_NUMBERS[signal] ?? 1) : 1)
+        const how = signal ?? `code ${code}`
         status(
-          `server exited (${signal ?? `code ${code}`}); ${written} entr${written === 1 ? 'y' : 'ies'} in ${opts.out}`,
+          written === 0
+            ? `server exited (${how}); nothing captured (no tools/call, resources/read or prompts/get answered); ${opts.out} is empty`
+            : `server exited (${how}); ${written} entr${written === 1 ? 'y' : 'ies'} in ${opts.out}`,
         )
         resolve({ exitCode, entries: written, out: opts.out })
       })

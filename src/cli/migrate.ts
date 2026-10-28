@@ -12,7 +12,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { caseFileHasComments, parseCaseText, resolveCaseFilesSync } from '../cases.js'
-import { ConfigError, loadConfigFile } from '../config.js'
+import { ConfigError, loadConfig, loadConfigFile } from '../config.js'
 import { DEFAULT_SERVER_NAME } from '../defaults.js'
 import { canonicalCodeName } from '../session/errors.js'
 import type { JsonValue } from '../types.js'
@@ -114,6 +114,28 @@ function migrateExpectError(step: Obj, at: string, edits: string[]): Obj {
   return { ...step, expectError: { ...expectError, code: next } }
 }
 
+/** v1 config keys with no effect in v2, and what to do about them. */
+const V1_ONLY_KEYS: Record<string, string> = {
+  display: 'has no effect in v2; use --pretty / --no-pretty on vib run (or NO_COLOR) and delete it',
+}
+
+/** Notes for leftover v1 keys in a (migrated) config object, including its profiles. */
+export function leftoverKeys(config: Obj, prefix = ''): string[] {
+  const out: string[] = []
+  const scan = (obj: Obj, at: string) => {
+    for (const [key, why] of Object.entries(V1_ONLY_KEYS)) {
+      if (obj[key] !== undefined) out.push(`${prefix}${at}${key} ${why}.`)
+    }
+  }
+  scan(config, '')
+  if (isObject(config.profiles)) {
+    for (const [name, profile] of Object.entries(config.profiles)) {
+      if (isObject(profile)) scan(profile, `profiles.${name}.`)
+    }
+  }
+  return out
+}
+
 const OP_KEYS = ['tool', 'resource', 'resourceTemplate', 'prompt', 'steps']
 
 export function looksLikeCase(value: unknown): value is Obj {
@@ -159,7 +181,12 @@ export async function migrateCommand(argv: string[]): Promise<number> {
   const loaded = loadConfigFile(process.cwd(), flags.configPath)
   if (!loaded?.configPath) {
     throw new UsageError(
-      'No vibrissa config found (vibrissa.json, vibrissa.jsonc or package.json#vibrissa). Pass --config <path>, or run vib init to create one.',
+      'No vibrissa config found (vibrissa.json, vibrissa.jsonc or package.json#vibrissa).',
+      {
+        code: 'not-found',
+        hint: 'Pass --config <path>, or run vib init to create one.',
+        next: ['vib init'],
+      },
     )
   }
   const { configPath, rootDir } = loaded
@@ -185,9 +212,11 @@ export async function migrateCommand(argv: string[]): Promise<number> {
 
   // Config
   const configText = fs.readFileSync(configPath, 'utf8')
+  const notes: string[] = []
   if (path.basename(configPath) === 'package.json') {
     const pkg = parseCaseText(configText, configPath) as Obj
     const { value, edits } = migrateConfig(isObject(pkg.vibrissa) ? pkg.vibrissa : {})
+    notes.push(...leftoverKeys(value, 'vibrissa.'))
     write(
       configPath,
       configText,
@@ -202,7 +231,18 @@ export async function migrateCommand(argv: string[]): Promise<number> {
     const { value, edits } = migrateConfig(raw, {
       schema: schemaRefFor(configPath, rootDir, 'vibrissa.schema.json'),
     })
+    notes.push(...leftoverKeys(value))
     write(configPath, configText, 'config', edits, value)
+  }
+  // Keys the v2 loader does not know (typos, v1 leftovers it warns about).
+  try {
+    for (const warning of loadConfig(rootDir, { configPath }).warnings) {
+      if (warning.startsWith('Unknown config key')) notes.push(warning)
+    }
+  } catch (err) {
+    notes.push(
+      `The migrated config does not load yet: ${err instanceof Error ? err.message : String(err)}`,
+    )
   }
 
   // Cases (globs from the config, or --cases)
@@ -254,7 +294,8 @@ export async function migrateCommand(argv: string[]): Promise<number> {
   }
 
   const blocked = changes.filter((c) => c.blocked)
-  const ok = blocked.length === 0 && (manifest.exitCode ?? 0) === 0
+  // A case file that is not valid JSON was not migrated: that needs attention too.
+  const ok = blocked.length === 0 && skipped.length === 0 && (manifest.exitCode ?? 0) === 0
   const hint = dryRun
     ? 'Dry run: nothing was written. Re-run without --dry-run to apply.'
     : manifest.requested
@@ -269,6 +310,7 @@ export async function migrateCommand(argv: string[]): Promise<number> {
       unchanged,
       skipped,
       manifest,
+      ...(notes.length > 0 ? { notes } : {}),
       ...(hint ? { hint } : {}),
     })
     return ok ? 0 : 1
@@ -287,7 +329,9 @@ export async function migrateCommand(argv: string[]): Promise<number> {
     for (const edit of change.edits) console.log(`    · ${edit}`)
     if (change.blocked) console.log(c.yellow(`    ${change.blocked}`))
   }
-  for (const s of skipped) console.log(`  ${c.yellow('skipped')} ${rel(s.file)}: ${s.reason}`)
+  for (const s of skipped)
+    console.log(`  ${c.red('skipped')} ${rel(s.file)}: ${s.reason} (fix the JSON and re-run)`)
+  for (const note of notes) console.log(c.yellow(`  note: ${note}`))
   const changedCount = changes.filter((c) => !c.blocked).length
   console.log('')
   console.log(

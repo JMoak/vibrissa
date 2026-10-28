@@ -11,7 +11,7 @@ import type {
   RunEvent,
   StepRef,
 } from '../src/events.js'
-import { stripAnsi } from '../src/reporters/ansi.js'
+import { createColors, stripAnsi } from '../src/reporters/ansi.js'
 import { escapeData, escapeProperty, workflowCommand } from '../src/reporters/github.js'
 import {
   ConsoleReporter,
@@ -30,6 +30,7 @@ import {
   unregisterReporter,
 } from '../src/reporters/index.js'
 import { cdata, escapeXmlAttr } from '../src/reporters/junit.js'
+import { driftSummary, renderManifestDrift, wordDiff } from '../src/reporters/manifest.js'
 import {
   formatDuration,
   formatPassRate,
@@ -151,19 +152,29 @@ function mixedEvents(rootDir: string): RunEvent[] {
       diff: {
         tools: {
           changed: [
-            { name: 'echo', field: 'description', before: 'Echo', after: 'Echo <IMPORTANT>' },
+            {
+              key: 'echo',
+              fields: [
+                {
+                  path: 'description',
+                  before: 'Echo the input',
+                  after: 'Echo the input <IMPORTANT>',
+                  breaking: false,
+                },
+              ],
+            },
           ],
         },
       },
     },
     {
       type: 'check',
-      outcome: { id: 'list-stable', title: 'tools/list is stable', status: 'passed' },
+      outcome: { id: 'spec/list-stable', title: 'tools/list is stable', status: 'passed' },
     },
     {
       type: 'check',
       outcome: {
-        id: 'ttl',
+        id: 'spec/ttl-present',
         title: 'list results carry ttlMs',
         status: 'warned',
         detail: 'tools/list has no ttlMs',
@@ -172,7 +183,7 @@ function mixedEvents(rootDir: string): RunEvent[] {
     {
       type: 'check',
       outcome: {
-        id: 'desc-lint',
+        id: 'desc/hidden-instructions',
         server: 'local',
         title: 'description lint',
         status: 'failed',
@@ -207,6 +218,9 @@ function mixedEvents(rootDir: string): RunEvent[] {
             message: 'expected "jordan", got "jo"',
             expected: 'jordan',
             actual: 'jo',
+            field: 'expect',
+            pointer: '/steps/1/expect/structuredContent/user',
+            stepIndex: 1,
           },
         ],
         expected: { $partial: true, structuredContent: { user: 'jordan' } },
@@ -546,7 +560,7 @@ describe('console reporter', () => {
       'PASS echo returns input (12ms)',
       'PASS create then fetch (2 steps, 14ms)',
       '',
-      'Manifest: ok (1)',
+      'Manifest lock: ok (tests/integration/__manifest__.json)',
       'Result: PASSED - 2 cases: 2 passed, 0 failed, 0 skipped, 0 updated in 345ms',
     ])
     expect(stderr).toEqual([])
@@ -571,15 +585,15 @@ describe('console reporter', () => {
     expect(stdout).toContain('SKIP not ready yet (skipped: waiting on server fix)')
     expect(stdout).toContain('UPD  record greeting (golden updated, 4ms)')
     expect(stdout).toContain('FAIL slow call (812ms) over 800ms budget')
-    expect(stdout).toContain('WARN check: list results carry ttlMs')
-    expect(stdout).toContain('FAIL check: description lint')
+    expect(stdout).toContain('WARN spec/ttl-present  list results carry ttlMs')
+    expect(stdout).toContain('FAIL desc/hidden-instructions  description lint')
     expect(stdout).toContain('    - content[0].text: expected "HELLO", got "hello"')
     expect(stdout).toContain('  Trace: reports/traces/upper.ndjson')
     expect(stdout).toContain('  Budget exceeded: took 812ms, budget 800ms')
     expect(stdout.some((l) => l.includes('- expected'))).toBe(true)
     expect(stdout.some((l) => l.includes('+ actual'))).toBe(true)
     expect(stdout.at(-1)).toBe(
-      'Result: FAILED - 6 cases: 1 passed, 3 failed, 1 skipped, 1 updated in 1.23s',
+      'Result: FAILED (manifest drift, 1 check failed) - 6 cases: 1 passed, 3 failed, 1 skipped, 1 updated in 1.23s',
     )
   })
 
@@ -627,7 +641,7 @@ describe('console reporter', () => {
     expect(stdout).toContain('  ~ flaky clock: 2/3 passed (67%) [declared flaky]')
     // run:end.ok wins over our own derivation (a failure is tolerated by the flaky floor).
     expect(stdout.at(-1)).toBe(
-      'Result: PASSED - 6 cases: 5 passed, 1 failed, 0 skipped, 0 updated in 99ms',
+      'Result: PASSED - 2 cases, 6 runs: 5 passed, 1 failed, 0 skipped, 0 updated in 99ms',
     )
   })
 
@@ -663,7 +677,7 @@ describe('console reporter', () => {
     expect(plain).toContain('    ✓ 1. create [tool session.create] (5ms)')
     expect(plain).toContain('↓ not ready yet (skipped: waiting on server fix)')
     expect(plain).toContain('✎ record greeting (golden updated, 4ms)')
-    expect(plain).toContain('⚠ check: list results carry ttlMs')
+    expect(plain).toContain('⚠ spec/ttl-present  list results carry ttlMs')
     expect(plain.some((l) => l.startsWith(' FAIL  upper mismatch'))).toBe(true)
     const box = plain.filter((l) => l.startsWith('+') || l.startsWith('|'))
     expect(box.length).toBeGreaterThan(4)
@@ -674,7 +688,10 @@ describe('console reporter', () => {
     ).toBe(true)
     expect(box.some((l) => l.includes('Duration: 1.23s'))).toBe(true)
     expect(box.some((l) => l.includes('Checks: 1 passed, 1 failed, 1 warned'))).toBe(true)
-    expect(box.some((l) => l.includes('Manifest: drift in 1 of 1'))).toBe(true)
+    expect(box.some((l) => l.includes('Manifest lock: DRIFT in'))).toBe(true)
+    expect(box.some((l) => l.includes('Result: FAILED (manifest drift, 1 check failed)'))).toBe(
+      true,
+    )
   })
 
   it('labels cases with their server when the run spans several servers', async () => {
@@ -707,7 +724,7 @@ describe('console reporter', () => {
     expect(stdout).toContain('PASS [local] echo returns input (1ms)')
     expect(stdout).toContain('FAIL [staging] echo returns input (2ms)')
     expect(stdout).toContain('PASS manifest [staging] tests/staging.manifest.json')
-    expect(stdout).toContain('PASS check: [staging] tools/list is stable')
+    expect(stdout).toContain('PASS Checks [staging]: 1 passed')
 
     const junit = capture()
     await drive(new JunitReporter(junit.ctx), events)
@@ -809,7 +826,6 @@ describe('json reporter', () => {
       skipped: 1,
       updated: 1,
       durationMs: 1234,
-      flaky: [],
       checks: { passed: 1, failed: 1, warned: 1 },
       manifestDrift: 1,
       warnings: 1,
@@ -880,7 +896,7 @@ describe('json reporter', () => {
     expect(byId['cases/skip.json'].reason).toBe('waiting on server fix')
     expect(doc.checks.map((c) => c.status)).toEqual(['passed', 'warned', 'failed'])
     expect(doc.checks[2]).toEqual({
-      id: 'desc-lint',
+      id: 'desc/hidden-instructions',
       server: 'local',
       title: 'description lint',
       status: 'failed',
@@ -895,7 +911,17 @@ describe('json reporter', () => {
         diff: {
           tools: {
             changed: [
-              { name: 'echo', field: 'description', before: 'Echo', after: 'Echo <IMPORTANT>' },
+              {
+                key: 'echo',
+                fields: [
+                  {
+                    path: 'description',
+                    before: 'Echo the input',
+                    after: 'Echo the input <IMPORTANT>',
+                    breaking: false,
+                  },
+                ],
+              },
             ],
           },
         },
@@ -926,7 +952,9 @@ describe('json reporter', () => {
     ])
     expect(doc.summary.passRates).toEqual({ 'cases/a.json': 1, 'cases/b.json': 2 / 3 })
     expect(doc.summary.flaky).toEqual(['cases/b.json'])
-    expect(doc.summary.repeat).toBe(3)
+    expect(doc.repeat).toBe(3)
+    expect(doc.summary.total).toBe(2)
+    expect(doc.summary.runs).toBe(6)
     expect(doc.cases.filter((c) => c.flaky).map((c) => c.id)).toEqual([
       'cases/b.json#1',
       'cases/b.json#2',
@@ -1173,7 +1201,10 @@ describe('junit reporter', () => {
       message: '1 tool changed: echo (description)',
       type: 'ManifestDrift',
     })
-    expect(manifest.children[0].children[0].text).toContain('Echo <IMPORTANT>')
+    expect(manifest.children[0].children[0].text).toContain(
+      '~ tool echo / description (non-breaking)',
+    )
+    expect(manifest.children[0].children[0].text).toContain('Echo the input {+<IMPORTANT>+}')
 
     const checks = root.children[2]
     expect(checks.attrs).toMatchObject({ tests: '3', failures: '1' })
@@ -1295,9 +1326,11 @@ describe('github reporter', () => {
 
     const md = fs.readFileSync(summaryFile, 'utf8')
     expect(md.startsWith('# Earlier step\n')).toBe(true)
-    expect(md).toContain('## Vibrissa results: ❌ Failed')
+    expect(md).toContain('## Vibrissa results: ❌ Failed (manifest drift, 1 check failed)')
     expect(md).toContain('| Result | Total | Passed | Failed | Skipped | Updated | Duration |')
-    expect(md).toContain('| ❌ Failed | 6 | 1 | 3 | 1 | 1 | 1.23s |')
+    expect(md).toContain(
+      '| ❌ Failed (manifest drift, 1 check failed) | 6 | 1 | 3 | 1 | 1 | 1.23s |',
+    )
     expect(md).toContain('### ❌ Failures (3)')
     expect(md).toContain(
       '| upper mismatch | `cases/upper.json` | local | 8ms | Expectation failed at content[0].text: expected "HELLO", got "hello" |',
@@ -1499,5 +1532,344 @@ describe('shared helpers', () => {
     expect(
       toJsonSafe({ a: undefined, b: [undefined, 1n, Number.NaN], c: new Map([['k', 1]]) }),
     ).toEqual({ b: [null, '1', null], c: { k: 1 } })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Dogfood polish: checks folding, empty runs, verdict reasons, drift, --update
+// ---------------------------------------------------------------------------
+
+function endEvent(
+  summary: Partial<{ total: number; passed: number; failed: number; durationMs: number }>,
+  ok?: boolean,
+): RunEvent {
+  return {
+    type: 'run:end',
+    summary: { total: 0, passed: 0, failed: 0, skipped: 0, updated: 0, durationMs: 5, ...summary },
+    ...(ok !== undefined ? { ok } : {}),
+  }
+}
+
+describe('console polish', () => {
+  it('folds passing checks into one line and gives failures an id-first, allow-listable line', async () => {
+    const { ctx, stdout } = capture()
+    await drive(new ConsoleReporter(ctx, { style: 'plain' }), mixedEvents(tmpDir))
+    const pass = stdout.indexOf('PASS Checks: 1 passed')
+    expect(pass).toBeGreaterThan(-1)
+    expect(stdout.filter((l) => l.includes('tools/list is stable'))).toEqual([])
+    const fail = stdout.indexOf('FAIL desc/hidden-instructions  description lint')
+    expect(stdout.slice(fail + 1, fail + 3)).toEqual([
+      '    echo: hidden instruction "<IMPORTANT>"',
+      '    Accept after review: checks.allow: ["desc/hidden-instructions"]',
+    ])
+    expect(stdout).toContain('WARN spec/ttl-present  list results carry ttlMs')
+    expect(stdout).toContain('Checks: 1 passed, 1 failed, 1 warned')
+  })
+
+  it('prints warnings once-prefixed and shows the flow step on mismatch lines', async () => {
+    const { ctx, stdout } = capture()
+    await drive(new ConsoleReporter(ctx, { style: 'plain' }), mixedEvents(tmpDir))
+    expect(stdout).toContain('WARN cases/legacy.json uses the v1 "error" key; run vib migrate')
+    expect(stdout.some((l) => l.includes('warning:'))).toBe(false)
+    expect(stdout).toContain('    - structuredContent.user (step 2): expected "jordan", got "jo"')
+  })
+
+  it('treats "no cases matched" as an error and says so in the Result line', async () => {
+    const message =
+      'No test cases left after filters (--tag smoke): 3 case file(s) matched the globs. Loosen the filters.'
+    const failing = capture()
+    await drive(new ConsoleReporter(failing.ctx, { style: 'plain' }), [
+      { type: 'run:start', totalCases: 0, servers: [], startedAt: STARTED_AT },
+      { type: 'warning', message },
+      endEvent({}, false),
+    ])
+    expect(failing.stdout).toContain(`ERROR ${message}`)
+    expect(failing.stdout.some((l) => l.startsWith('WARN'))).toBe(false)
+    expect(failing.stdout).not.toContain('Warnings: 1')
+    expect(failing.stdout.at(-1)).toBe(
+      'Result: FAILED (no cases matched) - 0 cases: 0 passed, 0 failed, 0 skipped, 0 updated in 5ms',
+    )
+
+    // allowEmpty: the runner says ok, so it is only a warning.
+    const allowed = capture()
+    await drive(new ConsoleReporter(allowed.ctx, { style: 'plain' }), [
+      { type: 'run:start', totalCases: 0, servers: [], startedAt: STARTED_AT },
+      { type: 'warning', message },
+      endEvent({}, true),
+    ])
+    expect(allowed.stdout).toContain(`WARN ${message}`)
+    expect(allowed.stdout.at(-1)).toMatch(/^Result: PASSED - 0 cases/)
+  })
+
+  it('explains failures that do not come from cases', async () => {
+    const { ctx, stdout } = capture()
+    await drive(new ConsoleReporter(ctx, { style: 'plain' }), timeoutEvents())
+    expect(stdout.at(-1)).toMatch(/^Result: FAILED \(1 case file failed to load\) - 3 cases/)
+
+    const drift = capture()
+    await drive(new ConsoleReporter(drift.ctx, { style: 'plain' }), [
+      { type: 'run:start', totalCases: 1, servers: ['local'], startedAt: STARTED_AT },
+      {
+        type: 'manifest:diff',
+        path: 'tests/__manifest__.json',
+        summary: '1 tool removed (get_forecast)',
+        diff: { tools: { removed: ['get_forecast'] } },
+      },
+      ...caseEvents(echo, { status: 'passed', durationMs: 1 }),
+      endEvent({ total: 1, passed: 1 }, false),
+    ])
+    expect(drift.stdout).toContain(
+      'Manifest lock: DRIFT in tests/__manifest__.json (1 tool removed)',
+    )
+    expect(drift.stdout.at(-1)).toBe(
+      'Result: FAILED (manifest drift) - 1 case: 1 passed, 0 failed, 0 skipped, 0 updated in 5ms',
+    )
+  })
+
+  it('renders structured manifest drift with breaking tags and a word-level description diff', async () => {
+    const { ctx, stdout } = capture()
+    await drive(new ConsoleReporter(ctx, { style: 'plain' }), [
+      {
+        type: 'manifest:diff',
+        path: 'tests/__manifest__.json',
+        summary: 'drift',
+        diff: {
+          tools: {
+            removed: ['get_forecast'],
+            added: [{ key: 'get_alerts', breaking: false }],
+            changed: [
+              {
+                key: 'get_weather',
+                fields: [
+                  {
+                    path: 'description',
+                    before: 'Get the weather for a city',
+                    after: 'Get the weather anywhere',
+                    breaking: false,
+                  },
+                  {
+                    path: 'inputSchema',
+                    before: { type: 'object', required: ['city'] },
+                    after: { type: 'object', required: ['city', 'units'] },
+                    breaking: true,
+                  },
+                ],
+              },
+            ],
+          },
+          changes: [{ path: 'server.name', before: 'weather', after: 'weather-v2' }],
+        },
+      },
+      endEvent({}, false),
+    ])
+    const start = stdout.indexOf('FAIL tests/__manifest__.json')
+    const block = stdout.slice(start)
+    expect(block).toContain('  - removed tool get_forecast (breaking)')
+    expect(block).toContain('  ~ tool get_weather / description (non-breaking)')
+    expect(block).toContain('      Get the weather [-for a city-]{+anywhere+}')
+    expect(block).toContain('  ~ tool get_weather / inputSchema (breaking)')
+    expect(block).toContain('      +     "units"')
+    expect(block).toContain('  + added tool get_alerts (non-breaking)')
+    expect(block).toContain('  ~ server server.name')
+    expect(block).toContain('      "weather" -> "weather-v2"')
+    expect(stdout).toContain(
+      'Manifest lock: DRIFT in tests/__manifest__.json (1 tool removed, 1 tool changed, 1 tool added, 1 server field changed)',
+    )
+  })
+
+  it('honors updateSkipped and never suggests --update on an --update run', async () => {
+    const { ctx, stdout } = capture()
+    await drive(new ConsoleReporter(ctx, { style: 'plain' }), [
+      ...caseEvents(echo, {
+        status: 'failed',
+        durationMs: 1,
+        reason: 'Expectation failed at content[0].text: expected "A", got "a"',
+        expected: { text: 'A' },
+        actual: { text: 'a' },
+        updateSkipped: { reason: 'expect contains matchers ($regex); update it by hand' },
+      } as CaseOutcome),
+      endEvent({ total: 1, failed: 1 }, false),
+    ])
+    expect(stdout).toContain('  not updated: expect contains matchers ($regex); update it by hand')
+    expect(stdout.some((l) => l.includes('--update'))).toBe(false)
+
+    // A normal run whose reason already carries the runner's hint gets no second tip.
+    const hinted = capture()
+    await drive(new ConsoleReporter(hinted.ctx, { style: 'plain' }), [
+      ...caseEvents(echo, {
+        status: 'failed',
+        durationMs: 1,
+        reason: 'Expectation failed at text. Use --update to accept the new output.',
+        expected: { text: 'A' },
+        actual: { text: 'a' },
+      }),
+      endEvent({ total: 1, failed: 1 }, false),
+    ])
+    expect(hinted.stdout.filter((l) => l.includes('--update'))).toHaveLength(1)
+  })
+
+  it('shows shard and repeat in the header', async () => {
+    const { ctx, stdout } = capture()
+    await drive(new ConsoleReporter(ctx, { style: 'plain' }), [
+      {
+        type: 'run:start',
+        totalCases: 4,
+        servers: ['local'],
+        startedAt: STARTED_AT,
+        repeat: 2,
+        shard: { index: 1, total: 4 },
+      } as RunEvent,
+      endEvent({ total: 0 }, true),
+    ])
+    expect(stdout[0]).toBe('vibrissa: running 4 cases on local (shard 1/4, repeat 2)')
+  })
+})
+
+describe('update and runner-rendered drift', () => {
+  it('lists updated goldens once (streaming line) plus a count in the summary', async () => {
+    const { ctx, stdout } = capture()
+    await drive(new ConsoleReporter(ctx, { style: 'plain' }), mixedEvents(tmpDir))
+    expect(stdout.filter((l) => l.includes('record greeting'))).toEqual([
+      'UPD  record greeting (golden updated, 4ms)',
+    ])
+    expect(stdout.some((l) => l.includes('Updated goldens'))).toBe(false)
+    expect(stdout).toContain('Goldens updated: 1')
+  })
+
+  it('prints a multi-line runner summary as-is: no JSON dump, no second rendering or tip', async () => {
+    const summary = [
+      '1 tool changed (get_weather: description)',
+      '  ~ tool get_weather / description (non-breaking)',
+      'Review the change, then run vib run --update-manifest to accept it.',
+    ].join('\n')
+    const events: RunEvent[] = [
+      {
+        type: 'manifest:diff',
+        path: 'tests/__manifest__.json',
+        summary,
+        diff: {
+          tools: {
+            changed: [
+              {
+                key: 'get_weather',
+                fields: [{ path: 'description', before: 'a b', after: 'a c', breaking: false }],
+              },
+            ],
+          },
+        },
+      },
+      endEvent({}, false),
+    ]
+    const { ctx, stdout } = capture()
+    await drive(new ConsoleReporter(ctx, { style: 'plain' }), events)
+    const start = stdout.indexOf('FAIL tests/__manifest__.json')
+    expect(stdout.slice(start + 1, start + 4)).toEqual([
+      '  1 tool changed (get_weather: description)',
+      '    ~ tool get_weather / description (non-breaking)',
+      '  Review the change, then run vib run --update-manifest to accept it.',
+    ])
+    expect(stdout.filter((l) => l.includes('~ tool get_weather'))).toHaveLength(1)
+    expect(stdout.some((l) => l.includes('"tools"') || l.trim() === '{')).toBe(false)
+    expect(stdout.filter((l) => l.includes('--update-manifest'))).toHaveLength(1)
+
+    const tap = capture()
+    await drive(new TapReporter(tap.ctx), events)
+    expect(tap.stdout).toContain('  message: "1 tool changed (get_weather: description)"')
+    expect(tap.stdout).toContain('      ~ tool get_weather / description (non-breaking)')
+    expect(tap.stdout.filter((l) => l.includes('~ tool get_weather'))).toHaveLength(1)
+
+    const junit = capture()
+    await drive(new JunitReporter(junit.ctx), events)
+    const failure = readJunit(tmpDir).children[0].children[0].children[0]
+    expect(failure.text).toBe(summary)
+  })
+})
+
+describe('json polish', () => {
+  it('passes mismatch field/pointer/stepIndex through', async () => {
+    const { ctx } = capture()
+    await drive(new JsonReporter(ctx), mixedEvents(tmpDir))
+    const flowCase = readJson(tmpDir).cases.find((c) => c.id === 'cases/flow.json')
+    expect(flowCase?.mismatches).toEqual([
+      {
+        path: 'structuredContent.user',
+        message: 'expected "jordan", got "jo"',
+        expected: 'jordan',
+        actual: 'jo',
+        field: 'expect',
+        pointer: '/steps/1/expect/structuredContent/user',
+        stepIndex: 1,
+      },
+    ])
+  })
+
+  it('adds shard/repeat metadata, updateSkipped, and omits empty arrays', async () => {
+    const { ctx } = capture()
+    await drive(new JsonReporter(ctx), [
+      {
+        type: 'run:start',
+        totalCases: 1,
+        servers: ['local'],
+        startedAt: STARTED_AT,
+        shard: { index: 2, total: 3 },
+      } as RunEvent,
+      ...caseEvents(upper, {
+        status: 'failed',
+        durationMs: 1,
+        updateSkipped: { reason: 'expect contains matchers' },
+      } as CaseOutcome),
+      endEvent({ total: 1, failed: 1 }, false),
+    ])
+    const doc = readJson(tmpDir)
+    expect(doc.shard).toEqual({ index: 2, total: 3 })
+    expect(doc.repeat).toBeUndefined()
+    expect(doc.cases[0].updateSkipped).toEqual({ reason: 'expect contains matchers' })
+    expect('tags' in doc.cases[0]).toBe(false)
+    expect('checks' in doc).toBe(false)
+    expect('manifests' in doc).toBe(false)
+    expect('warnings' in doc).toBe(false)
+    expect('flaky' in doc.summary).toBe(false)
+    expect(doc.summary.runs).toBeUndefined()
+  })
+})
+
+describe('github polish', () => {
+  it('strips the --update hint from annotations and reports why goldens were not updated', async () => {
+    const { ctx, stdout } = capture()
+    await drive(new GithubReporter(ctx, { env: {}, annotations: 'always' }), [
+      ...caseEvents(echo, {
+        status: 'failed',
+        durationMs: 1,
+        reason:
+          'Expectation failed at text: expected "A", got "a". Use --update to accept the new output.',
+        updateSkipped: { reason: 'expect contains matchers' },
+      } as CaseOutcome),
+      endEvent({ total: 1, failed: 1 }, false),
+    ])
+    const annotation = stdout.find((l) => l.startsWith('::error'))
+    expect(annotation).toBe(
+      '::error file=cases/echo.json,title=Vibrissa%3A echo returns input failed::Expectation failed at text: expected "A", got "a".%0ANot updated: expect contains matchers',
+    )
+  })
+})
+
+describe('manifest drift helpers', () => {
+  it('word-diffs descriptions', () => {
+    const plain = createColors(false)
+    expect(wordDiff('Echo the input', 'Echo the input <IMPORTANT>', plain)).toBe(
+      'Echo the input {+<IMPORTANT>+}',
+    )
+    expect(wordDiff('Get the weather now', 'Get weather now', plain)).toBe(
+      'Get [-the-] weather now',
+    )
+  })
+
+  it('summarizes structured diffs and rejects unstructured ones', () => {
+    expect(driftSummary({ prompts: { added: ['greet', 'bye'] } })).toBe('2 prompts added')
+    expect(driftSummary({ error: 'connection refused' })).toBe('error: connection refused')
+    expect(driftSummary('nope')).toBeUndefined()
+    expect(
+      renderManifestDrift({ tools: { changed: [{ name: 'legacy-shape' }] } }, createColors(false)),
+    ).toBeUndefined()
   })
 })

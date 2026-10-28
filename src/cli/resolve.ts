@@ -1,10 +1,11 @@
 import path from 'node:path'
 import { type ConfigOverrides, loadConfig, loadConfigFile, parseProtocolMode } from '../config.js'
 import { resolveRootDir, resolveServerConfig } from '../paths.js'
-import { McpSession, type SessionOptions } from '../session/index.js'
+import { McpSession, type SessionOptions, SessionStartError } from '../session/index.js'
 import type { ProtocolMode, RunOptions, ServerConfig } from '../types.js'
 import { isHttpServerConfig } from '../types.js'
 import {
+  UsageError,
   hasFlag,
   parseEnvPairs,
   resolvePathFromCwd,
@@ -39,6 +40,12 @@ export function parseCommonFlags(argv: string[]): CommonCliFlags {
 
   let serverCmd: string | undefined
   let serverArgs: string[] | undefined
+  if (serverRaw !== undefined && serverRaw.trim() === '') {
+    throw new UsageError('Empty --server value.', {
+      code: 'invalid-argument',
+      hint: 'Pass a server name from vibrissa.json, a command line ("node dist/index.js") or a URL.',
+    })
+  }
   if (serverRaw !== undefined && !/^https?:\/\//i.test(serverRaw.trim())) {
     const split = splitCommandLine(serverRaw)
     serverCmd = split.cmd
@@ -48,10 +55,21 @@ export function parseCommonFlags(argv: string[]): CommonCliFlags {
   let protocol: ProtocolMode | undefined
   if (protocolRaw !== undefined) {
     protocol = parseProtocolMode(protocolRaw, () => {
-      throw new Error(
-        `Invalid --protocol value "${protocolRaw}": expected auto, legacy, modern, or a revision like 2026-07-28.`,
-      )
+      throw new UsageError(`Invalid --protocol value "${protocolRaw}".`, {
+        code: 'invalid-argument',
+        hint: 'Use auto, legacy, modern, or a revision like 2026-07-28.',
+      })
     })
+  }
+  let timeoutMs: number | undefined
+  if (timeoutRaw !== undefined) {
+    timeoutMs = Number(timeoutRaw)
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      throw new UsageError(`Invalid --timeout value "${timeoutRaw}".`, {
+        code: 'invalid-argument',
+        hint: 'Pass milliseconds, e.g. --timeout 5000.',
+      })
+    }
   }
 
   return {
@@ -61,10 +79,7 @@ export function parseCommonFlags(argv: string[]): CommonCliFlags {
     serverArgs,
     serverCwd,
     env: Object.keys(env).length > 0 ? env : undefined,
-    timeoutMs:
-      timeoutRaw !== undefined && Number.isFinite(Number(timeoutRaw))
-        ? Number(timeoutRaw)
-        : undefined,
+    timeoutMs,
     json: hasFlag(argv, '--json'),
     profile,
     protocol,
@@ -106,15 +121,33 @@ export function mergeCliOptions(
   return options
 }
 
+/** True when no config file is found for these flags (built-in defaults apply). */
+export function usingDefaultConfig(flags: CommonCliFlags): boolean {
+  if (flags.configPath) return false
+  try {
+    return loadConfigFile(process.cwd()) === undefined
+  } catch {
+    return false
+  }
+}
+
+export const NO_CONFIG_HINT =
+  "No vibrissa.json found; using the default server command `node dist/index.js`. Run vib init --server '<cmd>' to configure yours (or pass --server)."
+
 export function openSessionOptions(flags: CommonCliFlags): {
   options: RunOptions
   server: ServerConfig
   serverName: string
   rootDir: string
   timeoutMs: number
+  /** No config file and no --server: the built-in `node dist/index.js` is used. */
+  defaulted: boolean
 } {
   const options = mergeCliOptions(flags)
+  const defaulted = flags.server === undefined && usingDefaultConfig(flags)
+  if (defaulted && !flags.json) console.warn(`note: ${NO_CONFIG_HINT}`)
   return {
+    defaulted,
     options,
     server: resolveServerConfig(options),
     serverName: options.defaultServer,
@@ -147,12 +180,39 @@ export async function startSession(
   extra: Partial<SessionOptions> = {},
   resolved: ReturnType<typeof openSessionOptions> = openSessionOptions(flags),
 ): Promise<StartedSession> {
-  const session = await McpSession.start(resolved.server, {
-    timeoutMs: resolved.timeoutMs,
-    stderr: 'capture',
-    ...extra,
-  })
+  let session: McpSession
+  try {
+    session = await McpSession.start(resolved.server, {
+      timeoutMs: resolved.timeoutMs,
+      stderr: 'capture',
+      ...extra,
+    })
+  } catch (err) {
+    // The note was already printed unless --json suppressed it; say it once.
+    if (resolved.defaulted && flags.json && err instanceof SessionStartError) {
+      throw new SessionStartError(`${err.message} ${NO_CONFIG_HINT}`, err.code, err.stderr, {
+        cause: err,
+      })
+    }
+    throw err
+  }
   return { session, ...resolved }
+}
+
+/**
+ * The server name `vib record` should write into a case: `--server X` when X is a server
+ * configured in vibrissa.json other than its defaultServer; undefined otherwise (no flag,
+ * the default server, or a command line / URL, which a case cannot name).
+ */
+export function caseServerName(flags: CommonCliFlags): string | undefined {
+  if (flags.server === undefined) return undefined
+  const base = mergeCliOptions(
+    { ...flags, server: undefined, serverCmd: undefined, serverArgs: undefined },
+    {},
+    { quiet: true },
+  )
+  if (!Object.hasOwn(base.servers, flags.server)) return undefined
+  return flags.server === base.defaultServer ? undefined : flags.server
 }
 
 export interface ChecksConfig {

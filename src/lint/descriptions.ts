@@ -136,6 +136,11 @@ export const IMPERATIVE_PATTERNS: Pattern[] = [
   },
   {
     group: 'precondition',
+    label: '"before calling,"',
+    re: /\bbefore\s+(?:using|calling|invoking)(?:\s+it)?\s*,/iu,
+  },
+  {
+    group: 'precondition',
     label: '"you must first/always"',
     re: /\byou\s+must\s+(?:first|always)\b/iu,
   },
@@ -167,6 +172,11 @@ export const IMPERATIVE_PATTERNS: Pattern[] = [
   },
   {
     group: 'payload',
+    label: 'smuggle into an argument',
+    re: /\b(?:include|put|place|insert|embed|append|pass|send|copy)\s+(?:it|them|its\s+contents?|their\s+contents?|the\s+contents?)\s+(?:in|into|as|to)\s+(?:the\s+)?[`'"]?[\w.-]+[`'"]?\s+(?:field|argument|parameter|param)\b/iu,
+  },
+  {
+    group: 'payload',
     label: 'read a local file',
     re: /\b(?:read|cat|open|load)\s+(?:the\s+)?(?:file\s+|contents?\s+of\s+)?[`'"]?(?:~|\$HOME|%USERPROFILE%|\/etc\/)/iu,
   },
@@ -186,12 +196,16 @@ export const HIDDEN_MARKUP_PATTERNS: Pattern[] = [
   },
 ]
 
+/**
+ * Most specific first: when two patterns hit the same path token
+ * (`~/.ssh/id_rsa`), only the earlier one is reported.
+ */
 export const SENSITIVE_PATH_PATTERNS: Pattern[] = [
-  { label: 'SSH directory', re: /(?<![\w.])\.ssh(?![\w-])/iu },
   {
     label: 'SSH private key',
     re: /(?<![A-Za-z0-9])id_(?:rsa|dsa|ecdsa|ed25519)(?![A-Za-z0-9])/iu,
   },
+  { label: 'SSH directory', re: /(?<![\w.])\.ssh(?![\w-])/iu },
   {
     label: 'cloud credentials',
     re: /\.aws[\\/](?:credentials|config)\b|(?<![\w.])\.(?:azure|kube|gnupg)(?![\w-])|\.config[\\/]gcloud\b|\.docker[\\/]config\.json\b/iu,
@@ -289,54 +303,154 @@ export const STEERING_CUES: Pattern[] = [
 // Rule implementations
 // ---------------------------------------------------------------------------
 
-/** Fires once per matching pattern. */
-function anyPattern(patterns: Pattern[]): TextCheck {
-  return (src) => {
-    const out: string[] = []
-    for (const p of patterns) {
-      const m = p.re.exec(src.text)
-      if (m) {
-        out.push(`${src.field}: ${p.label} in ${quote(excerpt(src.text, m.index, m[0].length))}`)
-      }
-    }
-    return out
+interface Hit {
+  p: Pattern
+  index: number
+  length: number
+}
+
+const TOKEN_BOUNDARY = /[\s'"`()<>[\]{},;]/u
+const MAX_TOKEN_REACH = 200
+const MAX_MATCHES_PER_PATTERN = 50
+const globalCache = new WeakMap<RegExp, RegExp>()
+
+function globalOf(re: RegExp): RegExp {
+  let g = globalCache.get(re)
+  if (!g) {
+    g = new RegExp(re.source, `${re.flags}g`)
+    globalCache.set(re, g)
   }
+  return g
+}
+
+/** The match widened to the surrounding path-like token (`~/.ssh/id_rsa`), for overlap tests. */
+function tokenSpan(text: string, index: number, length: number): [number, number] {
+  let start = index
+  let end = index + length
+  const minStart = Math.max(0, index - MAX_TOKEN_REACH)
+  const maxEnd = Math.min(text.length, end + MAX_TOKEN_REACH)
+  while (start > minStart && !TOKEN_BOUNDARY.test(text[start - 1])) start--
+  while (end < maxEnd && !TOKEN_BOUNDARY.test(text[end])) end++
+  return [start, end]
+}
+
+/**
+ * At most one hit per pattern. Within a group (default: the whole table), a hit
+ * whose token overlaps an earlier pattern's hit is dropped, so `~/.ssh/id_rsa`
+ * reports "SSH private key" once instead of also "SSH directory". Earlier
+ * patterns in a table therefore win: order tables most-specific first.
+ */
+function collectHits(patterns: Pattern[], text: string, grouped: boolean): Hit[] {
+  const kept: Array<Hit & { span: [number, number]; group: string }> = []
+  for (const p of patterns) {
+    const group = grouped ? (p.group ?? p.label) : ''
+    const re = globalOf(p.re)
+    re.lastIndex = 0
+    let n = 0
+    for (const m of text.matchAll(re)) {
+      if (++n > MAX_MATCHES_PER_PATTERN) break
+      const index = m.index ?? 0
+      const span = tokenSpan(text, index, m[0].length)
+      const clash = kept.some(
+        (k) => k.group === group && span[0] < k.span[1] && k.span[0] < span[1],
+      )
+      if (clash) continue
+      kept.push({ p, index, length: m[0].length, span, group })
+      break
+    }
+  }
+  return kept.sort((a, b) => a.index - b.index)
+}
+
+/** Fires once per matching pattern (overlapping hits collapse to the most specific). */
+function anyPattern(patterns: Pattern[]): TextCheck {
+  return (src) =>
+    collectHits(patterns, src.text, false).map(
+      (h) => `${src.field}: ${h.p.label} in ${quote(excerpt(src.text, h.index, h.length))}`,
+    )
 }
 
 /** Fires when patterns from at least `min` distinct groups match the same string. */
 function patternGroups(patterns: Pattern[], min: number): TextCheck {
   return (src) => {
-    const hits: Array<{ p: Pattern; m: RegExpExecArray }> = []
-    for (const p of patterns) {
-      const m = p.re.exec(src.text)
-      if (m) hits.push({ p, m })
-    }
+    const hits = collectHits(patterns, src.text, true)
     if (new Set(hits.map((h) => h.p.group ?? h.p.label)).size < min) return []
-    const first = hits[0].m
+    const first = hits[0]
     const labels = hits.map((h) => h.p.label).join(' + ')
-    return [
-      `${src.field}: ${labels} in ${quote(excerpt(src.text, first.index, first[0].length, 48))}`,
-    ]
+    return [`${src.field}: ${labels} in ${quote(excerpt(src.text, first.index, first.length, 48))}`]
   }
 }
 
-/** Fires per sentence that names another tool together with >= `min` distinct cues. */
+/** "any other weather tool", "all other tools", "other tools". */
+const GENERIC_TOOL_REF_RE =
+  /\b(?:any|all|every)\s+other\s+(?:[\w-]+\s+){0,2}?tools?\b|\bother\s+tools\b/iu
+
+/** A tool-like identifier right after a directive: "never use search_web", "instead of `read_doc`". */
+const DIRECTIVE_REF_RE =
+  /\b(?:(?:never|do\s+not|don['’]?t|must\s+not|should\s+not|stop)\s+(?:use|using|call|calling|invoke|invoking|run|running|trust)|instead\s+of(?:\s+(?:using|calling))?|rather\s+than(?:\s+(?:using|calling))?|prefer\s+this(?:\s+tool)?\s+(?:over|to))\s+(?:the\s+)?[`'"]?([A-Za-z][A-Za-z0-9_.-]*[A-Za-z0-9])/giu
+
+const FILE_LIKE_RE =
+  /\.(?:json|ya?ml|toml|md|txt|js|ts|py|sh|env|ini|cfg|conf|xml|html|csv|log|lock)$/iu
+
+/** Case-sensitive on purpose: separator-joined (`search_web`, `notes.get`) or camelCase (`getUser`). */
+function isToolLikeIdentifier(s: string): boolean {
+  return (
+    s.length >= 3 &&
+    !FILE_LIKE_RE.test(s) &&
+    (/^[A-Za-z][A-Za-z0-9]*(?:[_.-][A-Za-z0-9]+)+$/u.test(s) || /[a-z][A-Z]/u.test(s))
+  )
+}
+
+/**
+ * Other tools a sentence refers to: names from the manifest / knownToolNames,
+ * generic "any other ... tool" phrases, and tool-like identifiers that follow a
+ * use/call directive even when the tool is not in this manifest (cross-server).
+ * Unlisted identifiers only count when the sentence talks about tools at all,
+ * so "never use snake_case keys" is not a tool reference.
+ */
+function referencedTools(sentence: string, ctx: LintContext, self: string | undefined): string[] {
+  const selfLower = self?.toLowerCase()
+  const refs = ctx.mentions
+    .filter((m) => m.name !== self && m.re.test(sentence))
+    .map((m) => quote(m.name))
+  const known = new Set(ctx.mentions.map((m) => m.name.toLowerCase()))
+  const generic = GENERIC_TOOL_REF_RE.exec(sentence)
+  if (generic) refs.push(quote(generic[0]))
+  if (/\btools?\b/iu.test(sentence)) {
+    for (const m of sentence.matchAll(DIRECTIVE_REF_RE)) {
+      const id = m[1]
+      const lower = id.toLowerCase()
+      if (!isToolLikeIdentifier(id) || lower === selfLower || known.has(lower)) continue
+      const label = `${quote(id)} (not in this manifest)`
+      if (!refs.includes(label)) refs.push(label)
+    }
+  }
+  return refs
+}
+
+/** Fires per sentence that refers to another tool together with >= `min` distinct cues. */
 function toolMentionRule(cues: Pattern[], min: number): TextCheck {
   return (src, ctx) => {
     if (src.kind !== 'tool') return []
     const out: string[] = []
     for (const sentence of splitSentences(src.text)) {
-      const named = ctx.mentions.filter((m) => m.name !== src.toolName && m.re.test(sentence))
-      if (named.length === 0) continue
+      const refs = referencedTools(sentence, ctx, src.toolName)
+      if (refs.length === 0) continue
       const hits = cues.filter((c) => c.re.test(sentence))
       if (new Set(hits.map((h) => h.group ?? h.label)).size < min) continue
-      const names = named.map((m) => quote(m.name)).join(', ')
       const labels = hits.map((h) => h.label).join(' + ')
-      out.push(`${src.field}: names ${names} with ${labels} in ${quote(clip(sentence))}`)
+      out.push(`${src.field}: names ${refs.join(', ')} with ${labels} in ${quote(clip(sentence))}`)
     }
     return out
   }
 }
+
+/** Sensitive paths double as the "exfiltration target" signal for the imperative rule. */
+const EXFIL_TARGET_PATTERNS: Pattern[] = SENSITIVE_PATH_PATTERNS.map((p) => ({
+  ...p,
+  group: 'target',
+  label: `targets ${p.label}`,
+}))
 
 function invisibleChars(src: TextSource): TextResult[] {
   const { hits, tagText } = scanInvisible(src.raw)
@@ -581,7 +695,7 @@ function annotationTypes(tool: ToolSummary): string[] {
 // biome-ignore format: one rule per line keeps the table scannable
 export const DESCRIPTION_RULES: readonly DescriptionRule[] = [
   { id: 'desc/hidden-instructions', title: 'Hidden instructions in model-visible text', severity: 'failed', text: anyPattern(HIDDEN_INSTRUCTION_PATTERNS) },
-  { id: 'desc/imperative-instructions', title: 'Coercive imperative phrasing (2+ signals)', severity: 'warned', text: patternGroups(IMPERATIVE_PATTERNS, 2) },
+  { id: 'desc/imperative-instructions', title: 'Coercive imperative phrasing (2+ signals)', severity: 'warned', text: patternGroups([...IMPERATIVE_PATTERNS, ...EXFIL_TARGET_PATTERNS], 2) },
   { id: 'desc/invisible-unicode', title: 'Invisible or bidi-override Unicode characters', severity: 'failed', text: invisibleChars },
   { id: 'desc/whitespace-padding', title: 'Whitespace padding pushes text out of view', severity: 'warned', text: whitespacePadding },
   { id: 'desc/html-comment', title: 'Markdown/HTML comment hides text from reviewers', severity: 'warned', text: anyPattern(HIDDEN_MARKUP_PATTERNS) },

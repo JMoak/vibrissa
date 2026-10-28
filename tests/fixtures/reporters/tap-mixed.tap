@@ -6,18 +6,8 @@ not ok 1 - manifest drift tests/integration/__manifest__.json (local)
   message: "1 tool changed: echo (description)"
   severity: fail
   diff: |-
-    {
-      "tools": {
-        "changed": [
-          {
-            "name": "echo",
-            "field": "description",
-            "before": "Echo",
-            "after": "Echo <IMPORTANT>"
-          }
-        ]
-      }
-    }
+    ~ tool echo / description (non-breaking)
+        Echo the input {+<IMPORTANT>+}
   ...
 ok 2 - check: tools/list is stable
 ok 3 - check: list results carry ttlMs

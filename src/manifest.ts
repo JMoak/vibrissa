@@ -8,8 +8,7 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
-import { diffLinesUnified } from 'jest-diff'
-import { DEFAULT_MANIFEST_PATH } from './defaults.js'
+import { DEFAULT_MANIFEST_IGNORE_PATHS, DEFAULT_MANIFEST_PATH } from './defaults.js'
 import type { ListMeta, ListMetaEntry } from './lint/types.js'
 import { defaultNormalizeConfig, normalizeResult } from './normalize.js'
 import { type McpSession, SessionRequestError } from './session/index.js'
@@ -27,8 +26,12 @@ import type {
 
 export const MANIFEST_VERSION = 2
 
-/** Dotted paths ignored by diffManifest unless overridden (`manifestIgnore`). */
-export const DEFAULT_MANIFEST_IGNORE: readonly string[] = ['server.version']
+/**
+ * Dotted paths ignored by diffManifest unless overridden (`manifestIgnore`): the server's
+ * release version, and what differs only by protocol era (`protocolVersion`, `listMeta`), so
+ * one lock serves both eras. `vib manifest diff --strict` compares everything.
+ */
+export const DEFAULT_MANIFEST_IGNORE: readonly string[] = DEFAULT_MANIFEST_IGNORE_PATHS
 
 export interface Manifest {
   vibrissa: 2
@@ -317,44 +320,62 @@ export function writeManifest(file: string, manifest: Manifest): void {
 // ---------------------------------------------------------------------------
 
 export interface FieldChange {
-  /** Dotted path of the field (`description`, `server.name`, `capabilities.tools`). */
+  /**
+   * Dotted sub-path of what changed, as deep as it goes: `description`,
+   * `inputSchema.required`, `inputSchema.properties.city.type`, `capabilities.tools`.
+   */
   path: string
   /** Absent when the field was added. */
   before?: JsonValue
   /** Absent when the field was removed. */
   after?: JsonValue
+  /**
+   * Would existing clients / cases break? True for: a removed or renamed input property, a
+   * newly required property or prompt argument, a type change, removed enum values, a tightened
+   * `additionalProperties`, any outputSchema change, a changed resource mimeType, a removed
+   * capability, a protocolVersion change. Descriptions, titles and annotations are not breaking.
+   */
+  breaking: boolean
 }
 
 export interface ItemChange {
   /** Tool / prompt name, resource uri, or uriTemplate. */
   key: string
+  /** Any of `fields` is breaking. */
+  breaking: boolean
   fields: FieldChange[]
 }
 
+/** Only non-empty lists are present. Every removed item is a breaking change. */
 export interface SectionDiff {
-  added: string[]
-  removed: string[]
-  changed: ItemChange[]
+  added?: string[]
+  removed?: string[]
+  changed?: ItemChange[]
 }
 
 export const MANIFEST_SECTIONS = ['tools', 'resources', 'resourceTemplates', 'prompts'] as const
 export type ManifestSection = (typeof MANIFEST_SECTIONS)[number]
 
+/** Machine shape: empty lists and unchanged sections are omitted. */
 export interface ManifestDiff {
   identical: boolean
-  /** Server-level changes: protocolVersion, server.*, capabilities.*, instructions, listMeta.* */
-  changes: FieldChange[]
-  tools: SectionDiff
-  resources: SectionDiff
-  resourceTemplates: SectionDiff
-  prompts: SectionDiff
+  /** At least one breaking change (see FieldChange.breaking) or removed item. */
+  breaking: boolean
+  /** Server-level changes: protocolVersion, instructions, server.*, capabilities.*, listMeta.* */
+  changes?: FieldChange[]
+  tools?: SectionDiff
+  resources?: SectionDiff
+  resourceTemplates?: SectionDiff
+  prompts?: SectionDiff
 }
 
 export interface DiffManifestOptions {
   /**
-   * Dotted paths to ignore. Sections are keyed by item name / uri: `tools.*.annotations`,
-   * `tools.echo.description`, `capabilities.experimental`, `listMeta`. Default
-   * `["server.version"]`; pass `[]` to compare everything.
+   * Dotted paths to ignore. Sections are keyed by item name / uri (`tools.*.annotations`,
+   * `tools.notes.search.description`); prompt arguments by name
+   * (`prompts.*.arguments.*.description`); `*` matches any key. Default
+   * `["server.version", "protocolVersion", "listMeta"]` (per-release and per-era noise); pass
+   * `[]` to compare everything (`vib manifest diff --strict`).
    */
   ignore?: readonly string[]
 }
@@ -382,6 +403,15 @@ export function jsonEqual(a: unknown, b: unknown): boolean {
   return canonical(a) === canonical(b)
 }
 
+function byName(list: unknown): JsonObject | undefined {
+  if (!Array.isArray(list)) return undefined
+  const out: JsonObject = {}
+  for (const item of list) {
+    if (isObject(item) && typeof item.name === 'string') out[item.name] = item
+  }
+  return out
+}
+
 /** Manifest → `{ section: { key: item } }` view used for ignore paths and diffing. */
 function keyed(manifest: Manifest): JsonObject {
   const out: JsonObject = {
@@ -393,8 +423,12 @@ function keyed(manifest: Manifest): JsonObject {
   }
   for (const section of MANIFEST_SECTIONS) {
     const items: JsonObject = {}
-    for (const item of (manifest[section] ?? []) as unknown as JsonObject[]) {
-      items[String(item[SECTION_KEY[section]])] = item
+    for (const raw of (manifest[section] ?? []) as unknown as JsonObject[]) {
+      let item: JsonObject = raw
+      if (section === 'prompts' && Array.isArray(raw.arguments)) {
+        item = { ...raw, arguments: byName(raw.arguments) ?? {} }
+      }
+      items[String(raw[SECTION_KEY[section]])] = item
     }
     out[section] = items
   }
@@ -426,27 +460,117 @@ function applyIgnore(view: JsonObject, ignore: readonly string[]): JsonObject {
   return out as JsonObject
 }
 
-function fieldChanges(
+function segment(key: string): string {
+  return /^[A-Za-z_$][\w$-]*$/.test(key) ? key : `[${JSON.stringify(key)}]`
+}
+
+function joinField(prefix: string, key: string): string {
+  const seg = segment(key)
+  if (!prefix) return seg
+  return seg.startsWith('[') ? `${prefix}${seg}` : `${prefix}.${seg}`
+}
+
+interface RawChange {
+  path: string
+  segments: string[]
+  before?: JsonValue
+  after?: JsonValue
+}
+
+/** Leaf-level changes between two values (objects recurse; arrays and scalars are leaves). */
+function leafChanges(
   before: JsonValue | undefined,
   after: JsonValue | undefined,
   prefix: string,
-): FieldChange[] {
-  const a = isObject(before) ? before : {}
-  const b = isObject(after) ? after : {}
-  const keys = [...new Set([...Object.keys(a), ...Object.keys(b)])].sort(compare)
-  const changes: FieldChange[] = []
-  for (const key of keys) {
-    if (jsonEqual(a[key], b[key])) continue
-    changes.push({
-      path: prefix ? `${prefix}.${key}` : key,
-      ...(a[key] !== undefined ? { before: a[key] } : {}),
-      ...(b[key] !== undefined ? { after: b[key] } : {}),
-    })
+  segments: string[],
+): RawChange[] {
+  if (jsonEqual(before, after)) return []
+  if (isObject(before) && isObject(after)) {
+    const keys = [...new Set([...Object.keys(before), ...Object.keys(after)])].sort(compare)
+    return keys.flatMap((key) =>
+      leafChanges(before[key], after[key], joinField(prefix, key), [...segments, key]),
+    )
   }
-  return changes
+  return [
+    {
+      path: prefix,
+      segments,
+      ...(before !== undefined ? { before } : {}),
+      ...(after !== undefined ? { after } : {}),
+    },
+  ]
 }
 
-function sectionDiff(before: JsonValue | undefined, after: JsonValue | undefined): SectionDiff {
+function stringsOf(value: JsonValue | undefined): string[] {
+  return Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : []
+}
+
+function lostValues(before: JsonValue | undefined, after: JsonValue | undefined): boolean {
+  if (!Array.isArray(before)) return false
+  const kept = Array.isArray(after) ? after.map(canonical) : []
+  return before.some((v) => !kept.includes(canonical(v)))
+}
+
+/** Breaking-ness of a schema leaf change (input side: stricter is breaking). */
+function schemaBreaking(change: RawChange, rel: string[]): boolean {
+  if (rel.length === 0) return true // the whole schema appeared / disappeared / changed type
+  const last = rel[rel.length - 1]
+  const parent = rel[rel.length - 2]
+  if (parent === 'properties' && change.after === undefined) return true // removed / renamed
+  if (last === 'required') {
+    const before = stringsOf(change.before)
+    return stringsOf(change.after).some((name) => !before.includes(name))
+  }
+  if (last === 'type') return change.after !== undefined && !jsonEqual(change.before, change.after)
+  if (last === 'enum') return change.after !== undefined && lostValues(change.before, change.after)
+  if (last === 'additionalProperties') return change.after === false && change.before !== false
+  return false
+}
+
+function itemBreaking(section: ManifestSection, change: RawChange): boolean {
+  const [field, ...rest] = change.segments
+  switch (section) {
+    case 'tools':
+      if (field === 'outputSchema') return true
+      if (field === 'inputSchema') return schemaBreaking(change, rest)
+      return false
+    case 'resources':
+    case 'resourceTemplates':
+      return field === 'mimeType'
+    case 'prompts':
+      if (field !== 'arguments') return false
+      if (rest.length === 1) {
+        // An argument added as required, or removed.
+        if (change.after === undefined) return true
+        return (
+          change.before === undefined && isObject(change.after) && change.after.required === true
+        )
+      }
+      return rest[1] === 'required' && change.after === true && change.before !== true
+  }
+}
+
+function serverBreaking(change: RawChange): boolean {
+  const [field, ...rest] = change.segments
+  if (field === 'protocolVersion') return true
+  if (field === 'capabilities') return rest.length === 1 && change.after === undefined
+  return false
+}
+
+function finalize(change: RawChange, breaking: boolean): FieldChange {
+  return {
+    path: change.path,
+    ...(change.before !== undefined ? { before: change.before } : {}),
+    ...(change.after !== undefined ? { after: change.after } : {}),
+    breaking,
+  }
+}
+
+function sectionDiff(
+  section: ManifestSection,
+  before: JsonValue | undefined,
+  after: JsonValue | undefined,
+): SectionDiff | undefined {
   const a = isObject(before) ? before : {}
   const b = isObject(after) ? after : {}
   const added = Object.keys(b)
@@ -458,9 +582,17 @@ function sectionDiff(before: JsonValue | undefined, after: JsonValue | undefined
   const changed: ItemChange[] = []
   for (const key of Object.keys(a).sort(compare)) {
     if (!Object.hasOwn(b, key) || jsonEqual(a[key], b[key])) continue
-    changed.push({ key, fields: fieldChanges(a[key], b[key], '') })
+    const fields = leafChanges(a[key], b[key], '', []).map((c) =>
+      finalize(c, itemBreaking(section, c)),
+    )
+    changed.push({ key, breaking: fields.some((f) => f.breaking), fields })
   }
-  return { added, removed, changed }
+  if (added.length + removed.length + changed.length === 0) return undefined
+  return {
+    ...(added.length ? { added } : {}),
+    ...(removed.length ? { removed } : {}),
+    ...(changed.length ? { changed } : {}),
+  }
 }
 
 /** Structured diff of a locked manifest against the live one. */
@@ -473,30 +605,23 @@ export function diffManifest(
   const a = applyIgnore(keyed(locked), ignore)
   const b = applyIgnore(keyed(live), ignore)
   const changes: FieldChange[] = []
-  for (const key of ['protocolVersion', 'instructions']) {
-    if (!jsonEqual(a[key], b[key])) {
-      changes.push({
-        path: key,
-        ...(a[key] !== undefined ? { before: a[key] } : {}),
-        ...(b[key] !== undefined ? { after: b[key] } : {}),
-      })
+  for (const key of ['protocolVersion', 'instructions', 'server', 'capabilities', 'listMeta']) {
+    for (const change of leafChanges(a[key], b[key], key, [key])) {
+      changes.push(finalize(change, serverBreaking(change)))
     }
   }
-  for (const key of ['server', 'capabilities', 'listMeta']) {
-    changes.push(...fieldChanges(a[key], b[key], key))
+  const diff: ManifestDiff = { identical: true, breaking: false }
+  if (changes.length) diff.changes = changes
+  for (const section of MANIFEST_SECTIONS) {
+    const d = sectionDiff(section, a[section], b[section])
+    if (d) diff[section] = d
   }
-  const diff: ManifestDiff = {
-    identical: false,
-    changes,
-    tools: sectionDiff(a.tools, b.tools),
-    resources: sectionDiff(a.resources, b.resources),
-    resourceTemplates: sectionDiff(a.resourceTemplates, b.resourceTemplates),
-    prompts: sectionDiff(a.prompts, b.prompts),
-  }
-  diff.identical =
-    changes.length === 0 &&
-    MANIFEST_SECTIONS.every(
-      (s) => diff[s].added.length + diff[s].removed.length + diff[s].changed.length === 0,
+  diff.identical = !diff.changes && MANIFEST_SECTIONS.every((s) => diff[s] === undefined)
+  diff.breaking =
+    changes.some((c) => c.breaking) ||
+    MANIFEST_SECTIONS.some(
+      (s) =>
+        (diff[s]?.removed?.length ?? 0) > 0 || (diff[s]?.changed ?? []).some((c) => c.breaking),
     )
   return diff
 }
@@ -521,77 +646,133 @@ function count(n: number, [one, many]: [string, string]): string {
   return `${n} ${n === 1 ? one : many}`
 }
 
-/** One-line summary: `1 tool changed (echo: description); 1 prompt added (greet)`. */
+/**
+ * One-line summary: `1 tool changed (echo: description); 1 prompt added (greet)`, ending in
+ * ` (breaking)` when any change is breaking.
+ */
 export function summarizeDiff(diff: ManifestDiff): string {
   if (diff.identical) return 'no changes'
   const parts: string[] = []
   for (const section of MANIFEST_SECTIONS) {
     const d = diff[section]
+    if (!d) continue
     const noun = SECTION_NOUN[section]
-    if (d.added.length) parts.push(`${count(d.added.length, noun)} added (${names(d.added)})`)
-    if (d.removed.length) {
+    if (d.added?.length) parts.push(`${count(d.added.length, noun)} added (${names(d.added)})`)
+    if (d.removed?.length) {
       parts.push(`${count(d.removed.length, noun)} removed (${names(d.removed)})`)
     }
-    if (d.changed.length) {
+    if (d.changed?.length) {
       const detail = d.changed
         .slice(0, 3)
-        .map((c) => `${c.key}: ${c.fields.map((f) => f.path).join(', ')}`)
+        .map(
+          (c) =>
+            `${c.key}: ${names(
+              c.fields.map((f) => f.path),
+              4,
+            )}`,
+        )
         .join('; ')
       const more = d.changed.length > 3 ? `; +${d.changed.length - 3} more` : ''
       parts.push(`${count(d.changed.length, noun)} changed (${detail}${more})`)
     }
   }
-  if (diff.changes.length) parts.push(`${names(diff.changes.map((c) => c.path))} changed`)
-  return parts.join('; ')
+  if (diff.changes?.length) parts.push(`${names(diff.changes.map((c) => c.path))} changed`)
+  return `${parts.join('; ')}${diff.breaking ? ' (breaking)' : ''}`
 }
 
-function short(value: JsonValue | undefined, max = 100): string {
+function short(value: JsonValue | undefined, max = 120): string {
   if (value === undefined) return '(absent)'
   const text = JSON.stringify(value)
   return text.length > max ? `${text.slice(0, max - 1)}…` : text
 }
 
-const plain = (s: string) => s
+const MAX_WORD_TOKENS = 600
 
-function changeLines(change: FieldChange, indent: string): string[] {
-  const { before, after } = change
-  const isStructured = (v: JsonValue | undefined) => isObject(v) || Array.isArray(v)
-  if (!isStructured(before) || !isStructured(after)) {
-    return [`${indent}${change.path}: ${short(before)} -> ${short(after)}`]
-  }
-  const unified = diffLinesUnified(
-    JSON.stringify(before, null, 2).split('\n'),
-    JSON.stringify(after, null, 2).split('\n'),
-    {
-      aAnnotation: 'locked',
-      bAnnotation: 'live',
-      expand: false,
-      contextLines: 1,
-      omitAnnotationLines: true,
-      aColor: plain,
-      bColor: plain,
-      changeColor: plain,
-      commonColor: plain,
-      patchColor: plain,
-    },
+/** Word-level diff in git's `--word-diff=plain` notation: `[-removed-]{+added+}`. */
+export function wordDiff(before: string, after: string): string | undefined {
+  const a = before.match(/\s+|[^\s]+/g) ?? []
+  const b = after.match(/\s+|[^\s]+/g) ?? []
+  if (a.length > MAX_WORD_TOKENS || b.length > MAX_WORD_TOKENS) return undefined
+  const lcs: number[][] = Array.from({ length: a.length + 1 }, () =>
+    new Array(b.length + 1).fill(0),
   )
-  return [`${indent}${change.path}:`, ...unified.split('\n').map((line) => `${indent}  ${line}`)]
+  for (let i = a.length - 1; i >= 0; i--) {
+    for (let j = b.length - 1; j >= 0; j--) {
+      lcs[i][j] = a[i] === b[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1])
+    }
+  }
+  const ops: Array<['=' | '-' | '+', string]> = []
+  const push = (op: '=' | '-' | '+', token: string) => {
+    const last = ops[ops.length - 1]
+    if (last && last[0] === op) last[1] += token
+    else ops.push([op, token])
+  }
+  let i = 0
+  let j = 0
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) {
+      push('=', a[i])
+      i++
+      j++
+    } else if (lcs[i + 1][j] >= lcs[i][j + 1]) push('-', a[i++])
+    else push('+', b[j++])
+  }
+  while (i < a.length) push('-', a[i++])
+  while (j < b.length) push('+', b[j++])
+
+  // Merge change runs separated only by whitespace into one [-...-]{+...+} pair.
+  let out = ''
+  let k = 0
+  while (k < ops.length) {
+    if (ops[k][0] === '=') {
+      out += ops[k][1]
+      k++
+      continue
+    }
+    let removed = ''
+    let added = ''
+    while (k < ops.length) {
+      const [op, text] = ops[k]
+      if (op === '-') removed += text
+      else if (op === '+') added += text
+      else if (/^\s+$/.test(text) && k + 1 < ops.length && ops[k + 1][0] !== '=') {
+        removed += text
+        added += text
+      } else break
+      k++
+    }
+    out += `${removed ? `[-${removed}-]` : ''}${added ? `{+${added}+}` : ''}`
+  }
+  return out
 }
 
-/** Multi-line, uncolored rendering for the console (`vib manifest diff`, `vib diff`). */
+function changeLine(change: FieldChange, indent: string): string {
+  const tag = change.breaking ? '  (breaking)' : ''
+  const { before, after } = change
+  if (typeof before === 'string' && typeof after === 'string' && /\s/.test(before + after)) {
+    const words = wordDiff(before, after)
+    if (words !== undefined) return `${indent}${change.path}: ${words}${tag}`
+  }
+  return `${indent}${change.path}: ${short(before)} -> ${short(after)}${tag}`
+}
+
+/**
+ * Multi-line, uncolored rendering: one line per changed sub-path (word diff for prose),
+ * `+` / `-` per added / removed item, `(breaking)` on breaking lines; empty sections omitted.
+ */
 export function formatDiff(diff: ManifestDiff): string {
   if (diff.identical) return 'Manifest: no changes.'
   const lines: string[] = [`Manifest drift: ${summarizeDiff(diff)}`]
-  for (const change of diff.changes) lines.push(...changeLines(change, '  '))
+  for (const change of diff.changes ?? []) lines.push(changeLine(change, '  '))
   for (const section of MANIFEST_SECTIONS) {
     const d = diff[section]
-    if (d.added.length + d.removed.length + d.changed.length === 0) continue
+    if (!d) continue
     lines.push(`  ${section}:`)
-    for (const key of d.added) lines.push(`    + ${key} (added)`)
-    for (const key of d.removed) lines.push(`    - ${key} (removed)`)
-    for (const item of d.changed) {
+    for (const key of d.added ?? []) lines.push(`    + ${key} (added)`)
+    for (const key of d.removed ?? []) lines.push(`    - ${key} (removed)  (breaking)`)
+    for (const item of d.changed ?? []) {
       lines.push(`    ~ ${item.key}`)
-      for (const change of item.fields) lines.push(...changeLines(change, '        '))
+      for (const change of item.fields) lines.push(changeLine(change, '        '))
     }
   }
   return lines.join('\n')

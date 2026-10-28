@@ -5,11 +5,13 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import fg from 'fast-glob'
-import { parseCaseText } from '../cases.js'
+import { type LoadedCase, loadCaseFile, loadCasesSync, resolveCaseFilesSync } from '../cases.js'
+import { defaultRunOptions } from '../defaults.js'
 import { appendIndex, appendKey } from '../schema.js'
-import type { JsonValue } from '../types.js'
-import { UsageError, hasFlag, positionals, printJson } from './args.js'
-import { colors, isObject, preview } from './format.js'
+import type { JsonValue, RunOptions } from '../types.js'
+import { UsageError, closest, hasFlag, positionals, printJson, pruneEmpty } from './args.js'
+import { colors, isObject, plural, preview } from './format.js'
+import { mergeCliOptions, parseCommonFlags } from './resolve.js'
 
 export interface Assertion {
   /** Where in the result (matcher path format; `(root)` for the whole value). */
@@ -35,6 +37,14 @@ export interface StepExplanation {
   notes: string[]
 }
 
+export interface WeakAssertion {
+  /** `any-error` | `bare-partial` | `no-expectation` | `no-output-validation` | `ignore-errors` | `skipped` */
+  code: string
+  /** `case`, `step 2`, `setup 1`, `teardown 1`. */
+  at: string
+  message: string
+}
+
 export interface CaseExplanation {
   file: string
   name?: string
@@ -44,8 +54,14 @@ export interface CaseExplanation {
   skip?: string
   flaky?: boolean
   steps: StepExplanation[]
-  /** Load problem (the file was not explained). */
-  error?: string
+  /** Assertions weaker than they look (expectError {}, bare $partial, ...). */
+  flags: WeakAssertion[]
+  /** Load problems, exactly as vib run reports them (the case was not explained). */
+  errors: string[]
+  /** Load warnings (unknown keys, ...). */
+  warnings?: string[]
+  /** `$ref` fragments the case pulls in (already inlined in the prose). */
+  refs?: Array<{ path: string; ref: string }>
 }
 
 const MATCHERS = new Set([
@@ -357,7 +373,7 @@ export function explainStep(
 
 export function explainCase(value: unknown, file: string): CaseExplanation {
   if (!isObject(value))
-    return { file, kind: 'single', tags: [], steps: [], error: 'not a JSON object' }
+    return { file, kind: 'single', tags: [], steps: [], errors: ['not a JSON object'], flags: [] }
   const steps: StepExplanation[] = []
   const list = (key: 'setup' | 'steps' | 'teardown', phase: StepExplanation['phase']) => {
     const items = value[key]
@@ -380,20 +396,121 @@ export function explainCase(value: unknown, file: string): CaseExplanation {
       : {}),
     ...(value.flaky === true ? { flaky: true } : {}),
     steps,
+    flags: weakAssertions(value),
+    errors: [],
   }
+}
+
+function stepLabel(phase: StepExplanation['phase'], index: number, flow: boolean): string {
+  if (phase === 'setup') return `setup ${index}`
+  if (phase === 'teardown') return `teardown ${index}`
+  return flow ? `step ${index}` : 'case'
+}
+
+/** Assertions that pass more than the author probably meant (for PR review). */
+export function weakAssertions(testCase: Record<string, JsonValue>): WeakAssertion[] {
+  const flags: WeakAssertion[] = []
+  if (testCase.skip !== undefined && testCase.skip !== false) {
+    flags.push({
+      code: 'skipped',
+      at: 'case',
+      message: `skipped${typeof testCase.skip === 'string' ? `: ${testCase.skip}` : ''} (never runs)`,
+    })
+  }
+  const flow = Array.isArray(testCase.steps)
+  const phases: Array<[StepExplanation['phase'], JsonValue[]]> = [
+    ['setup', Array.isArray(testCase.setup) ? testCase.setup : []],
+    ['main', flow ? (testCase.steps as JsonValue[]) : [testCase]],
+    ['teardown', Array.isArray(testCase.teardown) ? testCase.teardown : []],
+  ]
+  for (const [phase, steps] of phases) {
+    steps.forEach((raw, i) => {
+      if (!isObject(raw)) return
+      const at = stepLabel(phase, i + 1, flow)
+      const isOp = ['tool', 'resource', 'resourceTemplate', 'prompt'].some(
+        (k) => raw[k] !== undefined,
+      )
+      if (isObject(raw.expectError) && Object.keys(raw.expectError).length === 0) {
+        flags.push({
+          code: 'any-error',
+          at,
+          message: 'expectError {} accepts any error (add a code or message)',
+        })
+      }
+      if (
+        isObject(raw.expect) &&
+        Object.keys(raw.expect).length === 1 &&
+        raw.expect.$partial === true
+      ) {
+        flags.push({
+          code: 'bare-partial',
+          at,
+          message: 'expect {"$partial": true} accepts any object result',
+        })
+      }
+      const asserts = ['expect', 'expectError', 'expectTask', 'expectInputRequired'].some(
+        (k) => raw[k] !== undefined,
+      )
+      if (
+        isOp &&
+        !asserts &&
+        !(phase === 'teardown' && raw.ignoreErrors === true) &&
+        phase !== 'setup'
+      ) {
+        flags.push({
+          code: 'no-expectation',
+          at,
+          message: 'no expectation: only checks that the call succeeds',
+        })
+      }
+      if (raw.validateOutput === false) {
+        flags.push({
+          code: 'no-output-validation',
+          at,
+          message:
+            'validateOutput: false: structuredContent is not checked against the outputSchema',
+        })
+      }
+      if (raw.ignoreErrors === true && phase !== 'teardown') {
+        flags.push({
+          code: 'ignore-errors',
+          at,
+          message: 'ignoreErrors outside teardown: failures of this step are hidden',
+        })
+      }
+    })
+  }
+  return flags
+}
+
+/** `$ref`s in the case as written: where they sit and which fragment they pull in. */
+function refsIn(value: JsonValue, at = ''): Array<{ path: string; ref: string }> {
+  const out: Array<{ path: string; ref: string }> = []
+  if (Array.isArray(value)) value.forEach((v, i) => out.push(...refsIn(v, appendIndex(at, i))))
+  else if (isObject(value)) {
+    if (typeof value.$ref === 'string' && Object.keys(value).length === 1) {
+      out.push({ path: at === '' ? '(root)' : at, ref: value.$ref })
+    } else if (!(Object.keys(value).length === 1 && value.$literal !== undefined)) {
+      for (const [key, child] of Object.entries(value)) {
+        if (key === '$schema' && isObject(child)) continue
+        out.push(...refsIn(child, appendKey(at, key)))
+      }
+    }
+  }
+  return out
 }
 
 export function formatExplanation(
   ex: CaseExplanation,
-  { full = false, maxLines = 40 } = {},
+  { full = false, brief = false, maxLines = 40 } = {},
 ): string {
   const c = colors()
   const out: string[] = []
   out.push(`${c.bold(ex.name ?? '(unnamed case)')}  ${c.dim(ex.file)}`)
-  if (ex.error) {
-    out.push(c.red(`  cannot explain: ${ex.error}`))
-    return out.join('\n')
-  }
+  for (const error of ex.errors) out.push(c.red(`  ✗ ${error}`))
+  for (const warning of ex.warnings ?? []) out.push(c.yellow(`  ! ${warning}`))
+  for (const flag of ex.flags) out.push(c.yellow(`  ! ${flag.at}: ${flag.message}`))
+  if (ex.errors.length > 0 || brief) return out.join('\n')
   const meta: string[] = []
   if (ex.kind === 'flow')
     meta.push(`flow of ${ex.steps.filter((s) => s.phase === 'main').length} steps`)
@@ -401,7 +518,9 @@ export function formatExplanation(
   if (ex.server) meta.push(`server: ${ex.server}`)
   if (ex.flaky) meta.push('flaky (pass-rate floor under --repeat)')
   if (meta.length) out.push(`  ${c.dim(meta.join(' · '))}`)
-  if (ex.skip) out.push(`  ${c.yellow(`skipped: ${ex.skip}`)}`)
+  for (const ref of ex.refs ?? []) {
+    out.push(`  ${c.dim(`${ref.path} is inlined from the fragment ${ref.ref}`)}`)
+  }
   const assertionLines = (list: Assertion[], indent: string) => {
     const shown = full ? list : list.slice(0, maxLines)
     for (const a of shown)
@@ -438,52 +557,192 @@ export function formatExplanation(
   return out.join('\n')
 }
 
-function expandInputs(inputs: string[]): string[] {
+interface Suite {
+  options: RunOptions
+  /** Every case file the config's globs match. */
+  files(): string[]
+  /** Ids of `$ref` fragment files the globs match (same detection as vib run). */
+  fragments(): Set<string>
+}
+
+function loadSuite(flags: ReturnType<typeof parseCommonFlags>): Suite {
+  let options: RunOptions
+  try {
+    options = mergeCliOptions(flags, {}, { quiet: true })
+  } catch (err) {
+    if (flags.configPath) throw err
+    options = { ...defaultRunOptions, rootDir: process.cwd() }
+  }
+  let fragments: Set<string> | undefined
+  return {
+    options,
+    files: () => resolveCaseFilesSync(options.globs, options.rootDir),
+    fragments: () => {
+      fragments ??= new Set(
+        loadCasesSync({
+          rootDir: options.rootDir,
+          globs: options.globs,
+          defaultServer: options.defaultServer,
+          servers: Object.keys(options.servers),
+          hooks: options.hooks,
+          manifest: options.manifest,
+        }).fragments ?? [],
+      )
+      return fragments
+    },
+  }
+}
+
+function loadOne(file: string, suite: Suite): LoadedCase & { warnings: string[] } {
+  const warnings: string[] = []
+  const loaded = loadCaseFile(
+    file,
+    {
+      rootDir: suite.options.rootDir,
+      defaultServer: suite.options.defaultServer,
+      servers: Object.keys(suite.options.servers),
+      hooks: suite.options.hooks,
+    },
+    warnings,
+  )
+  return { ...loaded, warnings }
+}
+
+function explainLoaded(loaded: LoadedCase & { warnings: string[] }): CaseExplanation {
+  const shown = path.relative(process.cwd(), loaded.path).replace(/\\/g, '/') || loaded.path
+  if (loaded.error || !loaded.data) {
+    return {
+      file: shown,
+      ...(loaded.ref.name ? { name: loaded.ref.name } : {}),
+      kind: 'single',
+      tags: loaded.ref.tags,
+      steps: [],
+      flags: [],
+      errors: [loaded.error ?? 'not a case file'],
+      warnings: loaded.warnings,
+    }
+  }
+  const ex = explainCase(loaded.data, shown)
+  const refs = loaded.source ? refsIn(loaded.source as unknown as JsonValue) : []
+  return { ...ex, warnings: loaded.warnings, ...(refs.length > 0 ? { refs } : {}) }
+}
+
+/** Files for the inputs: paths, globs, or case names (matched against the suite). */
+function resolveInputs(inputs: string[], suite: Suite): string[] {
   const files: string[] = []
+  let suiteCases: Array<{ file: string; name: string; id: string }> | undefined
+  const byName = () => {
+    suiteCases ??= suite
+      .files()
+      .map((file) => loadOne(file, suite))
+      .filter((loaded) => !loaded.notACase && !suite.fragments().has(loaded.ref.id))
+      .map((loaded) => ({ file: loaded.path, name: loaded.ref.name, id: loaded.ref.id }))
+    return suiteCases
+  }
   for (const input of inputs) {
     if (/[*?[\]{}]/.test(input)) {
       const hits = fg.sync(input.replace(/\\/g, '/'), { absolute: true, onlyFiles: true })
       if (hits.length === 0)
-        throw new UsageError(
-          `No case files match ${input}. Check the glob (quote it so the shell does not expand it).`,
-        )
-      files.push(...hits.sort())
-    } else files.push(path.resolve(input))
+        throw new UsageError(`No case files match ${input}.`, {
+          code: 'not-found',
+          hint: 'Check the glob (quote it so the shell does not expand it).',
+        })
+      files.push(...hits.map((f) => path.resolve(f)).sort())
+      continue
+    }
+    const asPath = path.resolve(input)
+    if (fs.existsSync(asPath) && fs.statSync(asPath).isFile()) {
+      files.push(asPath)
+      continue
+    }
+    const cases = byName()
+    const lower = input.toLowerCase()
+    let hits = cases.filter((c) => c.name.toLowerCase() === lower || c.id === input)
+    if (hits.length === 0) hits = cases.filter((c) => c.name.toLowerCase().includes(lower))
+    if (hits.length === 0) {
+      const suggestion = closest(
+        input,
+        cases.map((c) => c.name),
+      )
+      const looksLikePath = /[\\/]|\.jsonc?$/i.test(input)
+      throw new UsageError(
+        looksLikePath
+          ? `Case file not found: ${asPath}.`
+          : `No case named "${input}" in the suite.`,
+        {
+          code: looksLikePath ? 'not-found' : 'unknown-case',
+          hint: `${suggestion ? `Did you mean "${suggestion}"? ` : ''}Pass a case file path, a glob, or a case name (${cases.length} cases in the suite; vib explain lists them all).`,
+          next: ['vib explain --brief'],
+        },
+      )
+    }
+    files.push(...hits.map((h) => h.file))
   }
-  return files
+  return [...new Set(files)]
 }
 
 export async function explainCommand(argv: string[]): Promise<number> {
+  const flags = parseCommonFlags(argv)
   const inputs = positionals(argv)
-  if (inputs.length === 0) {
+  const brief = hasFlag(argv, '--brief')
+  const suite = loadSuite(flags)
+  const files = inputs.length === 0 ? suite.files() : resolveInputs(inputs, suite)
+  if (files.length === 0) {
     throw new UsageError(
-      'Missing case file. Usage: vib explain <case.json> [more files or "globs/**/*.json"] [--json] [--full]',
+      `No case files match the suite globs (${suite.options.globs.join(', ')}).`,
+      {
+        code: 'not-found',
+        hint: 'Record one with vib record <tool>, or pass a case file path.',
+        next: ['vib record <tool>'],
+      },
     )
   }
-  const files = expandInputs(inputs)
   const explanations: CaseExplanation[] = []
+  const fragments: string[] = []
   for (const file of files) {
-    if (!fs.existsSync(file)) {
-      throw new UsageError(`Case file not found: ${file}. Pass a path to a case .json file.`)
+    const loaded = loadOne(file, suite)
+    // Like vib run: manifest locks and `$ref` fragments under the globs are not cases.
+    if (suite.fragments().has(loaded.ref.id)) {
+      fragments.push(loaded.ref.id)
+      continue
     }
-    const shown = path.relative(process.cwd(), file).replace(/\\/g, '/') || file
-    try {
-      explanations.push(explainCase(parseCaseText(fs.readFileSync(file, 'utf8'), shown), shown))
-    } catch (err) {
-      explanations.push({
-        file: shown,
-        kind: 'single',
-        tags: [],
-        steps: [],
-        error: err instanceof Error ? err.message : String(err),
-      })
-    }
+    if (loaded.notACase && inputs.length === 0) continue
+    explanations.push(explainLoaded(loaded))
   }
-  const ok = explanations.every((e) => !e.error)
-  if (hasFlag(argv, '--json')) printJson({ ok, cases: explanations })
-  else
+  const ok = explanations.every((e) => e.errors.length === 0)
+  const shown = brief
+    ? explanations.filter(
+        (e) => e.errors.length > 0 || e.flags.length > 0 || (e.warnings ?? []).length > 0,
+      )
+    : explanations
+  const summary = {
+    cases: explanations.length,
+    errors: explanations.filter((e) => e.errors.length > 0).length,
+    flagged: explanations.filter((e) => e.flags.length > 0).length,
+  }
+  if (flags.json) {
+    printJson(pruneEmpty({ ok, summary, cases: shown, fragments }))
+    return ok ? 0 : 1
+  }
+  const c = colors()
+  if (shown.length > 0) {
     console.log(
-      explanations.map((e) => formatExplanation(e, { full: hasFlag(argv, '--full') })).join('\n\n'),
+      shown.map((e) => formatExplanation(e, { full: hasFlag(argv, '--full'), brief })).join('\n\n'),
     )
+  }
+  if (fragments.length > 0) {
+    const shownIds = fragments.slice(0, 5).join(', ')
+    const more = fragments.length > 5 ? `, +${fragments.length - 5} more` : ''
+    console.log(
+      c.dim(
+        `${shown.length > 0 ? '\n' : ''}info: skipped ${plural(fragments.length, '$ref fragment file')} (not cases): ${shownIds}${more}`,
+      ),
+    )
+  }
+  if (explanations.length > 1 || brief) {
+    console.log('')
+    const line = `${plural(summary.cases, 'case')} · ${plural(summary.errors, 'load error')} · ${summary.flagged} with weak assertions`
+    console.log(ok ? c.green(line) : c.red(line))
+  }
   return ok ? 0 : 1
 }

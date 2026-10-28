@@ -12,7 +12,6 @@
     "ci": { "check": true, "reporters": ["console", "junit"] },
     "legacy": {
       "servers": { "echo": { "protocol": "legacy" } },
-      "manifest": "tests/__manifest__.legacy.json",
       "excludeTags": ["tasks"]
     }
   }

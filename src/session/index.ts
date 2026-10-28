@@ -15,7 +15,14 @@
  *   On legacy (2025) connections the same handlers answer real server→client requests.
  * - Tasks extension (SEP-2663): the client declares `io.modelcontextprotocol/tasks`; a
  *   `resultType: "task"` answer is returned as-is, or polled via `tasks/get` with `await`.
+ * - close() releases everything: stdio children are killed promptly when they do not exit on
+ *   stdin EOF (immediately when a call was left hanging), and HTTP sockets are owned by a
+ *   per-session agent that is destroyed (see ./http.ts), so the process can exit cleanly.
  */
+import { spawnSync } from 'node:child_process'
+import fs from 'node:fs'
+import path from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
 import {
   Client,
   type ClientCapabilities,
@@ -56,6 +63,7 @@ import {
   textFromContent,
   toToolError,
 } from './errors.js'
+import { type NodeHttpClient, createNodeHttpClient } from './http.js'
 
 export * from './errors.js'
 
@@ -66,6 +74,19 @@ export const VIBRISSA_CLIENT_INFO = { name: 'vibrissa', version: '2.0.0-alpha.0'
 const DEFAULT_AWAIT_TIMEOUT_MS = 30000
 const DEFAULT_POLL_MS = 500
 const STDERR_TAIL_CHARS = 4000
+/** How long close() lets a stdio server exit on its own after stdin EOF. */
+const STDIO_EXIT_GRACE_MS = 500
+/** How long close() waits after SIGTERM before SIGKILL. */
+const STDIO_KILL_GRACE_MS = 500
+const NOISE_SAMPLE_LINES = 5
+const NOISE_LINE_CHARS = 200
+
+/** Non-JSON-RPC lines a stdio server wrote to stdout (the SDK drops them silently). */
+export interface StdoutNoise {
+  lines: number
+  /** The first few offending lines (truncated). */
+  sample: string[]
+}
 
 /**
  * Answers one embedded input request (MRTR round or legacy server→client request).
@@ -90,6 +111,11 @@ export interface SessionOptions {
    */
   stderr?: 'inherit' | 'capture' | 'ignore'
   onStderr?: (text: string) => void
+  /**
+   * Called for every non-JSON-RPC line a stdio server writes to stdout (e.g. a stray
+   * `console.log`). Such lines corrupt the protocol stream; see also `session.stdoutNoise`.
+   */
+  onStdoutNoise?: (line: string) => void
   /** Declare the tasks extension (servers may then answer with tasks). Default true. */
   tasks?: boolean
   clientInfo?: { name: string; version: string }
@@ -353,6 +379,174 @@ function describeServer(server: ServerConfig): string {
   return `server.cmd "${cmd}"`
 }
 
+const SCRIPT_EXTENSION = /\.(m?js|cjs|m?ts|cts|py)$/i
+/** Node CLI flags whose value is the next argument (so it is not the entry script). */
+const NODE_FLAGS_WITH_VALUE = new Set([
+  '-r',
+  '--require',
+  '--import',
+  '--loader',
+  '--experimental-loader',
+  '-C',
+  '--conditions',
+  '--env-file',
+  '--title',
+  '--input-type',
+])
+const NODE_FLAGS_WITHOUT_ENTRY = new Set([
+  '-e',
+  '--eval',
+  '-p',
+  '--print',
+  '-',
+  '-i',
+  '--interactive',
+])
+
+function interpreterFor(file: string): string {
+  return /\.py$/i.test(file) ? 'python' : 'node'
+}
+
+function isExecutableFile(file: string): boolean {
+  if (process.platform === 'win32') return false
+  try {
+    if (!fs.statSync(file).isFile()) return false
+    fs.accessSync(file, fs.constants.X_OK)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Node resolves `node dist/index` like a module path; mirror that for the existence check. */
+function nodeEntryExists(abs: string): boolean {
+  const candidates = [abs, ...['.js', '.mjs', '.cjs', '.json', '.node'].map((ext) => abs + ext)]
+  candidates.push(path.join(abs, 'index.js'))
+  return candidates.some((file) => {
+    try {
+      return fs.statSync(file).isFile()
+    } catch {
+      return false
+    }
+  })
+}
+
+/**
+ * Fail fast (before spawning) on the two most common stdio mistakes: running a script as
+ * the command (`dist/index.js`), and `node <entry>` where the entry was never built.
+ */
+function preflightStdio(server: StdioServerConfigLike): void {
+  const cwd = server.cwd ?? process.cwd()
+  const where = describeServer(server as ServerConfig)
+  const args = server.args ?? []
+  if (SCRIPT_EXTENSION.test(server.cmd)) {
+    const abs = path.resolve(cwd, server.cmd)
+    if (!isExecutableFile(abs)) {
+      const suggestion = [interpreterFor(server.cmd), server.cmd, ...args].join(' ')
+      const exists = fs.existsSync(abs)
+      throw new SessionStartError(
+        exists
+          ? `Server failed to start at ${where}: ${server.cmd} is a script, not an executable. Did you mean "${suggestion}"?`
+          : `Server failed to start at ${where}: File not found: ${server.cmd} (resolved ${abs}). Did you mean "${suggestion}"? Run your build first if the file is generated.`,
+        'spawn',
+      )
+    }
+    return
+  }
+  const base = path
+    .basename(server.cmd)
+    .toLowerCase()
+    .replace(/\.exe$/, '')
+  if (base !== 'node' && server.cmd !== process.execPath) return
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]
+    if (NODE_FLAGS_WITHOUT_ENTRY.has(arg)) return
+    if (NODE_FLAGS_WITH_VALUE.has(arg)) {
+      i++
+      continue
+    }
+    if (arg.startsWith('-')) continue
+    const abs = path.resolve(cwd, arg)
+    if (!nodeEntryExists(abs)) {
+      throw new SessionStartError(
+        `Server failed to start at ${where}: File not found: ${arg} (resolved ${abs}). Run your build, or vib init --server '<cmd>'.`,
+        'spawn',
+      )
+    }
+    return
+  }
+}
+
+type StdioServerConfigLike = { cmd: string; args?: string[]; cwd?: string }
+
+/** True once `pid` no longer exists (polls; resolves false after `ms`). */
+async function waitForExit(pid: number, ms: number): Promise<boolean> {
+  const deadline = Date.now() + ms
+  while (true) {
+    try {
+      process.kill(pid, 0)
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EPERM') return true
+    }
+    if (Date.now() >= deadline) return false
+    await sleep(Math.min(20, Math.max(1, deadline - Date.now())))
+  }
+}
+
+/** SIGTERM / SIGKILL; on Windows, kill the whole tree (cross-spawn may run cmd.exe shims). */
+function terminate(pid: number, force: boolean): void {
+  try {
+    if (process.platform === 'win32') {
+      spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], {
+        stdio: 'ignore',
+        windowsHide: true,
+      })
+    } else {
+      process.kill(pid, force ? 'SIGKILL' : 'SIGTERM')
+    }
+  } catch {
+    // already gone
+  }
+}
+
+/**
+ * The line that best explains an early exit: the first error-looking line
+ * (`Error: Cannot find module ...`, `ModuleNotFoundError: ...`), else the first line that is
+ * not stack / source-context noise.
+ */
+export function firstMeaningfulStderrLine(stderr: string): string | undefined {
+  const lines = stderr
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+  const errorLine = lines.find((line) =>
+    /^(\w+(Error|Exception)\b|Error\b|Traceback\b|fatal\b|panic\b)|is not recognized as an internal or external command|command not found|No such file or directory|Cannot find module/i.test(
+      line,
+    ),
+  )
+  if (errorLine) return errorLine
+  return lines.find(
+    (line) =>
+      !/^at\s/.test(line) &&
+      !/^node:internal\//.test(line) &&
+      !/^\^+$/.test(line) &&
+      !/^throw\b/.test(line) &&
+      !/^Node\.js v\d/.test(line),
+  )
+}
+
+function isJsonRpcLine(line: string): boolean {
+  const start = line.trimStart()[0]
+  if (start !== '{' && start !== '[') return false
+  try {
+    const value = JSON.parse(line) as unknown
+    const items = Array.isArray(value) ? value : [value]
+    return items.length > 0 && items.every((item) => isObject(item) && item.jsonrpc === '2.0')
+  } catch {
+    return false
+  }
+}
+
 // ---------------------------------------------------------------------------
 // McpSession
 // ---------------------------------------------------------------------------
@@ -367,13 +561,26 @@ export class McpSession {
   private isClosed = false
   private _era: 'legacy' | 'modern' = 'legacy'
   private _protocolVersion = ''
+  private readonly noise: StdoutNoise = { lines: 0, sample: [] }
+  private stdoutPending = ''
+  private readonly stdoutDecoder = new StringDecoder('utf8')
+  /** A request was left unanswered (timeout): the server may be hung, so close() kills at once. */
+  private hungRequest = false
+  private closing: Promise<void> | undefined
 
   private constructor(
     private readonly client: Client,
     private readonly transport: Transport,
     readonly server: ServerConfig,
     private readonly opts: SessionOptions,
+    private readonly stdio?: StdioClientTransport,
+    private readonly httpClient?: NodeHttpClient,
   ) {}
+
+  /** Non-JSON-RPC lines the stdio server wrote to stdout so far (protocol pollution). */
+  get stdoutNoise(): StdoutNoise {
+    return { lines: this.noise.lines, sample: [...this.noise.sample] }
+  }
 
   /** Negotiated era: `modern` = 2026-07-28+ via server/discover, `legacy` = 2025 initialize. */
   get era(): 'legacy' | 'modern' {
@@ -408,6 +615,7 @@ export class McpSession {
 
     let transport: Transport
     let stdio: StdioClientTransport | undefined
+    let httpClient: NodeHttpClient | undefined
     if (http) {
       let url: URL
       try {
@@ -418,8 +626,10 @@ export class McpSession {
           'config',
         )
       }
+      httpClient = createNodeHttpClient()
       transport = new StreamableHTTPClientTransport(url, {
         requestInit: server.headers ? { headers: server.headers } : undefined,
+        fetch: httpClient.fetch,
       })
     } else {
       if (typeof server.cmd !== 'string' || server.cmd.length === 0) {
@@ -428,6 +638,7 @@ export class McpSession {
           'config',
         )
       }
+      preflightStdio(server)
       stdio = new StdioClientTransport({
         command: server.cmd,
         args: server.args ?? [],
@@ -449,14 +660,50 @@ export class McpSession {
       versionNegotiation,
       inputRequired: { autoFulfill: true },
     })
-    const session = new McpSession(client, transport, server, opts)
+    const session = new McpSession(client, transport, server, opts, stdio, httpClient)
     session.wire(stdio)
     await session.connect(spawnTimeoutMs, protocol === 'auto' && !http)
     return session
   }
 
+  /**
+   * See every raw stdout chunk (in order, before the SDK parses it) by wrapping the stdio
+   * transport's line buffer. The SDK silently drops lines that are not JSON-RPC.
+   */
+  private watchStdout(stdio: StdioClientTransport): void {
+    const buffer = (stdio as unknown as { _readBuffer?: { append?: (chunk: Buffer) => void } })
+      ._readBuffer
+    if (!buffer || typeof buffer.append !== 'function') return
+    const append = buffer.append.bind(buffer)
+    buffer.append = (chunk: Buffer) => {
+      this.scanStdout(chunk)
+      append(chunk)
+    }
+  }
+
+  private scanStdout(chunk: Buffer): void {
+    const scanFrom = this.stdoutPending.length
+    this.stdoutPending += this.stdoutDecoder.write(chunk)
+    let newline = this.stdoutPending.indexOf('\n', scanFrom)
+    while (newline !== -1) {
+      const line = this.stdoutPending.slice(0, newline).replace(/\r$/, '')
+      this.stdoutPending = this.stdoutPending.slice(newline + 1)
+      if (line.trim() !== '' && !isJsonRpcLine(line)) {
+        this.noise.lines += 1
+        if (this.noise.sample.length < NOISE_SAMPLE_LINES) {
+          this.noise.sample.push(
+            line.length > NOISE_LINE_CHARS ? `${line.slice(0, NOISE_LINE_CHARS)}…` : line,
+          )
+        }
+        this.opts.onStdoutNoise?.(line)
+      }
+      newline = this.stdoutPending.indexOf('\n')
+    }
+  }
+
   /** Install transport taps, stderr capture, and the input-request handlers. */
   private wire(stdio: StdioClientTransport | undefined): void {
+    if (stdio) this.watchStdout(stdio)
     const transport = this.transport
     const send = transport.send.bind(transport)
     transport.send = (message, options) => {
@@ -565,7 +812,8 @@ export class McpSession {
         }),
       ])
     } catch (err) {
-      await this.client.close().catch(() => {})
+      this.hungRequest = true // nothing worth waiting for: kill the child right away
+      await this.close()
       throw this.startError(err, where, spawnTimeoutMs)
     } finally {
       if (guard) clearTimeout(guard)
@@ -579,7 +827,12 @@ export class McpSession {
 
   private startError(err: unknown, where: string, spawnTimeoutMs: number): SessionStartError {
     const stderr = this.stderrBuffer.trim()
-    const tail = stderr ? ` Last stderr: ${stderr.split(/\r?\n/).slice(-5).join(' | ')}` : ''
+    const firstLine = firstMeaningfulStderrLine(stderr)
+    const noise =
+      this.noise.lines > 0
+        ? ` The server wrote ${this.noise.lines} non-JSON-RPC line${this.noise.lines === 1 ? '' : 's'} to stdout (first: ${JSON.stringify(this.noise.sample[0])}); stdout must carry only JSON-RPC, log to stderr instead.`
+        : ''
+    const tail = `${firstLine ? ` Server stderr: ${firstLine}` : ''}${noise}`
     const message = err instanceof Error ? err.message : String(err)
     const errno = (err as { code?: unknown })?.code
     const http = isHttpServerConfig(this.server)
@@ -681,6 +934,8 @@ export class McpSession {
         return await fn(tracker)
       } finally {
         this.active = undefined
+        const answered = new Set(tracker.responses.map((r) => r.message.id))
+        for (const id of tracker.sent.keys()) if (!answered.has(id)) this.hungRequest = true
       }
     })
     this.queue = run.catch(() => undefined)
@@ -983,9 +1238,47 @@ export class McpSession {
     })
   }
 
-  async close(): Promise<void> {
+  /**
+   * Close the connection and release every OS resource, so the process can exit naturally.
+   * - stdio: stdin EOF, then SIGTERM after 500ms (at once if a call was left hanging), then
+   *   SIGKILL after another 500ms (Windows: kill the process tree).
+   * - HTTP: terminate a legacy server session (DELETE) when one exists, close the transport,
+   *   then destroy the session's sockets.
+   * Idempotent; concurrent callers share one teardown.
+   */
+  close(): Promise<void> {
+    this.closing ??= this.teardown()
+    return this.closing
+  }
+
+  private async teardown(): Promise<void> {
     this.isClosed = true
-    await this.client.close().catch(() => {})
+    if (this.httpClient) {
+      const http = this.transport as StreamableHTTPClientTransport
+      if (http.sessionId !== undefined) {
+        let timer: NodeJS.Timeout | undefined
+        await Promise.race([
+          http.terminateSession().catch(() => {}),
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, 1000)
+          }),
+        ])
+        if (timer) clearTimeout(timer)
+      }
+      await this.client.close().catch(() => {})
+      this.httpClient.destroy()
+      return
+    }
+    const pid = this.stdio?.pid ?? undefined
+    const sdkClose = this.client.close().catch(() => {})
+    if (typeof pid === 'number') {
+      const graceMs = this.hungRequest ? 0 : STDIO_EXIT_GRACE_MS
+      if (!(await waitForExit(pid, graceMs))) {
+        terminate(pid, false)
+        if (!(await waitForExit(pid, STDIO_KILL_GRACE_MS))) terminate(pid, true)
+      }
+    }
+    await sdkClose
   }
 
   /**

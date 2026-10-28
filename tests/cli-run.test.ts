@@ -97,7 +97,37 @@ describe('vib run', () => {
     expect(out.text()).toMatch(/Unknown reporter "junitt".*Did you mean "junit"\?/)
   })
 
-  it('--json prints exactly one JsonReport on stdout (and writes results.json); logs go to stderr', async () => {
+  it.each([
+    ['--chek', '--check'],
+    ['--tags', '--tag'],
+    ['--reporters', '--reporter'],
+    ['--failfast', '--fail-fast'],
+  ])(
+    'rejects the typo %s (exit 2, did you mean %s) instead of running a false green',
+    async (typo, fix) => {
+      const out = capture()
+      const args = typo === '--tags' || typo === '--reporters' ? [typo, 'x'] : [typo]
+      expect(await runCommand(['--config', fixtureConfig, ...args])).toBe(2)
+      expect(out.text()).toBe(
+        `Unknown option ${typo} for vib run. Did you mean ${fix}? Run vib run --help for its options.`,
+      )
+    },
+  )
+
+  it('rejects unknown flags on manifest and diff too', async () => {
+    const out = capture()
+    expect(await manifestCommand(['diff', '--config', fixtureConfig, '--strct'])).toBe(2)
+    expect(out.text()).toMatch(/^Unknown option --strct for vib manifest\. Did you mean --strict\?/)
+    out.lines.length = 0
+    expect(
+      await diffCommand(['--config', fixtureConfig, '--against', 'x', '--manifest-onyl']),
+    ).toBe(2)
+    expect(out.text()).toMatch(
+      /^Unknown option --manifest-onyl for vib diff\. Did you mean --manifest-only\?/,
+    )
+  })
+
+  it('--json prints exactly one JsonReport on stdout (and writes results.json); stderr stays quiet', async () => {
     const stdout: string[] = []
     const stderr: string[] = []
     vi.spyOn(console, 'log').mockImplementation((...args) => void stdout.push(args.join(' ')))
@@ -127,15 +157,45 @@ describe('vib run', () => {
       manifests: [expect.objectContaining({ status: 'ok' })],
     })
     expect(JSON.parse(fs.readFileSync(path.join(outDir, 'results.json'), 'utf8'))).toEqual(printed)
-    expect(stderr.join('\n')).toMatch(/^PASS MRTR/m)
-    expect(stderr.join('\n')).toMatch(/vibrissa: wrote .*results\.json/)
+    // No console log on stderr either: only warnings and errors.
+    expect(stderr).toEqual([])
+
+    stdout.length = 0
+    expect(
+      await runCommand(['--config', fixtureConfig, '--json', '--tag', 'nope', '--out-dir', outDir]),
+    ).toBe(1)
+    expect(stdout).toHaveLength(1)
+    // Once, as an error (it fails the run); not repeated as a warning.
+    expect(stderr).toEqual([
+      expect.stringMatching(/^error: No test cases left after filters \(--tag nope\)/),
+    ])
+    expect(JSON.parse(stdout[0]).cases).toEqual([])
 
     stdout.length = 0
     expect(await runCommand(['--config', fixtureConfig, '--json', '--shard', 'x'])).toBe(2)
     expect(stdout).toHaveLength(1)
     expect(JSON.parse(stdout[0])).toMatchObject({
       ok: false,
-      error: { message: expect.stringMatching(/^Invalid --shard value "x"/) },
+      error: {
+        type: 'ConfigError',
+        code: 'config',
+        message: expect.stringMatching(/^Invalid --shard value "x"/),
+        hint: 'Run vib run --help for usage.',
+      },
+    })
+
+    // Unknown flags use the CLI's envelope too (code, hint, next).
+    stdout.length = 0
+    expect(await runCommand(['--config', fixtureConfig, '--json', '--chek'])).toBe(2)
+    expect(JSON.parse(stdout[0])).toEqual({
+      ok: false,
+      error: {
+        type: 'UsageError',
+        code: 'unknown-option',
+        message: 'Unknown option --chek for vib run.',
+        hint: 'Did you mean --check? Run vib run --help for its options.',
+      },
+      next: ['vib run --help'],
     })
   })
 
@@ -204,8 +264,53 @@ describe('vib run', () => {
       failFast: true,
       reporters: ['json', 'junit'],
       baseline: path.resolve('reports/last-green.json'),
-      manifestIgnore: ['server.version'],
+      manifestIgnore: ['server.version', 'protocolVersion', 'listMeta'],
     })
+  })
+
+  it('--brief prints only what needs attention (console and --json)', async () => {
+    const out = capture()
+    const outDir = mkTmpDir()
+    expect(
+      await runCommand([
+        '--config',
+        fixtureConfig,
+        '--no-pretty',
+        '--brief',
+        '--check',
+        '--cases',
+        'tests/fixtures/echo-server/cases/echo.*.json',
+        '--out-dir',
+        outDir,
+      ]),
+    ).toBe(1)
+    const text = out.text()
+    expect(text).toMatch(/FAIL echo mismatch/)
+    expect(text).not.toMatch(/PASS echo basic/)
+    expect(text).not.toMatch(/PASS manifest/)
+    expect(text).not.toMatch(/^PASS check/m)
+    expect(text).toMatch(/Result: FAILED/)
+
+    out.lines.length = 0
+    expect(
+      await runCommand([
+        '--config',
+        fixtureConfig,
+        '--json',
+        '--brief',
+        '--cases',
+        'tests/fixtures/echo-server/cases/echo.*.json',
+        '--out-dir',
+        outDir,
+      ]),
+    ).toBe(1)
+    const report = JSON.parse(out.lines.find((l) => l.startsWith('{')) ?? '{}')
+    expect(report.cases.map((c: { caseId: string }) => c.caseId)).toEqual([
+      'cases/echo.diff-complex.fail.json',
+      'cases/echo.fail.json',
+    ])
+    expect(report.manifests).toBeUndefined() // the ok manifest is not news
+    expect(JSON.stringify(report)).not.toMatch(/:\[\]/) // no empty arrays
   })
 
   it('runs --check and the legacy profile', async () => {
@@ -220,7 +325,7 @@ describe('vib run', () => {
         mkTmpDir(),
       ]),
     ).toBe(0)
-    expect(out.text()).toMatch(/PASS check: tools\/list is deterministic across calls/)
+    expect(out.text()).toMatch(/Checks: \d+ passed, 0 failed/)
     expect(
       await runCommand(['--config', fixtureConfig, '--profile', 'legacy', '--out-dir', mkTmpDir()]),
     ).toBe(0)
@@ -254,12 +359,40 @@ describe('vib manifest', () => {
 
     out.lines.length = 0
     expect(await manifestCommand(['show', '--config', fixtureConfig, '--json'])).toBe(0)
+    // The CLI success envelope: { ok: true, ... }.
     expect(JSON.parse(out.lines[0])).toMatchObject({
-      vibrissa: 2,
-      server: { name: 'vibrissa-echo-fixture' },
+      ok: true,
+      server: 'echo',
+      manifest: { vibrissa: 2, server: { name: 'vibrissa-echo-fixture' } },
     })
     expect(await manifestCommand(['show', '--config', fixtureConfig])).toBe(0)
     expect(out.text()).toMatch(/vibrissa-echo-fixture 2\.0\.0 · protocol 2026-07-28/)
+  })
+
+  it('ignores era noise by default; --strict compares everything', async () => {
+    const dir = mkTmpDir()
+    const lock = path.join(dir, '__manifest__.json')
+    const out = capture()
+    expect(await manifestCommand(['record', '--config', fixtureConfig, '--out', lock])).toBe(0)
+    const old = readManifest(lock)
+    old.protocolVersion = '2025-11-25'
+    old.listMeta = {}
+    fs.writeFileSync(lock, JSON.stringify(old))
+    expect(await manifestCommand(['diff', '--config', fixtureConfig, '--out', lock])).toBe(0)
+    out.lines.length = 0
+    expect(
+      await manifestCommand([
+        'diff',
+        '--config',
+        fixtureConfig,
+        '--out',
+        lock,
+        '--strict',
+        '--json',
+      ]),
+    ).toBe(1)
+    const payload = JSON.parse(out.lines[0])
+    expect(payload.diff.changes.map((c: { path: string }) => c.path)).toContain('protocolVersion')
   })
 
   it('rejects unknown actions and a missing lock with exit 2', async () => {
@@ -278,6 +411,27 @@ describe('vib manifest', () => {
     expect(out.text()).toMatch(
       /No manifest lock at .*none\.json\. Create it with "vib manifest record"/,
     )
+    out.lines.length = 0
+    expect(
+      await manifestCommand([
+        'diff',
+        '--config',
+        fixtureConfig,
+        '--json',
+        '--out',
+        path.join(mkTmpDir(), 'none.json'),
+      ]),
+    ).toBe(2)
+    expect(JSON.parse(out.lines[0])).toMatchObject({
+      ok: false,
+      error: {
+        type: 'UsageError',
+        code: 'manifest-missing',
+        message: expect.stringMatching(/^No manifest lock at .*none\.json\.$/),
+        hint: 'Create it with "vib manifest record".',
+      },
+      next: ['vib manifest record'],
+    })
   })
 })
 
@@ -300,6 +454,43 @@ describe('vib diff', () => {
       manifest: { identical: true },
       summary: { cases: 3, different: 0 },
     })
+    // Observed results only: no pass/fail status or golden hints leak into the comparison.
+    expect(Object.keys(payload.cases[0]).sort()).toEqual(['against', 'base', 'id', 'name', 'same'])
+    expect(JSON.stringify(payload)).not.toMatch(/--update/)
+  })
+
+  it('compares through the case matchers (no false differences on accepted timestamps)', async () => {
+    const dir = mkTmpDir()
+    const file = path.join(dir, 'task-handle.json')
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        tool: 'slow',
+        args: { ms: 5 },
+        expect: {
+          taskId: 'task-1',
+          status: 'working',
+          statusMessage: 'working on it',
+          createdAt: { $type: 'string' },
+          lastUpdatedAt: { $type: 'string' },
+          pollIntervalMs: 25,
+        },
+      }),
+    )
+    const out = capture()
+    const code = await diffCommand([
+      '--config',
+      fixtureConfig,
+      '--against',
+      'node server/index.js',
+      '--cases',
+      file,
+      '--json',
+    ])
+    const payload = JSON.parse(out.lines[0])
+    expect(payload.cases[0].base[0].observed).toMatchObject({ createdAt: '<matches $type>' })
+    expect(payload.cases[0].same).toBe(true)
+    expect(code).toBe(0)
   })
 
   it('reports manifest and per-case differences against another server', async () => {

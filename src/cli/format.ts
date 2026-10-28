@@ -173,18 +173,17 @@ export interface ListMetaLike {
   cacheScope?: string
 }
 
+/** `cache: 60000 ms (public)` from list-level ttlMs / cacheScope ('' when neither is set). */
 export function formatListMeta(meta: ListMetaLike | undefined): string {
-  if (!meta) return ''
-  const parts: string[] = []
-  if (meta.ttlMs !== undefined) parts.push(`ttl ${meta.ttlMs}ms`)
-  if (meta.cacheScope !== undefined) parts.push(meta.cacheScope)
-  return parts.length > 0 ? `(${parts.join(', ')})` : ''
+  if (!meta || (meta.ttlMs === undefined && meta.cacheScope === undefined)) return ''
+  const ttl = meta.ttlMs !== undefined ? `${meta.ttlMs} ms` : 'no ttl'
+  return `cache: ${ttl}${meta.cacheScope !== undefined ? ` (${meta.cacheScope})` : ''}`
 }
 
 function heading(text: string, meta?: ListMetaLike): string {
   const c = colors()
   const suffix = formatListMeta(meta)
-  return `${c.bold(c.cyan(text))}${suffix ? ` ${c.dim(suffix)}` : ''}`
+  return `${c.bold(c.cyan(text))}${suffix ? `  ${c.dim(suffix)}` : ''}`
 }
 
 export function formatToolList(tools: ToolSummary[], meta?: ListMetaLike): string {
@@ -217,6 +216,46 @@ export function formatToolList(tools: ToolSummary[], meta?: ListMetaLike): strin
   ].join('\n')
 }
 
+/** `vib tools <name>`: everything about one tool. */
+export function formatToolDetail(tool: ToolSummary): string {
+  const c = colors()
+  const out: string[] = [`${c.bold(c.cyan(tool.name))}${tool.title ? `  ${tool.title}` : ''}`]
+  const hints = toolHints(tool)
+  if (hints) out.push(c.dim(hints))
+  out.push('')
+  out.push(c.bold('Description'))
+  out.push(
+    ...(tool.description?.trim() ? tool.description.trim().split(/\r?\n/) : ['(none)']).map(
+      (line) => `  ${line}`,
+    ),
+  )
+  const schema = isObject(tool.inputSchema) ? tool.inputSchema : {}
+  const props = isObject(schema.properties) ? schema.properties : {}
+  const required = Array.isArray(schema.required) ? schema.required.map(String) : []
+  out.push('', c.bold('Arguments'))
+  if (Object.keys(props).length === 0) out.push('  (none)')
+  for (const [name, prop] of Object.entries(props)) {
+    const description =
+      isObject(prop) && typeof prop.description === 'string' ? `  ${c.gray(prop.description)}` : ''
+    out.push(
+      `  ${c.bold(name)}${required.includes(name) ? '*' : ''}: ${schemaTypeLabel(prop)}${description}`,
+    )
+  }
+  out.push('', c.bold('inputSchema'), indentJson(tool.inputSchema))
+  if (tool.outputSchema !== undefined)
+    out.push('', c.bold('outputSchema'), indentJson(tool.outputSchema))
+  if (tool.annotations !== undefined)
+    out.push('', c.bold('annotations'), indentJson(tool.annotations))
+  if (tool.execution !== undefined) out.push('', c.bold('execution'), indentJson(tool.execution))
+  out.push(
+    '',
+    c.dim(
+      `Next: vib call ${tool.name} --arg key=value   ·   vib record ${tool.name}   ·   vib fuzz ${tool.name}`,
+    ),
+  )
+  return out.join('\n')
+}
+
 export function formatResourceList(
   resources: ResourceSummary[],
   templates: ResourceTemplateSummary[],
@@ -236,12 +275,7 @@ export function formatResourceList(
           { header: 'MIME' },
           { header: 'DESCRIPTION', flex: true, paint: (t) => c.gray(t) },
         ],
-        resources.map((r) => [
-          r.uri,
-          r.title ?? r.name,
-          r.mimeType ?? '',
-          firstLine(r.description),
-        ]),
+        resources.map((r) => [r.uri, r.name, r.mimeType ?? '', firstLine(r.description)]),
       ),
     )
   }
@@ -256,12 +290,7 @@ export function formatResourceList(
           { header: 'MIME' },
           { header: 'DESCRIPTION', flex: true, paint: (t) => c.gray(t) },
         ],
-        templates.map((t) => [
-          t.uriTemplate,
-          t.title ?? t.name,
-          t.mimeType ?? '',
-          firstLine(t.description),
-        ]),
+        templates.map((t) => [t.uriTemplate, t.name, t.mimeType ?? '', firstLine(t.description)]),
       ),
     )
   }
@@ -360,54 +389,8 @@ export function formatInputRequests(requests: JsonValue): string[] {
   return lines
 }
 
-/** A sample `--respond` value that answers every request in an InputRequests map. */
-export function sampleRespond(requests: JsonValue): Record<string, JsonValue> {
-  const out: Record<string, JsonValue> = {}
-  const entries = isObject(requests) ? Object.values(requests) : []
-  for (const entry of entries) {
-    const request = isObject(entry) ? entry : {}
-    const method = typeof request.method === 'string' ? request.method : undefined
-    if (!method || out[method] !== undefined) continue
-    const params = isObject(request.params) ? request.params : {}
-    if (method === 'elicitation/create') {
-      const schema = isObject(params.requestedSchema) ? params.requestedSchema : {}
-      const props = isObject(schema.properties) ? schema.properties : {}
-      const content: Record<string, JsonValue> = {}
-      for (const [name, prop] of Object.entries(props)) content[name] = sampleValue(prop)
-      out[method] = { action: 'accept', content }
-    } else if (method === 'sampling/createMessage') {
-      out[method] = {
-        role: 'assistant',
-        content: { type: 'text', text: '...' },
-        model: 'scripted',
-      }
-    } else if (method === 'roots/list') {
-      out[method] = { roots: [] }
-    } else {
-      out[method] = {}
-    }
-  }
-  return out
-}
-
-function sampleValue(schema: JsonValue): JsonValue {
-  if (!isObject(schema)) return null
-  if (schema.default !== undefined) return schema.default
-  if (Array.isArray(schema.enum) && schema.enum.length > 0) return schema.enum[0]
-  switch (schema.type) {
-    case 'boolean':
-      return true
-    case 'number':
-    case 'integer':
-      return 0
-    case 'array':
-      return []
-    case 'object':
-      return {}
-    default:
-      return '...'
-  }
-}
+/** @deprecated name; use `suggestRespond` from src/respond-hint.ts. */
+export { suggestRespond, suggestRespond as sampleRespond } from '../respond-hint.js'
 
 // ---------------------------------------------------------------------------
 // Help
@@ -444,6 +427,7 @@ export const COMMON_FLAGS: FlagHelp[] = [
   { flag: '--env KEY=VALUE', text: 'Extra env var for stdio servers (repeatable)' },
   { flag: '--server-cwd <dir>', text: 'Working directory for a stdio server' },
   { flag: '--json', text: 'Machine-readable output (one stable JSON object on stdout)' },
+  { flag: '--compact', text: 'Single-line JSON even on a terminal (piped output is compact)' },
 ]
 
 function flagTable(flags: FlagHelp[]): string[] {
@@ -476,9 +460,13 @@ export function formatCommandHelp(help: CommandHelp): string {
 
 /** Every flag a command accepts (for unknown-flag detection). */
 export function acceptedFlags(help: CommandHelp): Set<string> {
-  const names = new Set<string>(['--help'])
+  const names = new Set<string>(['--help', '--json', '--compact'])
   for (const f of [...(help.flags ?? []), ...(help.common ? COMMON_FLAGS : [])]) {
-    for (const token of f.flag.split(/[\s,/]+/)) if (token.startsWith('--')) names.add(token)
+    for (const raw of f.flag.split(/[\s,/]+/)) {
+      // `--update[=all]` → `--update`; `--seed=<n>` → `--seed`
+      const token = raw.replace(/\[.*$/, '').replace(/=.*$/, '')
+      if (token.startsWith('--')) names.add(token)
+    }
   }
   for (const extra of help.extraFlags ?? []) names.add(extra)
   return names

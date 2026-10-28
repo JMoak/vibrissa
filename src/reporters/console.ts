@@ -13,6 +13,7 @@
  */
 import type { CaseStatus, CheckOutcome, Reporter, ReporterContext, RunEvent } from '../events.js'
 import { type Colors, type EnvLike, createColors, resolveStyle, visibleLength } from './ansi.js'
+import { driftDetail, driftSummary } from './manifest.js'
 import {
   type CaseRecord,
   DEFAULT_MAX_MISMATCHES,
@@ -24,7 +25,7 @@ import {
   firstLine,
   formatDuration,
   formatPassRate,
-  manifestDiffLines,
+  isNoCasesMessage,
   mismatchLine,
   neutralizeWorkflowCommand,
   outcomeHeadline,
@@ -34,6 +35,7 @@ import {
   splitLines,
   stepLabel,
   truncate,
+  updateSkippedReason,
 } from './shared.js'
 
 export interface ConsoleReporterOptions {
@@ -91,6 +93,10 @@ export class ConsoleReporter implements Reporter {
   private readonly maxDiffLines: number
   private readonly width: number
   private finished = false
+  /** Passing checks, folded into one "Checks: N passed" line per server. */
+  private readonly passedChecks = new Map<string, number>()
+  /** The runner's "no cases matched" warning, printed as an error line at the end. */
+  private noCasesMessage?: string
 
   constructor(
     private readonly ctx: ReporterContext,
@@ -109,6 +115,7 @@ export class ConsoleReporter implements Reporter {
 
   onEvent(event: RunEvent): void {
     const record = this.run.handle(event)
+    if (event.type !== 'check') this.flushPassedChecks()
     switch (event.type) {
       case 'run:start':
         this.printHeader(event.totalCases, event.servers, event.repeat)
@@ -187,7 +194,10 @@ export class ConsoleReporter implements Reporter {
 
   private printHeader(totalCases: number, servers: string[], repeat?: number): void {
     const on = servers.length > 0 ? ` on ${servers.join(', ')}` : ''
-    const times = repeat !== undefined && repeat > 1 ? ` (repeat ${repeat})` : ''
+    const notes: string[] = []
+    if (this.run.shard) notes.push(`shard ${this.run.shard.index}/${this.run.shard.total}`)
+    if (repeat !== undefined && repeat > 1) notes.push(`repeat ${repeat}`)
+    const times = notes.length > 0 ? ` (${notes.join(', ')})` : ''
     const label = `running ${plural(totalCases, 'case')}${on}${times}`
     if (this.style === 'pretty') this.out(`${this.c.bold(this.c.cyan('vibrissa'))} ${label}`)
     else this.out(`vibrissa: ${label}`)
@@ -244,23 +254,55 @@ export class ConsoleReporter implements Reporter {
     return lines
   }
 
+  /**
+   * Like `vib check`: passing checks fold into one line; failed/warned checks print their
+   * id, title and detail, plus the allow-list entry that would accept them after review.
+   */
   private printCheck(check: CheckOutcome): void {
-    const title =
-      check.status === 'failed'
-        ? this.c.red(check.title)
-        : check.status === 'warned'
-          ? this.c.yellow(check.title)
-          : check.title
-    this.out(`${this.badge(check.status)} check: ${this.serverTag(check.server)}${title}`)
-    if (check.detail && check.status !== 'passed') {
+    if (check.status === 'passed') {
+      const key = check.server ?? ''
+      this.passedChecks.set(key, (this.passedChecks.get(key) ?? 0) + 1)
+      return
+    }
+    const paint = check.status === 'failed' ? this.c.red : this.c.yellow
+    this.out(
+      `${this.badge(check.status)} ${this.serverTag(check.server)}${paint(this.c.bold(check.id))}  ${check.title}`,
+    )
+    if (check.detail) {
       for (const line of splitLines(check.detail)) this.out(`    ${this.c.dim(line)}`)
     }
+    this.out(`    ${this.c.dim(`Accept after review: checks.allow: ["${check.id}"]`)}`)
+  }
+
+  private flushPassedChecks(): void {
+    for (const [server, count] of this.passedChecks) {
+      const where = server && this.run.multiServer ? ` [${server}]` : ''
+      this.out(`${this.badge('passed')} Checks${where}: ${count} passed`)
+    }
+    this.passedChecks.clear()
   }
 
   private printWarning(message: string): void {
+    if (isNoCasesMessage(message)) {
+      this.noCasesMessage = message
+      return
+    }
     const [first, ...rest] = splitLines(message)
-    this.out(`${this.badge('warned')} ${this.c.yellow(`warning: ${first}`)}`)
+    this.out(`${this.badge('warned')} ${this.c.yellow(first)}`)
     for (const line of rest) this.out(`    ${this.c.yellow(line)}`)
+  }
+
+  /** "No cases matched" is an error unless the runner accepted it (allowEmpty). */
+  private printNoCases(): void {
+    if (!this.noCasesMessage) return
+    const accepted = this.run.ended && this.run.ok()
+    const [first, ...rest] = splitLines(this.noCasesMessage)
+    const glyph = accepted
+      ? this.badge('warned')
+      : this.c.red(this.style === 'pretty' ? '✗' : 'ERROR')
+    const paint = accepted ? this.c.yellow : this.c.red
+    this.out(`${glyph} ${paint(first)}`)
+    for (const line of rest) this.out(`    ${paint(line)}`)
   }
 
   // -------------------------------------------------------------------------
@@ -269,9 +311,10 @@ export class ConsoleReporter implements Reporter {
 
   private finish(): void {
     this.finished = true
+    this.flushPassedChecks()
+    this.printNoCases()
     this.printFailures()
     this.printManifestDrift()
-    this.printUpdated()
     if (this.style === 'pretty') this.printBox()
     else this.printPlainSummary()
   }
@@ -287,15 +330,25 @@ export class ConsoleReporter implements Reporter {
     const failed = this.run.casesWith('failed')
     if (failed.length === 0) return
     this.rule(`Failures (${failed.length})`, (s) => this.c.bold(this.c.red(s)))
+    // An --update run already decided what to rewrite; never suggest --update again.
+    const updateRun = this.run.cases.some(
+      (c) => c.outcome.status === 'updated' || updateSkippedReason(c.outcome) !== undefined,
+    )
     let goldenMismatch = false
     for (const record of failed) {
       this.out('')
       this.printFailure(record)
-      if (record.outcome.expected !== undefined && record.outcome.actual !== undefined) {
+      const { outcome } = record
+      if (
+        outcome.expected !== undefined &&
+        outcome.actual !== undefined &&
+        updateSkippedReason(outcome) === undefined &&
+        !outcome.reason?.includes('--update')
+      ) {
         goldenMismatch = true
       }
     }
-    if (goldenMismatch) {
+    if (goldenMismatch && !updateRun) {
       this.out('')
       this.out(this.c.dim('Tip: if the new output is correct, rerun with --update to accept it.'))
     }
@@ -311,6 +364,8 @@ export class ConsoleReporter implements Reporter {
 
     const reason = outcome.reason ?? outcomeHeadline(outcome)
     for (const line of splitLines(reason)) this.out(`  ${c.red(line)}`)
+    const notUpdated = updateSkippedReason(outcome)
+    if (notUpdated) this.out(`  ${c.yellow(`not updated: ${notUpdated}`)}`)
 
     if (record.steps.length > 0) {
       this.out('')
@@ -368,34 +423,21 @@ export class ConsoleReporter implements Reporter {
       this.out(
         `${this.badge('failed')} ${this.serverTag(m.server)}${this.c.bold(displayPath(m.path, this.ctx.rootDir))}`,
       )
-      for (const line of splitLines(m.summary ?? '')) if (line) this.out(`  ${this.c.red(line)}`)
-      const lines = manifestDiffLines(m.diff)
+      // The runner's summary may already be the full rendering (drift lines + tip).
+      splitLines(m.summary ?? '').forEach((line, i) => {
+        if (line) this.out(`  ${i === 0 ? this.c.red(line) : line}`)
+      })
+      const lines = driftDetail(m.summary, m.diff, this.c)
       if (lines.length > 0) {
         this.out('')
-        for (const line of lines) this.out(`    ${this.c.dim(line)}`)
+        for (const line of lines) this.out(line === '' ? '' : `  ${line}`)
       }
     }
-    this.out('')
-    this.out(this.c.dim('Tip: review the change, then rerun with --update-manifest to accept it.'))
-  }
-
-  private printUpdated(): void {
-    const updated = this.run.casesWith('updated')
-    if (updated.length === 0) return
-    this.rule(`Updated goldens (${updated.length})`, (s) => this.c.bold(this.c.cyan(s)))
-    for (const record of updated) {
+    if (!drift.every((m) => m.summary?.includes('--update-manifest'))) {
       this.out('')
-      this.out(`${this.badge('updated')} ${this.caseTitle(record)} ${this.path(record.ref.file)}`)
-      const diff = renderDiff(record.outcome.expected, record.outcome.actual, this.c, {
-        aAnnotation: 'previous',
-        bAnnotation: 'updated',
-        maxLines: Math.min(40, this.maxDiffLines),
-        ellipsis: this.g.ellipsis,
-      })
-      if (diff) {
-        this.out('')
-        for (const line of diff) this.out(line === '' ? '' : `    ${line}`)
-      }
+      this.out(
+        this.c.dim('Tip: review the change, then rerun with --update-manifest to accept it.'),
+      )
     }
   }
 
@@ -407,6 +449,7 @@ export class ConsoleReporter implements Reporter {
     extras: Array<{ text: string; tone: Tone }>
     flakyLines: string[]
     ok: boolean
+    verdict: string
   } {
     const summary = this.run.resolvedSummary()
     const counts: Array<[string, number]> = [
@@ -423,17 +466,20 @@ export class ConsoleReporter implements Reporter {
         tone: cc.failed > 0 ? 'bad' : cc.warned > 0 ? 'warn' : 'ok',
       })
     }
-    if (this.run.manifests.length > 0) {
-      const drift = this.run.manifestDrift().length
-      extras.push(
-        drift > 0
-          ? { text: `Manifest: drift in ${drift} of ${this.run.manifests.length}`, tone: 'bad' }
-          : { text: `Manifest: ok (${this.run.manifests.length})`, tone: 'ok' },
-      )
+    for (const m of this.run.manifests) {
+      const where = m.server && this.run.multiServer ? ` [${m.server}]` : ''
+      const file = displayPath(m.path, this.ctx.rootDir)
+      if (m.status === 'ok') {
+        extras.push({ text: `Manifest lock${where}: ok (${file})`, tone: 'ok' })
+      } else {
+        const what = driftSummary(m.diff) ?? firstLine(m.summary ?? 'changed')
+        extras.push({ text: `Manifest lock${where}: DRIFT in ${file} (${what})`, tone: 'bad' })
+      }
     }
-    if (this.run.warnings.length > 0) {
-      extras.push({ text: `Warnings: ${this.run.warnings.length}`, tone: 'warn' })
-    }
+    const warnings = this.run.warnings.filter((w) => !isNoCasesMessage(w)).length
+    if (warnings > 0) extras.push({ text: `Warnings: ${warnings}`, tone: 'warn' })
+    const updated = this.run.casesWith('updated').length
+    if (updated > 0) extras.push({ text: `Goldens updated: ${updated}`, tone: 'ok' })
     if (!this.run.ended) {
       extras.push({ text: 'Run ended before completion (no run:end received)', tone: 'bad' })
     }
@@ -448,26 +494,37 @@ export class ConsoleReporter implements Reporter {
         flakyLines.push(`  ${this.g.flaky} ${r.name}: ${formatPassRate(r)}${declared}`)
       }
     }
+    const ok = this.run.ok() && this.run.ended
+    const reasons = this.run.verdictReasons()
+    const verdict = !this.run.ended
+      ? 'INCOMPLETE'
+      : ok
+        ? 'PASSED'
+        : `FAILED${reasons.length > 0 ? ` (${reasons.join(', ')})` : ''}`
     return {
       counts,
       duration: formatDuration(summary.durationMs),
       extras,
       flakyLines,
-      ok: this.run.ok() && this.run.ended,
+      ok,
+      verdict,
     }
   }
 
+  /** `6 cases` or, when repeated, `2 cases, 6 runs`. */
+  private sizeLabel(): string {
+    const repeat = this.run.repeatInfo()
+    if (repeat) return `${plural(repeat.cases, 'case')}, ${plural(repeat.runs, 'run')}`
+    return plural(this.run.resolvedSummary().total, 'case')
+  }
+
   private printPlainSummary(): void {
-    const summary = this.run.resolvedSummary()
     const parts = this.summaryParts()
     this.out('')
     for (const extra of parts.extras) this.out(extra.text)
     for (const line of parts.flakyLines) this.out(line)
     const counts = parts.counts.map(([label, n]) => `${n} ${label.toLowerCase()}`).join(', ')
-    const verdict = !this.run.ended ? 'INCOMPLETE' : parts.ok ? 'PASSED' : 'FAILED'
-    this.out(
-      `Result: ${verdict} - ${plural(summary.total, 'case')}: ${counts} in ${parts.duration}`,
-    )
+    this.out(`Result: ${parts.verdict} - ${this.sizeLabel()}: ${counts} in ${parts.duration}`)
   }
 
   /** v1-style ASCII banner box. */
@@ -497,8 +554,15 @@ export class ConsoleReporter implements Reporter {
       if (label === 'Updated' && n > 0) return c.cyan(value)
       return value
     }
+    const repeat = this.run.repeatInfo()
+    const sizes = repeat
+      ? [
+          { plain: `Cases: ${repeat.cases}`, painted: `Cases: ${c.cyan(String(repeat.cases))}` },
+          { plain: `Runs: ${repeat.runs}`, painted: `Runs: ${c.cyan(String(repeat.runs))}` },
+        ]
+      : [{ plain: `Total: ${summary.total}`, painted: `Total: ${c.cyan(String(summary.total))}` }]
     const segments = [
-      { plain: `Total: ${summary.total}`, painted: `Total: ${c.cyan(String(summary.total))}` },
+      ...sizes,
       ...parts.counts.map(([label, n]) => ({
         plain: `${label}: ${n}`,
         painted: `${label}: ${paintCount(label, n)}`,
@@ -526,6 +590,7 @@ export class ConsoleReporter implements Reporter {
     this.out(mid)
     for (const row of rows) this.out(line(` ${row}`))
     this.out(line(` Duration: ${c.gray(parts.duration)}`))
+    if (parts.verdict.includes('(')) this.out(line(` ${c.red(fit(`Result: ${parts.verdict}`))}`))
     if (parts.extras.length > 0) {
       this.out(mid)
       for (const extra of parts.extras) {

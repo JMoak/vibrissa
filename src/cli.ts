@@ -2,16 +2,21 @@
 /**
  * `vib` / `vib-test` entry point: the command table, help, flag checks, and the error →
  * exit-code mapping (0 ok · 1 failed · 2 usage / config / connection error).
+ *
+ * Under `--json` every outcome is one JSON object on stdout: `{ ok: true, ... }` on success,
+ * `{ ok: false, error: { type, code, message, hint }, next? }` on any failure (nothing is
+ * duplicated on stderr).
  */
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   UsageError,
+  assertKnownFlags,
   closest,
-  flagTokens,
   normalizeArgv,
   printJson,
+  setJsonStyle,
   splitAtDoubleDash,
 } from './cli/args.js'
 import { callCommand } from './cli/call.js'
@@ -34,17 +39,16 @@ import { runCommand, runHelp } from './cli/run.js'
 import { tapCommand } from './cli/tap.js'
 import { toolsCommand } from './cli/tools.js'
 import { ConfigError } from './config.js'
-import { SessionStartError } from './session/index.js'
+import { SessionRequestError, SessionStartError } from './session/index.js'
 
 export interface CommandSpec extends CommandHelp {
   run: (argv: string[]) => Promise<number>
-  /** Reject flags the help does not list (off for commands owned elsewhere). */
-  strictFlags?: boolean
   /** stdout carries a protocol stream: never print errors/JSON there. */
   protocolStdout?: boolean
 }
 
 const GROUPS: Array<[string, string]> = [
+  ['setup', 'Setup — create or upgrade a project'],
   ['explore', 'Explore — what does the server offer?'],
   ['probe', 'Probe — try one operation'],
   ['capture', 'Capture — turn reality into cases'],
@@ -77,16 +81,78 @@ const ARG_FLAGS = [
   },
 ]
 
+const EXPECT_MISSING = {
+  flag: '--expect-missing',
+  text: 'Skip the check that the name is listed by the server (to probe unknown names)',
+}
+
+const BRIEF = { flag: '--brief', text: 'Only failures and warnings' }
+
 export const COMMANDS: Record<string, CommandSpec> = {
+  init: {
+    name: 'init',
+    group: 'setup',
+    summary:
+      'Scaffold vibrissa.json, a real sample case from your server, a sample flow, optionally CI',
+    usage: [
+      'vib init [--dir .] [--server "<cmd>"|<url>] [--from-claude-config [file]] [--force]',
+      'vib init --ci        (only writes .github/workflows/vibrissa.yml when vibrissa.json exists)',
+    ],
+    description:
+      'Detects the server command: package.json bin/main/dist, pyproject.toml (python -m <pkg>), go.mod (go run .).\nThe server is named "default". If it starts, the first tool is called with minimal generated args and\nrecorded as a real case; otherwise a skipped sample is written for you to edit. Adds reports/ to .gitignore.\n--from-claude-config reads .mcp.json, else Claude Desktop\'s claude_desktop_config.json (mcpServers);\nliteral secrets in env/headers are replaced with ${VAR} references.',
+    flags: [
+      { flag: '--dir <path>', text: 'Target directory (default .)' },
+      { flag: '--server <cmd|url>', text: 'Server command line or URL (skips detection)' },
+      { flag: '--from-claude-config [file]', text: 'Pre-fill servers from a Claude config' },
+      {
+        flag: '--ci',
+        text: 'Write .github/workflows/vibrissa.yml (runs vib run --profile ci; the profile carries the flags)',
+      },
+      {
+        flag: '--no-call',
+        text: 'Do not call a tool for the sample (writes a skipped placeholder instead)',
+      },
+      { flag: '--protocol <mode>', text: 'Set protocol on the scaffolded servers' },
+      { flag: '--timeout <ms>', text: 'timeoutMs for the config (default 15000)' },
+      { flag: '--force', text: 'Overwrite existing files' },
+      { flag: '--json', text: 'Machine-readable output' },
+    ],
+    examples: [
+      'vib init',
+      'vib init --server "uv run my-server"',
+      'vib init --from-claude-config',
+      'vib init --ci',
+    ],
+    run: initCommand,
+  },
+  migrate: {
+    name: 'migrate',
+    group: 'setup',
+    summary: 'Rewrite v1 config and case files to v2 in place (idempotent)',
+    usage: ['vib migrate [--dry-run] [--manifest] [--cases <glob>] [--force]'],
+    description:
+      'server → servers.default + defaultServer (also in profiles); $schema added / fixed to @jmoak/vibrissa;\nexpectError.code aliases renamed (RequestTimedOut → RequestTimeout) and v1 numeric codes named\n(-32001 → RequestTimeout, -32002 → ResourceNotFound). Leftover v1 keys (display) are reported.\nFiles with comments are left alone unless --force. Exit 1 when a file could not be migrated.',
+    flags: [
+      { flag: '--dry-run', text: 'Show what would change; write nothing' },
+      { flag: '--manifest', text: 'Also record the manifest lock (vib manifest record)' },
+      { flag: '--cases <glob>', text: 'Case files to migrate (default: config globs)' },
+      {
+        flag: '--force',
+        text: 'Rewrite files even if they contain comments (comments are dropped)',
+      },
+    ],
+    common: true,
+    examples: ['vib migrate --dry-run', 'vib migrate --manifest'],
+    run: migrateCommand,
+  },
   discover: {
     name: 'discover',
     group: 'explore',
     summary: 'Show protocol era/version, server identity, capabilities, extensions, instructions',
     usage: ['vib discover [--json]'],
     description:
-      'Calls server/discover (2026-07-28) or reads the initialize result (2025 era).\n--json prints the DiscoverInfo object (era, protocolVersion, supportedVersions, serverInfo, capabilities, extensions, instructions, synthesized, raw).',
+      'Calls server/discover (2026-07-28) or reads the initialize result (2025 era).\n--json: { ok, era, protocolVersion, supportedVersions, serverInfo, capabilities, extensions, instructions, synthesized, transport, next }.',
     common: true,
-    strictFlags: true,
     examples: [
       'vib discover',
       'vib discover --server staging --json',
@@ -97,13 +163,13 @@ export const COMMANDS: Record<string, CommandSpec> = {
   tools: {
     name: 'tools',
     group: 'explore',
-    summary: 'List tools: name, title, description, arguments, hints',
-    usage: ['vib tools [--json]'],
+    summary: 'List tools (name, title, description, arguments, hints), or show one in detail',
+    usage: ['vib tools [--json]', 'vib tools <name> [--json]'],
     description:
-      '--json prints { tools: ToolSummary[], listMeta: { tools: { ttlMs, cacheScope } } }.',
+      '--json: { ok, tools: ToolSummary[], listMeta: { tools: { ttlMs, cacheScope } } }; with <name>: { ok, tool }.',
+    flags: [EXPECT_MISSING],
     common: true,
-    strictFlags: true,
-    examples: ['vib tools', 'vib tools --json | jq ".tools[].name"'],
+    examples: ['vib tools', 'vib tools echo', 'vib tools --json | jq ".tools[].name"'],
     run: toolsCommand,
   },
   resources: {
@@ -112,9 +178,8 @@ export const COMMANDS: Record<string, CommandSpec> = {
     summary: 'List resources (uri, mime type) and resource templates',
     usage: ['vib resources [--json]'],
     description:
-      '--json prints { resources, resourceTemplates, listMeta: { resources, resourceTemplates } }; a list the server does not support has listMeta.<list>.unsupported = true.',
+      '--json: { ok, resources, resourceTemplates, listMeta: { resources, resourceTemplates } }; a list the server does not support has listMeta.<list>.unsupported = true.',
     common: true,
-    strictFlags: true,
     run: resourcesCommand,
   },
   prompts: {
@@ -122,9 +187,8 @@ export const COMMANDS: Record<string, CommandSpec> = {
     group: 'explore',
     summary: 'List prompts and their arguments',
     usage: ['vib prompts [--json]'],
-    description: '--json prints { prompts, listMeta: { prompts } }.',
+    description: '--json: { ok, prompts, listMeta: { prompts } }.',
     common: true,
-    strictFlags: true,
     run: promptsCommand,
   },
   call: {
@@ -135,18 +199,18 @@ export const COMMANDS: Record<string, CommandSpec> = {
       "vib call <tool> [--args '{...}'] [--arg k=v] [--respond '{...}'] [--await] [--validate] [--raw]",
     ],
     description:
-      'Prints the result after config "normalize" (so you see what a golden would hold); --raw shows the wire result.\nWhen the server asks for input (MRTR) and nothing answers, the request is printed with a ready-to-paste --respond value.\nExit 1 on an error, an unanswered input request, or a failed --validate.',
+      'Prints the result after config "normalize" (what a golden would hold); --raw shows the wire result.\nThe tool must be listed by the server (did-you-mean otherwise; --expect-missing skips the check).\nstructuredContent is always checked against the outputSchema: a violation is a warning, or a failure with --validate.\nWhen the server asks for input (MRTR) and nothing answers, the request is printed with a ready-to-paste --respond.\nExit 1 on an error, an unanswered input request, or a failed --validate.',
     flags: [
       ...ARG_FLAGS,
       ...MRTR_FLAGS,
       {
         flag: '--validate',
-        text: "Validate structuredContent against the tool's outputSchema and print a verdict",
+        text: 'Fail (exit 1) when structuredContent violates the outputSchema, and print the verdict',
       },
       { flag: '--raw', text: 'Print the raw wire result (skip normalization)' },
+      EXPECT_MISSING,
     ],
     common: true,
-    strictFlags: true,
     examples: [
       'vib call echo --arg text=hello',
       'vib call typed --args \'{"a": 1, "b": 2}\' --validate',
@@ -160,13 +224,15 @@ export const COMMANDS: Record<string, CommandSpec> = {
     group: 'probe',
     summary: 'Read a resource by URI (or expand a URI template with --arg)',
     usage: ['vib read <uri> [--raw]', "vib read '<uri-template>' --arg key=value"],
+    description:
+      'The URI must be listed by resources/list or match a listed template (--expect-missing skips the check).',
     flags: [
       ...ARG_FLAGS,
       ...MRTR_FLAGS.slice(0, 2),
       { flag: '--raw', text: 'Print the raw wire result' },
+      EXPECT_MISSING,
     ],
     common: true,
-    strictFlags: true,
     examples: ['vib read file:///README.md', "vib read 'users://{id}' --arg id=42 --json"],
     run: readCommand,
   },
@@ -181,9 +247,9 @@ export const COMMANDS: Record<string, CommandSpec> = {
       ...ARG_FLAGS,
       ...MRTR_FLAGS.slice(0, 2),
       { flag: '--raw', text: 'Print the raw wire result' },
+      EXPECT_MISSING,
     ],
     common: true,
-    strictFlags: true,
     examples: ['vib get-prompt greet --arg name=Jordan --arg style=terse'],
     run: getPromptCommand,
   },
@@ -198,7 +264,7 @@ export const COMMANDS: Record<string, CommandSpec> = {
       'vib record --from-tap <file> [--select <n|name|all>]',
     ],
     description:
-      'Results go through config "normalize", then matcher-like keys are escaped ($literal), so the golden matches what vib run compares.\nErrors become expectError (code name + message prefix). Input requests are recorded as respond + expectInputRequired;\nwithout --respond you are asked in a terminal, and non-interactive runs fail with the exact --respond to pass.\n--flow reads steps until an empty line: `<tool> {"json": "args"}`, `<tool> key=value ...`, or NDJSON objects\n({"tool": ..., "args": ..., "respond": ...}). Server-minted ids reused by later steps become {{captures}} automatically (--no-capture to disable).\n--from-tap lists the calls in a vib tap capture; --select picks them (1-based index, range 2-5, tool/prompt name or URI, all).',
+      'Results go through config "normalize", then matcher-like keys are escaped ($literal), so the golden matches what vib run compares.\nVolatile values are loosened: ISO timestamps, UUIDs, epoch-ms numbers, and anything that differs between two back-to-back\ncalls (--no-stable-check skips the second call; --exact keeps everything verbatim). See docs/CASES.md "Generated ids and timestamps".\nErrors become expectError (code name + message prefix). Input requests are recorded as respond + expectInputRequired;\nwithout --respond you are asked in a terminal, and non-interactive runs fail with the exact --respond to pass.\nA result that violates the tool\'s outputSchema is refused unless --allow-invalid-output.\nFiles go to the directory of the first config glob (deduplicated names); --server <name> writes "server" into the case.\n--flow reads steps until an empty line: `<tool> {"json": "args"}`, `<tool> key=value ...`, or NDJSON objects\n({"tool": ..., "args": ..., "respond": ...}). Server-minted ids reused by later steps become {{captures}} automatically (--no-capture to disable).\n--from-tap lists the calls in a vib tap capture; --select picks them (1-based index, range 2-5, tool/prompt name or URI, all).',
     flags: [
       ...ARG_FLAGS,
       { flag: '--resource <uri>', text: 'Record resources/read' },
@@ -209,21 +275,27 @@ export const COMMANDS: Record<string, CommandSpec> = {
       { flag: '--prompt <name>', text: 'Record prompts/get' },
       ...MRTR_FLAGS,
       { flag: '--partial', text: 'Wrap the expectation in "$partial": true' },
+      { flag: '--exact', text: 'Keep every value verbatim (no volatile-field loosening)' },
+      {
+        flag: '--no-stable-check',
+        text: 'Do not repeat the call to find values that change between calls',
+      },
+      {
+        flag: '--allow-invalid-output',
+        text: 'Write the golden even if structuredContent violates the outputSchema',
+      },
+      EXPECT_MISSING,
       { flag: '--flow', text: 'Record a multi-step flow from stdin' },
       { flag: '--no-capture', text: '--flow: do not infer {{captures}}' },
       { flag: '--from-tap <file>', text: 'Turn calls captured by vib tap into cases' },
       { flag: '--select <sel>', text: '--from-tap: which calls (repeatable, comma-separated)' },
-      {
-        flag: '--out-dir <dir>',
-        text: '--from-tap: where to write (default tests/integration/tap)',
-      },
-      { flag: '--out <path>', text: 'Case file (default tests/integration/<name>.json)' },
-      { flag: '--name <text>', text: 'Case name' },
+      { flag: '--out-dir <dir>', text: '--from-tap: where to write (default <suite dir>/tap)' },
+      { flag: '--out <path>', text: 'Case file (default <suite dir>/<name>.json)' },
+      { flag: '--name <text>', text: 'Case name (default "<tool> <args>")' },
       { flag: '--tag <tag>', text: 'Add a tag (repeatable)' },
       { flag: '--force', text: 'Overwrite an existing case file' },
     ],
     common: true,
-    strictFlags: true,
     examples: [
       'vib record echo --arg text=hello',
       'vib record --resource fixture://readme',
@@ -246,7 +318,7 @@ export const COMMANDS: Record<string, CommandSpec> = {
     flags: [
       {
         flag: '--out <file>',
-        text: 'Capture file (default reports/tap/<timestamp>.ndjson; appended)',
+        text: 'Capture file (default reports/tap/<timestamp>.ndjson; appended, seq continues)',
       },
       { flag: '--quiet', text: 'No status lines on stderr' },
       { flag: '--env KEY=VALUE', text: 'Extra env var for the server (repeatable)' },
@@ -255,7 +327,6 @@ export const COMMANDS: Record<string, CommandSpec> = {
       { flag: '--server <name>', text: 'Configured server to proxy (without --)' },
       { flag: '--profile <name>', text: 'Profile for the configured server (without --)' },
     ],
-    strictFlags: true,
     protocolStdout: true,
     examples: [
       'vib tap -- node dist/index.js',
@@ -265,74 +336,29 @@ export const COMMANDS: Record<string, CommandSpec> = {
   },
   // Help for run / manifest / diff lives with those commands (src/cli/{run,manifest,diff}.ts).
   manifest: { ...manifestHelp, group: 'capture', run: manifestCommand },
-  migrate: {
-    name: 'migrate',
-    group: 'capture',
-    summary: 'Rewrite v1 config and case files to v2 in place (idempotent)',
-    usage: ['vib migrate [--dry-run] [--manifest] [--cases <glob>] [--force]'],
-    description:
-      'server → servers.default + defaultServer (also in profiles); $schema added / fixed to @jmoak/vibrissa;\nexpectError.code aliases renamed (RequestTimedOut → RequestTimeout) and v1 numeric codes named\n(-32001 → RequestTimeout, -32002 → ResourceNotFound). Files with comments are left alone unless --force.',
-    flags: [
-      { flag: '--dry-run', text: 'Show what would change; write nothing' },
-      { flag: '--manifest', text: 'Also record the manifest lock (vib manifest record)' },
-      { flag: '--cases <glob>', text: 'Case files to migrate (default: config globs)' },
-      {
-        flag: '--force',
-        text: 'Rewrite files even if they contain comments (comments are dropped)',
-      },
-    ],
-    common: true,
-    strictFlags: true,
-    examples: ['vib migrate --dry-run', 'vib migrate --manifest'],
-    run: migrateCommand,
-  },
-  init: {
-    name: 'init',
-    group: 'capture',
-    summary: 'Scaffold vibrissa.json (servers map), a sample case and flow, optionally CI',
-    usage: [
-      'vib init [--dir .] [--server "<cmd>"|<url>] [--from-claude-config [file]] [--ci] [--force]',
-    ],
-    description:
-      "Detects the server command: package.json bin/main/dist, pyproject.toml (python -m <pkg>), go.mod (go run .).\n--from-claude-config reads .mcp.json, else Claude Desktop's claude_desktop_config.json (mcpServers);\nliteral secrets in env/headers are replaced with ${VAR} references.",
-    flags: [
-      { flag: '--dir <path>', text: 'Target directory (default .)' },
-      { flag: '--server <cmd|url>', text: 'Server command line or URL (skips detection)' },
-      { flag: '--from-claude-config [file]', text: 'Pre-fill servers from a Claude config' },
-      {
-        flag: '--ci',
-        text: 'Write .github/workflows/vibrissa.yml (vib run --profile ci --check --reporter console,github,junit,json)',
-      },
-      { flag: '--protocol <mode>', text: 'Set protocol on the scaffolded servers' },
-      { flag: '--timeout <ms>', text: 'timeoutMs for the config (default 15000)' },
-      { flag: '--force', text: 'Overwrite existing files' },
-      { flag: '--json', text: 'Machine-readable output' },
-    ],
-    strictFlags: true,
-    examples: [
-      'vib init',
-      'vib init --from-claude-config --ci',
-      'vib init --server "uv run my-server"',
-    ],
-    run: initCommand,
-  },
   run: { ...runHelp, group: 'gate', run: runCommand },
   diff: { ...diffHelp, group: 'gate', run: diffCommand },
   explain: {
     name: 'explain',
     group: 'gate',
-    summary: 'Paraphrase what case files do and assert (for reviewing agent-written suites)',
-    usage: ['vib explain <case.json> [more files or "globs/**/*.json"] [--full] [--json]'],
+    summary: 'Paraphrase what cases do and assert, and flag weak assertions',
+    usage: [
+      'vib explain                      (every case in the configured suite)',
+      'vib explain <case.json | "case name" | "glob/**/*.json"> ... [--brief] [--full] [--json]',
+    ],
     description:
-      'Names every matcher in plain words (docs/MATCHERS.md): what is called with which args, what must equal / match /\nbe present, captures and {{placeholders}}, scripted answers, task polling, budgets.',
+      'Loads cases exactly like vib run (validation, $ref fragments, placeholder checks) and reports the same load errors.\nNames every matcher in plain words (docs/MATCHERS.md), and flags weak assertions: expectError {}, a bare root\n$partial, no expectation, validateOutput: false, ignoreErrors outside teardown, skipped cases. Exit 1 on load errors.',
     flags: [
+      BRIEF,
       { flag: '--full', text: 'Show every assertion (default: first 40 per expectation)' },
+      { flag: '--config <path>', text: 'Config whose suite (globs, servers) to use' },
       { flag: '--json', text: 'Structured explanation: { ok, cases: [...] }' },
     ],
-    strictFlags: true,
     examples: [
+      'vib explain',
       'vib explain tests/integration/echo.basic.json',
-      'vib explain "tests/integration/**/*.json" --json',
+      'vib explain "echo basic"',
+      'vib explain --brief --json',
     ],
     run: explainCommand,
   },
@@ -340,16 +366,16 @@ export const COMMANDS: Record<string, CommandSpec> = {
     name: 'check',
     group: 'harden',
     summary: 'Spec-sanity checks + tool-description lint (poisoning, shadowing, exfiltration)',
-    usage: ['vib check [--allow <id>] [--verbose] [--json]', 'vib check --list'],
+    usage: ['vib check [--allow <id>] [--brief] [--verbose] [--json]', 'vib check --list'],
     description:
       'Offline, deterministic checks over the live manifest (docs/CHECKS.md). Config:\n  "checks": { "allow": ["desc/long-description", "desc/sensitive-paths:ssh.list_keys"], "severity": { "desc/embedded-url": "failed" } }\nExit 1 when any check failed (warnings never fail).',
     flags: [
       { flag: '--allow <id>', text: 'Skip a check (id, prefix/*, or id:subject; repeatable)' },
       { flag: '--list', text: 'List every check id with its default severity' },
+      BRIEF,
       { flag: '--verbose', text: 'List passed checks individually' },
     ],
     common: true,
-    strictFlags: true,
     run: checkCommand,
   },
   fuzz: {
@@ -381,12 +407,12 @@ export const COMMANDS: Record<string, CommandSpec> = {
       { flag: '--id <case-id>', text: 'Run a single case (same --seed/--runs as the report)' },
       {
         flag: '--record-failures',
-        text: 'Write each failing case to tests/integration/fuzz/<tool>-<id>.json',
+        text: 'Write each failing case to <suite dir>/fuzz/<tool>-<id>.json',
       },
       { flag: '--out-dir <dir>', text: 'Where --record-failures writes' },
+      BRIEF,
     ],
     common: true,
-    strictFlags: true,
     examples: [
       'vib fuzz search --runs 200',
       'vib fuzz echo --inject --record-failures',
@@ -401,7 +427,6 @@ export const COMMANDS: Record<string, CommandSpec> = {
     usage: ['vib inspect [--cli] [-- extra inspector args]'],
     flags: [{ flag: '--cli', text: 'Inspector CLI mode instead of the UI' }],
     common: true,
-    strictFlags: true,
     run: inspectCommand,
   },
   conformance: {
@@ -412,10 +437,48 @@ export const COMMANDS: Record<string, CommandSpec> = {
     description:
       'Wraps npx @modelcontextprotocol/conformance server --url <url>. The official suite is HTTP-first;\nfor stdio servers use vib check (the deterministic subset).',
     common: true,
-    strictFlags: true,
     run: conformanceCommand,
   },
 }
+
+/** `vib help cases`: everything needed to write a case, in about 2 KB. */
+export const CASES_CHEATSHEET = `Vibrissa case files — cheat sheet (full reference: docs/CASES.md, docs/MATCHERS.md)
+
+One JSON file = one case. One operation:
+  "tool": "echo"  |  "resource": "file:///x"  |  "resourceTemplate": "users://{id}"  |  "prompt": "greet"
+  "args": { ... }            tool args, template variables, or prompt args
+  "expect": <expectation>    the normalized result; plain JSON = exact deep equality
+  "expectError": { "code": "InvalidParams", "message": { "$regex": "must be" } }   (a tool isError counts)
+Also: name, tags, server, skip, flaky, timeoutMs, budgetMs, validateOutput, normalize
+
+Matchers (anywhere inside expect):
+  {"$partial": true, ...}           extra keys / trailing items allowed below
+  {"$regex": "^ok", "flags": "i"}   {"$wildcard": "req_*"}       strings
+  {"$type": "string"}  {"$any": true} (present)  {"$ignore": true} (may be missing)
+  {"$number": {"gte": 0, "lt": 10}}  {"$length": {"min": 1}}
+  {"$contains": {...}, "count": 1}  {"$unordered": true, "value": [...]}   arrays
+  {"$oneOf": [a, b]}  {"$schema": {...JSON Schema...}}  {"$ref": "./shared/x.json"}  {"$literal": {...}}
+  Timestamps: {"$schema": {"type": "string", "format": "date-time"}}
+
+Flows: "steps": [ step, ... ], plus "setup" / "teardown" (teardown runs on failure; "ignoreErrors": true)
+  "capture": { "sid": "structuredContent.sessionId" }   then "{{sid}}" in later args / expect
+  "{{env.NAME}}" reads an environment variable
+Input requests (MRTR):
+  "respond": { "elicitation/create": { "action": "accept", "content": { "confirm": true } } }
+  "expectInputRequired": { "elicitation/create": { "$partial": true, "message": "Proceed?" } }
+Tasks: "await": true  or  { "pollMs": 500, "timeoutMs": 30000 };  "expectTask": { "$partial": true, ... }
+
+Examples:
+  {"tool": "echo", "args": {"text": "hi"}, "expect": {"content": [{"type": "text", "text": "hi"}]}}
+  {"tool": "echo", "args": {}, "expectError": {"code": "InvalidParams"}}
+  {"steps": [
+    {"tool": "session.create", "args": {"user": "jo"}, "capture": {"sid": "structuredContent.id"}},
+    {"tool": "session.get", "args": {"id": "{{sid}}"},
+     "expect": {"$partial": true, "structuredContent": {"user": "jo"}}}]}
+
+Write cases: vib record <tool> --arg k=v · review: vib explain <file> · run: vib run`
+
+const HELP_TOPICS: Record<string, () => string> = { cases: () => CASES_CHEATSHEET }
 
 function version(): string {
   try {
@@ -447,30 +510,92 @@ export function formatGlobalHelp(): string {
     '',
     c.bold('Every command:'),
     '  --config <path> · --server <name|cmd|url> · --profile <name> · --protocol auto|legacy|modern|<date>',
-    '  --timeout <ms> · --env KEY=VALUE · --json (one stable JSON object on stdout)',
+    '  --timeout <ms> · --env KEY=VALUE · --json (one JSON object on stdout; --compact for one line)',
     '',
-    `Help for one command: ${c.cyan('vib <command> --help')} · full flag reference: docs/CLI.md`,
+    `Help for one command: ${c.cyan('vib <command> --help')} · case syntax: ${c.cyan('vib help cases')} · full flag reference: docs/CLI.md`,
     'Typical loop: vib init → vib discover → vib tools → vib call → vib record → vib manifest record → vib run --check',
     'Exit codes: 0 ok · 1 failed (assertion, check, tool error) · 2 usage/config/connection error',
   )
   return out.join('\n')
 }
 
-function exitCodeFor(err: unknown): number {
-  if (err instanceof UsageError || err instanceof ConfigError || err instanceof SessionStartError)
-    return 2
-  if (err instanceof Error && err.name === 'ManifestFileError') return 2
-  return 1
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+export interface ErrorEnvelope {
+  ok: false
+  error: { type: string; code: string; message: string; hint: string }
+  next?: string[]
 }
 
-function errorMessage(err: unknown, command: string): string {
-  const message = err instanceof Error ? err.message : String(err)
-  if (err instanceof UsageError || err instanceof ConfigError || err instanceof SessionStartError)
-    return message
-  // Unknown failures still end with a next step.
-  return /[.!?)]$/.test(message.trim()) && /\b(run|pass|use|check|add|set|fix|try)\b/i.test(message)
-    ? message
-    : `${message}${/[.!?]$/.test(message.trim()) ? '' : '.'} Run vib ${command} --help for usage.`
+function lastSentence(message: string): { detail: string; hint?: string } {
+  const parts = message.trim().split(/(?<=[.!?])\s+(?=[A-Z])/)
+  if (parts.length < 2) return { detail: message.trim() }
+  return { detail: parts.slice(0, -1).join(' '), hint: parts[parts.length - 1] }
+}
+
+/** Map anything thrown by a command to exit code + the `--json` envelope + human text. */
+export function describeError(
+  err: unknown,
+  command: string,
+): { exit: number; envelope: ErrorEnvelope; human: string } {
+  const type = err instanceof Error ? err.name : 'Error'
+  const fallbackHint = `Run vib ${command} --help for usage.`
+  let exit = 1
+  let code = 'internal'
+  let message = err instanceof Error ? err.message : String(err)
+  let hint: string | undefined
+  let next: string[] | undefined
+  if (err instanceof UsageError) {
+    exit = 2
+    code = err.code
+    message = err.detail
+    hint = err.hint
+    next = err.next
+  } else if (err instanceof ConfigError) {
+    exit = 2
+    code = 'config'
+  } else if (err instanceof SessionStartError) {
+    exit = 2
+    code = err.code
+    // The message may end with the server's stderr tail; the next step is about the server.
+    hint = SERVER_START_HINT
+    next = ['vib discover --server "<cmd>"', 'vib init --server "<cmd>"']
+  } else if (err instanceof SessionRequestError) {
+    code = err.error.codeName ?? 'request'
+  } else if (type === 'ManifestFileError') {
+    exit = 2
+    code = 'manifest'
+  }
+  if (hint === undefined) {
+    const split = lastSentence(message)
+    if (
+      split.hint &&
+      /\b(run|pass|use|check|add|set|fix|try|make|point|export|start|edit|delete|re-run|quote)\b/i.test(
+        split.hint,
+      )
+    ) {
+      message = split.detail
+      hint = split.hint
+    }
+  }
+  hint ??= fallbackHint
+  message = endSentence(message)
+  return {
+    exit,
+    envelope: { ok: false, error: { type, code, message, hint }, ...(next ? { next } : {}) },
+    human: `${message} ${hint}`,
+  }
+}
+
+const SERVER_START_HINT =
+  'Fix the server command in vibrissa.json, or try one with --server "<cmd> <args>" (vib init --server "<cmd>" writes it to the config).'
+
+/** Close a message as a sentence (`..., ` / `...:` → `....`) so a hint can follow it. */
+export function endSentence(text: string): string {
+  const trimmed = text.trim().replace(/[\s,;:]+$/, '')
+  return /[.!?)"'`]$/.test(trimmed) ? trimmed : `${trimmed}.`
 }
 
 function reportError(
@@ -479,31 +604,43 @@ function reportError(
   json: boolean,
   protocolStdout: boolean,
 ): number {
-  const code = exitCodeFor(err)
-  const message = errorMessage(err, command)
-  if (json && !protocolStdout) {
-    printJson({
-      ok: false,
-      error: {
-        type: err instanceof Error ? err.name : 'Error',
-        ...(err instanceof SessionStartError ? { code: err.code } : {}),
-        message,
-      },
-    })
-  }
-  console.error(colors().red(`error: ${message}`))
+  const { exit, envelope, human } = describeError(err, command)
+  if (json && !protocolStdout) printJson(envelope)
+  else console.error(colors().red(`error: ${human}`))
   if (process.env.VIB_DEBUG && err instanceof Error && err.stack) console.error(err.stack)
-  return code
+  return exit
 }
+
+// ---------------------------------------------------------------------------
+// Dispatch
+// ---------------------------------------------------------------------------
 
 /** Run the CLI with `argv` (without node/script). Returns the exit code. */
 export async function main(rawArgv: string[]): Promise<number> {
   const argv = normalizeArgv(rawArgv)
+  const [ownAll] = splitAtDoubleDash(argv)
+  const json = ownAll.includes('--json')
+  setJsonStyle(ownAll.includes('--compact') ? 'compact' : 'auto')
   const first = argv[0]
   if (first === '--help' || first === '-h' || first === 'help') {
     const topic = first === 'help' ? argv[1] : undefined
-    if (topic && COMMANDS[topic]) console.log(formatCommandHelp(COMMANDS[topic]))
-    else console.log(formatGlobalHelp())
+    if (topic === undefined) console.log(formatGlobalHelp())
+    else if (Object.hasOwn(COMMANDS, topic)) console.log(formatCommandHelp(COMMANDS[topic]))
+    else if (Object.hasOwn(HELP_TOPICS, topic)) console.log(HELP_TOPICS[topic]())
+    else {
+      const topics = [...Object.keys(HELP_TOPICS), ...Object.keys(COMMANDS)]
+      const suggestion = closest(topic, topics)
+      return reportError(
+        new UsageError(`Unknown help topic "${topic}".`, {
+          code: 'unknown-topic',
+          hint: `${suggestion ? `Did you mean "vib help ${suggestion}"? ` : ''}Topics: cases, or any command name.`,
+          next: ['vib help cases', 'vib --help'],
+        }),
+        'help',
+        json,
+        false,
+      )
+    }
     return 0
   }
   if (first === '--version' || first === '-v') {
@@ -515,50 +652,47 @@ export async function main(rawArgv: string[]): Promise<number> {
   if (first !== undefined && !first.startsWith('-')) {
     if (!Object.hasOwn(COMMANDS, first)) {
       const suggestion = closest(first, Object.keys(COMMANDS))
-      console.error(
-        colors().red(
-          `error: unknown command "${first}".${suggestion ? ` Did you mean "vib ${suggestion}"?` : ''} Run vib --help to list commands.`,
-        ),
+      return reportError(
+        new UsageError(`Unknown command "${first}".`, {
+          code: 'unknown-command',
+          hint: `${suggestion ? `Did you mean "vib ${suggestion}"? ` : ''}Run vib --help to list commands.`,
+          next: suggestion ? [`vib ${suggestion} --help`] : ['vib --help'],
+        }),
+        first,
+        json,
+        false,
       )
-      return 2
     }
     name = first
     args = argv.slice(1)
   }
   const spec = COMMANDS[name]
   const [own] = splitAtDoubleDash(args)
-  const json = own.includes('--json')
   if (own.includes('--help') || own.includes('-h')) {
     console.log(formatCommandHelp(spec))
     return 0
   }
   try {
-    if (spec.strictFlags) {
-      const accepted = acceptedFlags(spec)
-      for (const flag of flagTokens(own)) {
-        if (accepted.has(flag)) continue
-        const suggestion = closest(flag, [...accepted])
-        throw new UsageError(
-          `Unknown option ${flag} for vib ${name}.${suggestion ? ` Did you mean ${suggestion}?` : ''} Run vib ${name} --help for its options.`,
-        )
-      }
-    }
+    assertKnownFlags(own, acceptedFlags(spec), name)
     return await spec.run(args)
   } catch (err) {
     return reportError(err, name, json, Boolean(spec.protocolStdout))
   }
 }
 
-/** Run `main`, then exit once stdout/stderr have flushed (pipes may be asynchronous). */
+/**
+ * Grace period before a forced exit. The process normally exits on its own once `main`
+ * returned (every session is closed by then); calling process.exit while a socket or pipe
+ * is still closing aborts on Windows (UV_HANDLE_CLOSING), so it is only the fallback for
+ * something holding the event loop open.
+ */
+const FORCE_EXIT_AFTER_MS = 2000
+
+/** Run `main` and exit with its code once pending I/O has drained. */
 export async function runCli(argv: string[] = process.argv.slice(2)): Promise<void> {
   const code = await main(argv)
-  const drain = (stream: NodeJS.WriteStream) =>
-    new Promise<void>((resolve) => {
-      if (stream.writableLength === 0) resolve()
-      else stream.write('', () => resolve())
-    })
-  await Promise.all([drain(process.stdout), drain(process.stderr)])
-  process.exit(code)
+  process.exitCode = code
+  setTimeout(() => process.exit(code), FORCE_EXIT_AFTER_MS).unref()
 }
 
 function isEntryModule(): boolean {

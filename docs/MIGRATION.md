@@ -14,13 +14,6 @@ npx vib run                # same suite, now on the v2 client
 npx vib manifest record    # recommended: lock the server surface
 ```
 
-Before recording the manifest, make sure your case `globs` exclude it. The lock lands in
-`tests/integration/` by default, which the default glob also matches:
-
-```json
-{ "globs": ["tests/integration/**/*.json", "!tests/integration/**/__manifest__*.json"] }
-```
-
 Review the diff, commit, done. The rest of this page explains what changed and why.
 
 ## What changed in the protocol
@@ -84,8 +77,10 @@ v1 `vib init` wrote a `$schema` path under `node_modules/vibrissa/`, which never
 (the package is scoped). The fix gives you editor completion again.
 
 It does not touch `expect` bodies; goldens do not need rewriting (see below). Files that
-contain comments are left alone (and reported) unless you pass `--force`, which drops the
-comments. `--dry-run` shows the edits without writing; `--manifest` also records the
+contain comments are left alone and reported as needing a manual edit unless you pass
+`--force`, which drops the comments; either way the command exits `1` so the leftover is
+not missed. v1 keys with no effect in v2 (`display`) are reported with what to use
+instead. `--dry-run` shows the edits without writing; `--manifest` also records the
 manifest lock. Record one: the lock is what turns a changed tool description into a
 failing PR instead of a silent change. Flags: [CLI.md](./CLI.md#vib-migrate).
 
@@ -157,11 +152,16 @@ carry no wire code) and `-32002` no longer matches a 2026 server's not-found. Pr
 4. **Config key `display` is ignored.** Use `--pretty` / `--no-pretty`.
 5. **`$id` of both schemas** moved to `https://unpkg.com/@jmoak/vibrissa/schema/...`.
 6. **Manifest drift fails runs** once you have recorded a manifest. That is the point;
-   `--update-manifest` accepts intended changes. Without a lock, `vib run` only warns.
+   `--update-manifest` accepts intended changes. Without a lock, `vib run` warns, or fails
+   with `requireManifest: true`.
 7. **Case files are validated on load.** Unknown keys, `expect` together with
-   `expectError`, malformed matchers, and placeholders that nothing captures fail the case
-   before it runs (v1 ignored some of these).
-8. **Protocol version on 2025 servers.** The v2 client negotiates up to `2025-11-25` on
+   `expectError`, unknown `$` keys in expectations (`$partail`), unknown
+   `expectError.code` names, malformed matchers, and placeholders that nothing captures
+   fail the case before it runs, with a did-you-mean (v1 ignored some of these). Data that
+   really has `$`-keys goes in `{"$literal": ...}`; `vib record` does that for you.
+8. **Config files are validated too.** An unknown key in `vibrissa.json` (or a profile) is
+   an error, exit `2`, with a did-you-mean; all problems are listed at once.
+9. **Protocol version on 2025 servers.** The v2 client negotiates up to `2025-11-25` on
    the legacy era. Servers pinned to older revisions still connect; their negotiated
    version may differ from what v1 reported.
 
@@ -183,6 +183,11 @@ handshake and run both in CI:
 ```bash
 vib run && vib run --profile legacy
 ```
+
+Both runs check the same manifest lock: `protocolVersion` and `listMeta` (the 2026 list
+cache hints) are in the default `manifestIgnore`, so the legacy run does not report drift.
+Exclude cases that need 2026 features (tasks, the raw envelope) from the legacy profile with
+`excludeTags`.
 
 **A tool now pauses with `input_required` and my case fails.** The server moved to MRTR.
 Add a `respond` entry for the method in the error message. `vib record` captures the

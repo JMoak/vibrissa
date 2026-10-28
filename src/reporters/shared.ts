@@ -19,6 +19,42 @@ import type { JsonValue } from '../types.js'
 import { type Colors, createColors } from './ansi.js'
 
 // ---------------------------------------------------------------------------
+// Fields the runner is adding to the contract. Read defensively so reporters work
+// before and after src/events.ts declares them.
+// ---------------------------------------------------------------------------
+
+export interface ShardInfo {
+  index: number
+  total: number
+}
+
+/** `outcome.updateSkipped.reason`: why --update left this failing golden alone. */
+export function updateSkippedReason(outcome: CaseOutcome): string | undefined {
+  const value = (outcome as { updateSkipped?: unknown }).updateSkipped
+  if (typeof value !== 'object' || value === null) return undefined
+  const reason = (value as { reason?: unknown }).reason
+  return typeof reason === 'string' && reason !== '' ? reason : 'skipped by --update'
+}
+
+/** `run:start.shard` as `{ index, total }`, when present and well-formed. */
+export function shardOf(event: object): ShardInfo | undefined {
+  const value = (event as { shard?: unknown }).shard
+  if (typeof value !== 'object' || value === null) return undefined
+  const { index, total } = value as { index?: unknown; total?: unknown }
+  return typeof index === 'number' && typeof total === 'number' ? { index, total } : undefined
+}
+
+/** Remove the runner's "Use --update ..." sentence (annotations must not suggest it). */
+export function stripUpdateHint(text: string): string {
+  return text.replace(/\s*Use --update\b[^\n.]*\.?/g, '').trimEnd()
+}
+
+/** The runner reports "zero cases after filters" as a warning; treat it as an error line. */
+export function isNoCasesMessage(message: string): boolean {
+  return /^No test cases (?:matched|left)\b/.test(message)
+}
+
+// ---------------------------------------------------------------------------
 // Formatting
 // ---------------------------------------------------------------------------
 
@@ -88,7 +124,7 @@ export function neutralizeWorkflowCommand(line: string): string {
   const trimmed = line.trimStart()
   if (!trimmed.startsWith('::')) return line
   const lead = line.length - trimmed.length
-  return `${line.slice(0, lead)}:​${trimmed.slice(1)}`
+  return `${line.slice(0, lead)}:\u200b${trimmed.slice(1)}`
 }
 
 /** Compact one-line JSON rendering of an arbitrary value. */
@@ -234,6 +270,8 @@ export class RunCollector {
   totalCases?: number
   /** run:start.repeat, when the runner announced it. */
   repeat?: number
+  /** run:start.shard, when the runner announced it. */
+  shard?: ShardInfo
   /** run:end.ok: the runner's own verdict, which wins over our derivation. */
   runOk?: boolean
   readonly servers: string[] = []
@@ -253,6 +291,7 @@ export class RunCollector {
         this.startedAt = event.startedAt
         this.totalCases = event.totalCases
         this.repeat = event.repeat
+        this.shard = shardOf(event)
         for (const server of event.servers) this.addServer(server)
         return undefined
       case 'session:start':
@@ -434,6 +473,42 @@ export class RunCollector {
     return records.sort((a, b) => compareStrings(a.caseId, b.caseId))
   }
 
+  /**
+   * Repeat bookkeeping: distinct cases vs. executions. Undefined unless the run repeated
+   * (run:start.repeat > 1, or ids carrying a `#<n>` suffix).
+   */
+  repeatInfo(): { cases: number; runs: number } | undefined {
+    const repeated = (this.repeat ?? 1) > 1 || this.cases.some((c) => c.run !== undefined)
+    if (!repeated) return undefined
+    const runs = this.summary?.total ?? this.cases.length
+    const distinct = new Set(this.cases.map((c) => c.caseId)).size
+    const cases = distinct || (this.repeat ? Math.round(runs / this.repeat) : runs)
+    return { cases, runs }
+  }
+
+  /**
+   * Why the run failed beyond plain case failures: manifest drift, failed checks, case files
+   * that failed to load, or no cases at all. Empty when ok, or when failed cases say it all.
+   */
+  verdictReasons(): string[] {
+    if (!this.ended || this.ok()) return []
+    const reasons: string[] = []
+    const summary = this.resolvedSummary()
+    if (summary.total === 0) reasons.push('no cases matched')
+    const drift = this.manifestDrift().length
+    if (drift > 0) reasons.push(drift === 1 ? 'manifest drift' : `manifest drift in ${drift} locks`)
+    const failedChecks = this.checkCounts().failed
+    if (failedChecks > 0) reasons.push(`${plural(failedChecks, 'check')} failed`)
+    const load = this.cases.filter(
+      (c) => c.outcome.status === 'failed' && c.outcome.errorKind === 'load',
+    ).length
+    if (load > 0) reasons.push(`${plural(load, 'case file')} failed to load`)
+    if (reasons.length === 0 && summary.failed === 0 && this.warnings.length > 0) {
+      reasons.push('see warnings')
+    }
+    return reasons
+  }
+
   /** Cases that both passed and failed across repeats (0 < pass rate < 1). */
   flaky(): PassRateRecord[] {
     return this.passRates().filter((r) => r.rate > 0 && r.rate < 1)
@@ -589,8 +664,10 @@ export function budgetNote(outcome: CaseOutcome): string | undefined {
   return outcome.reason?.includes(text) ? undefined : text
 }
 
+/** `path (step 2): message`. Mismatch.stepIndex is 0-based; shown 1-based like step labels. */
 export function mismatchLine(m: Mismatch): string {
-  return `${m.path || '(root)'}: ${m.message}`
+  const step = m.stepIndex !== undefined ? ` (step ${m.stepIndex + 1})` : ''
+  return `${m.path || '(root)'}${step}: ${m.message}`
 }
 
 /** One-line reason for a non-passing outcome. */
@@ -622,6 +699,8 @@ export function failureText(record: CaseRecord, opts: FailureTextOptions = {}): 
   const lines: string[] = []
   if (outcome.reason) lines.push(...splitLines(outcome.reason))
   else lines.push(outcomeHeadline(outcome))
+  const notUpdated = updateSkippedReason(outcome)
+  if (notUpdated) lines.push(`Not updated: ${notUpdated}`)
   if (record.steps.length > 0) {
     lines.push('', 'Steps:')
     for (const s of record.steps) {
@@ -676,12 +755,4 @@ export function isErrorOutcome(outcome: CaseOutcome): boolean {
   return (
     outcome.errorKind === 'error' || outcome.errorKind === 'timeout' || outcome.errorKind === 'load'
   )
-}
-
-/** Pretty-printed JSON lines for a manifest diff, capped. */
-export function manifestDiffLines(diff: JsonValue | undefined, maxLines = 40): string[] {
-  if (diff === undefined || diff === null) return []
-  const lines = splitLines(JSON.stringify(diff, null, 2))
-  if (lines.length <= maxLines) return lines
-  return [...lines.slice(0, maxLines), `... ${plural(lines.length - maxLines, 'more line')}`]
 }

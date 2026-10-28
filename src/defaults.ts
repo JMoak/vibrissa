@@ -2,8 +2,15 @@ import type { NormalizeConfig, RunOptions } from './types.js'
 
 export const DEFAULT_SERVER_NAME = 'default'
 export const DEFAULT_MANIFEST_PATH = 'tests/integration/__manifest__.json'
-/** Mirrors DEFAULT_MANIFEST_IGNORE in src/manifest.ts (kept here so config has no runtime deps). */
-export const DEFAULT_MANIFEST_IGNORE_PATHS: readonly string[] = ['server.version']
+/**
+ * Default `manifestIgnore` (src/manifest.ts re-exports it as DEFAULT_MANIFEST_IGNORE): the
+ * release version plus what differs only by protocol era, so one lock serves both eras.
+ */
+export const DEFAULT_MANIFEST_IGNORE_PATHS: readonly string[] = [
+  'server.version',
+  'protocolVersion',
+  'listMeta',
+]
 export const DEFAULT_OUT_DIR = 'reports'
 
 export const DEFAULT_NORMALIZE: Required<NormalizeConfig> = {

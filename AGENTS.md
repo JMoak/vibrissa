@@ -150,11 +150,14 @@ The hint says what to do next: a flag, a config key, a command. Never throw a ba
    with `parseCommonFlags` and connect with `startSession` from `src/cli/resolve.ts`.
    Throw `UsageError` for bad input; `src/cli.ts` maps it (and `ConfigError`,
    `SessionStartError`) to exit `2`.
-2. Support `--json`: exactly one JSON document with an `ok` field on stdout, everything
-   human on stderr. Connection flags come for free with `common: true`.
+2. Support `--json`: exactly one JSON document with an `ok` field on stdout (print it
+   with `printJson`, which handles compact vs pretty), everything human on stderr.
+   Errors thrown as `UsageError` / `ConfigError` become `{ ok: false, error: { type, code,
+   message, hint }, next }` automatically. Connection flags come for free with `common: true`.
 3. Add an entry to `COMMANDS` in `src/cli.ts` (`name`, `group`, `summary`, `usage`,
-   `flags`, `examples`, `run`). Set `strictFlags: true` so unknown flags are rejected with
-   a suggestion. That entry is what `vib <command> --help` prints.
+   `flags`, `examples`, `run`). Every flag the command reads must be listed in `flags`
+   (or `extraFlags`): unknown flags are rejected with a did-you-mean on every command.
+   That entry is what `vib <command> --help` prints.
 4. Tests in `tests/cli-commands.test.ts` against the fixture server.
 5. Document it in [docs/CLI.md](./docs/CLI.md): synopsis, flags, exit codes, `--json`
    shape, one example. Add a row to the README command table if it is part of the loop.

@@ -1,8 +1,10 @@
 # Vibrissa v2 — Scope & Direction
 
-Status: scoping draft (2026-10-28). Nothing here is committed to; this is the menu we
-pick from. Supersedes the loose ideas in `FUTURE.md` (tags, transcripts, profiles,
-watch) by folding them into a coherent plan.
+Status: delivered as 2.0.0 (alpha, 2026-10-28), after one dogfood round. This file is the
+original scoping menu, kept for the rationale; what shipped is tracked in
+[IMPLEMENTATION_PLAN.md](./IMPLEMENTATION_PLAN.md) and what is left in
+[FUTURE.md](./FUTURE.md). Where this file and the reference docs (CASES, CLI, CONFIG)
+disagree, the reference docs describe the shipped behavior.
 
 ---
 

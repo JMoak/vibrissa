@@ -24,8 +24,9 @@ vib fuzz <tool> --seed S --runs N --id <case-id>      (reproduce one case)
 | `--budget <ms>` | Also apply the `latency-under-budget` invariant: calls slower than this fail. |
 | `--strict-invalid` | Invalid args must get JSON-RPC `InvalidParams`; a tool error (`isError: true`) fails. Default: a tool error is accepted. |
 | `--id <case-id>` | Run one case. Pass the same `--seed`, a `--runs` at least as large, and the same `--strategy` / `--inject` as the run that reported it. |
-| `--record-failures` | Write each case that failed an error-level invariant to `tests/integration/fuzz/<tool>-<id>.json` (see [Reproducing a failure](#reproducing-a-failure)). |
+| `--record-failures` | Write each case that failed an error-level invariant to `<suite dir>/fuzz/<tool>-<id>.json`, where the suite dir is the directory of the first config glob (see [Reproducing a failure](#reproducing-a-failure)). |
 | `--out-dir <dir>` | Where `--record-failures` writes (relative to the shell cwd). |
+| `--brief` | Only failures and warnings (with `--json`: no per-case list). |
 | `--json` | Machine-readable report. |
 
 Connection flags (`--config`, `--server`, `--profile`, `--protocol`, `--timeout`, ...) work
@@ -43,6 +44,12 @@ How a run goes:
    `tools-list-unchanged` (its tool definitions did not change under fuzzing). Both are
    error level.
 
+The report has one row per invariant with the number of cases it applied to, or `n/a` and
+the reason when it does not apply (`output-matches-output-schema` for a tool with no
+`outputSchema`). Failures are grouped by **root cause** (invariant plus failure summary):
+each group shows one example with its reason, args, and reproduce line, then the other
+case ids.
+
 Exit `0` when no error-level invariant and no run-level check failed; `1` otherwise.
 Warning-level verdicts (`no-echo-of-injection-payload-in-error-message`) are reported but
 never fail the run.
@@ -52,10 +59,11 @@ never fail the run.
 ```
 { ok, tool, server, seed, runs, strategies, generated, durationMs, restarts,
   schemaWarnings: [...],
-  invariants: [{ id, title, level, passed, failed, skipped }],
+  invariants: [{ id, title, level, applicable, passed, failed, skipped, na? }],
   runChecks: [{ id, level, ok, detail? }],
+  rootCauses: [{ invariant, level, summary, cases: [ids], reproduce }],
   failures: [{ id, strategy, expectation, reason, args, outcome, failed: [verdicts], reproduce }],
-  cases: [{ id, strategy, expectation, reason, target?, args, outcome, verdicts }],
+  cases: [{ id, strategy, expectation, reason, target?, args, outcome, verdicts }],   // omitted with --brief
   recorded: [paths], reproduce }
 ```
 
@@ -230,8 +238,8 @@ To get a failing case back:
 2. **From code:** `findCase(schema, { seed: 'echo', count: 100, id: 'invalid-316f7f4b60' })`
    regenerates that case.
 3. **As a regression test:** `--record-failures` writes each case that failed an
-   error-level invariant to `tests/integration/fuzz/<tool>-<id>.json` (under the config
-   directory; `--out-dir` to change). Against a server that did not check argument types
+   error-level invariant to `<suite dir>/fuzz/<tool>-<id>.json` (the suite dir is the
+   directory of the first config glob; `--out-dir` to change). Against a server that did not check argument types
    (an earlier version of the fixture's `echo`), one of them was:
 
    ```json

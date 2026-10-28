@@ -33,7 +33,9 @@ import {
   resolveOutDir,
   serverInfoLabel,
   stepLabel,
+  stripUpdateHint,
   truncate,
+  updateSkippedReason,
 } from './shared.js'
 
 export const SUMMARY_FILE = 'summary.md'
@@ -211,7 +213,10 @@ export class GithubReporter implements Reporter {
     }
     const file = this.annotationPath(record.ref.file)
     if (outcome.status === 'failed') {
-      const lines = [outcome.reason ? outcome.reason : outcomeHeadline(outcome)]
+      // Annotations never suggest --update: the job log and summary carry that context.
+      const lines = [stripUpdateHint(outcome.reason ? outcome.reason : outcomeHeadline(outcome))]
+      const notUpdated = updateSkippedReason(outcome)
+      if (notUpdated) lines.push(`Not updated: ${notUpdated}`)
       const failedStep = record.steps.find((s) => s.status === 'failed')
       if (failedStep && !outcome.reason) {
         lines.push(`Step ${stepLabel(failedStep.step)}: ${failedStep.reason ?? 'failed'}`)
@@ -275,7 +280,12 @@ export class GithubReporter implements Reporter {
     const run = this.run
     const summary = run.resolvedSummary()
     const ok = run.ok() && run.ended
-    const verdict = !run.ended ? '⚠️ Incomplete' : ok ? '✅ Passed' : '❌ Failed'
+    const reasons = run.verdictReasons()
+    const verdict = !run.ended
+      ? '⚠️ Incomplete'
+      : ok
+        ? '✅ Passed'
+        : `❌ Failed${reasons.length > 0 ? ` (${reasons.join(', ')})` : ''}`
     const out: string[] = []
     out.push(`## Vibrissa results: ${verdict}`, '')
     out.push('| Result | Total | Passed | Failed | Skipped | Updated | Duration |')
@@ -301,7 +311,7 @@ export class GithubReporter implements Reporter {
       out.push('| :-- | :-- | :-- | --: | :-- |')
       for (const r of failed) {
         out.push(
-          `| ${mdCell(this.caseTitle(r))} | ${mdCode(displayPath(r.ref.file, this.ctx.rootDir))} | ${mdCell(r.ref.server)} | ${formatDuration(r.outcome.durationMs)} | ${mdCell(truncate(outcomeHeadline(r.outcome), 200))} |`,
+          `| ${mdCell(this.caseTitle(r))} | ${mdCode(displayPath(r.ref.file, this.ctx.rootDir))} | ${mdCell(r.ref.server)} | ${formatDuration(r.outcome.durationMs)} | ${mdCell(truncate(stripUpdateHint(outcomeHeadline(r.outcome)), 200))} |`,
         )
       }
       for (const r of failed.slice(0, this.maxDetails)) {

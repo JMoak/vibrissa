@@ -6,19 +6,29 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import type { JsonValue } from '../types.js'
+import { loadConfig } from '../config.js'
+import { generateArgs, validateAgainstSchema } from '../fuzz/index.js'
+import { resolveServerConfig } from '../paths.js'
+import { McpSession } from '../session/index.js'
+import type { JsonValue, Step, ToolSummary } from '../types.js'
 import {
   UsageError,
   hasFlag,
   printJson,
   resolvePathFromCwd,
   schemaRefFor,
+  slugify,
   splitCommandLine,
+  suiteLayout,
   takeFlag,
   takeOptionalFlag,
+  uniquePath,
 } from './args.js'
-import { colors } from './format.js'
+import { type OpSpec, executeOp } from './call.js'
+import { colors, firstLine, isObject, preview, truncate } from './format.js'
+import { defaultName, observedFromOutcome, stepFromObserved } from './record.js'
 import { parseCommonFlags } from './resolve.js'
+import { type Loosened, loosenedSummary } from './volatile.js'
 
 type ServerEntry = Record<string, JsonValue>
 
@@ -235,6 +245,11 @@ function fromClaudeConfig(dir: string, explicit: string): Detected {
         `${file} lists no usable servers (each needs "command" or "url"). Add one, or run vib init --server "<cmd>".`,
       )
     }
+    const names = Object.keys(servers)
+    if (names.length === 1 && names[0] !== 'default') {
+      notes.push(`Named the server "default" (it is "${names[0]}" in ${path.basename(file)}).`)
+      return { servers: { default: servers[names[0]] }, source: file, notes }
+    }
     return { servers, source: file, notes }
   }
   throw new UsageError(
@@ -283,7 +298,7 @@ export function ciWorkflow(dir: string): string {
     lines.push('      - uses: actions/setup-go@v5', '        with:', '          go-version: stable')
   if (node) lines.push('      - run: npm ci', '      - run: npm run build --if-present')
   lines.push(
-    `      - run: ${vib} run --profile ci --check --reporter ${CI_REPORTERS.join(',')}`,
+    `      - run: ${vib} run --profile ci`,
     '      - uses: actions/upload-artifact@v4',
     '        if: failure()',
     '        with:',
@@ -294,13 +309,21 @@ export function ciWorkflow(dir: string): string {
   return lines.join('\n')
 }
 
-function sampleCase(file: string, dir: string): Record<string, JsonValue> {
+/** Placeholder sample when no real call could be recorded (skipped until edited). */
+function skippedSample(
+  file: string,
+  dir: string,
+  tool: string,
+  args: Record<string, JsonValue>,
+  why: string,
+): Record<string, JsonValue> {
   return {
     $schema: schemaRefFor(file, dir, 'case.schema.json'),
-    name: 'echo basic',
-    tool: 'echo',
-    args: { text: 'hello', uppercase: true },
-    expect: { content: [{ type: 'text', text: 'HELLO' }] },
+    name: `${tool} sample`,
+    skip: `edit args for your server (${why}), then delete this line`,
+    tool,
+    args,
+    expect: { $partial: true },
   }
 }
 
@@ -329,11 +352,250 @@ function sampleFlow(file: string, dir: string): Record<string, JsonValue> {
   }
 }
 
+/** Pick the tool `init` may call: read-only first, never one annotated destructive. */
+export function pickSampleTool(tools: ToolSummary[]): ToolSummary | undefined {
+  const ann = (t: ToolSummary) => (isObject(t.annotations) ? t.annotations : {})
+  return (
+    tools.find((t) => ann(t).readOnlyHint === true) ??
+    tools.find((t) => ann(t).destructiveHint !== true)
+  )
+}
+
+/** A readable value for one property: example/default/const/enum, else a plain per-type value. */
+function friendlyValue(schema: JsonValue): JsonValue {
+  if (!isObject(schema)) return 'hello'
+  if (Array.isArray(schema.examples) && schema.examples.length > 0) return schema.examples[0]
+  if (schema.default !== undefined) return schema.default
+  if (schema.const !== undefined) return schema.const
+  if (Array.isArray(schema.enum) && schema.enum.length > 0) return schema.enum[0]
+  const type = Array.isArray(schema.type) ? schema.type.find((t) => t !== 'null') : schema.type
+  switch (type) {
+    case 'integer':
+    case 'number':
+      return typeof schema.minimum === 'number' ? schema.minimum : 1
+    case 'boolean':
+      return true
+    case 'array':
+      return []
+    case 'object':
+      return {}
+    default:
+      return 'hello'
+  }
+}
+
+/**
+ * Minimal schema-valid args for the sample call: readable values for the required
+ * properties when they validate, else the fuzz generator's "only required properties" case.
+ */
+export function minimalArgs(inputSchema: JsonValue): Record<string, JsonValue> {
+  const schema = isObject(inputSchema) ? inputSchema : {}
+  const props = isObject(schema.properties) ? schema.properties : {}
+  const required = Array.isArray(schema.required) ? schema.required.map(String) : []
+  const friendly: Record<string, JsonValue> = {}
+  for (const name of required) friendly[name] = friendlyValue(props[name] ?? {})
+  if (validateAgainstSchema(inputSchema, friendly).ok) return friendly
+  const cases = generateArgs(inputSchema, {
+    seed: 'vib-init',
+    count: 12,
+    strategies: ['valid'],
+    selfCheck: true,
+  })
+  return (cases.find((c) => /only required/i.test(c.reason)) ?? cases[0])?.args ?? {}
+}
+
+interface SampleResult {
+  path: string
+  status: WriteStatus
+  /** A real call was recorded (otherwise a skipped placeholder was written). */
+  recorded: boolean
+  tool?: string
+  reason?: string
+}
+
+/**
+ * Start the configured server, call one tool with minimal generated args and record it as
+ * the sample case. Falls back to a skipped placeholder when the server does not start, lists
+ * no callable tool, or the call fails.
+ */
+async function writeSample(
+  dir: string,
+  configPath: string,
+  force: boolean,
+  allowCall: boolean,
+  notes: string[],
+): Promise<SampleResult> {
+  const { options } = loadConfig(dir, { configPath })
+  const { dir: casesDir, suffix } = suiteLayout(options.globs)
+  const placeholder = (
+    tool: string,
+    args: Record<string, JsonValue>,
+    why: string,
+  ): SampleResult => {
+    const file = path.join(dir, casesDir, `sample${suffix}`)
+    const status = writeFile(
+      file,
+      `${JSON.stringify(skippedSample(file, dir, tool, args, why), null, 2)}\n`,
+      force,
+    )
+    return { path: file, status, recorded: false, tool, reason: why }
+  }
+  if (!allowCall) return placeholder('echo', { text: 'hello' }, '--no-call')
+  let session: McpSession | undefined
+  try {
+    try {
+      session = await McpSession.start(resolveServerConfig(options), {
+        timeoutMs: Math.min(options.timeoutMs, 10_000),
+        stderr: 'capture',
+      })
+    } catch (err) {
+      const why = err instanceof Error ? firstLine(err.message) : String(err)
+      return placeholder(
+        'echo',
+        { text: 'hello' },
+        `the server did not start: ${truncate(why, 120)}`,
+      )
+    }
+    const tools = await session.listTools()
+    const tool = pickSampleTool(tools)
+    if (!tool) {
+      return placeholder(
+        tools[0]?.name ?? 'echo',
+        {},
+        tools.length
+          ? 'every tool is annotated destructive, so none was called'
+          : 'the server lists no tools',
+      )
+    }
+    const args = minimalArgs(tool.inputSchema)
+    const op: OpSpec = { kind: 'tool', target: tool.name, args }
+    const outcome = await executeOp(session, op, { timeoutMs: options.timeoutMs })
+    const observed = observedFromOutcome(outcome)
+    if (observed.kind !== 'result') {
+      const why =
+        observed.kind === 'error'
+          ? `calling ${tool.name} with generated args failed: ${truncate(firstLine(observed.error?.message ?? ''), 100)}`
+          : `${tool.name} asked for input`
+      return placeholder(tool.name, args, why)
+    }
+    const second = await executeOp(session, op, { timeoutMs: options.timeoutMs })
+    const loosened: Loosened[] = []
+    const step = stepFromObserved(
+      op,
+      observed,
+      {
+        normalize: options.normalize,
+        loosened,
+        ...(second.kind === 'result' ? { second: second.result } : {}),
+      },
+      notes,
+    ) as Step
+    const name = defaultName(op)
+    const file = uniquePath(
+      path.join(dir, casesDir, `${slugify(name) || 'sample'}${suffix}`),
+      suffix,
+    )
+    const testCase = { $schema: schemaRefFor(file, dir, 'case.schema.json'), name, ...step }
+    const status = writeFile(file, `${JSON.stringify(testCase, null, 2)}\n`, force)
+    notes.push(
+      `Recorded a real sample by calling ${tool.name} ${preview(args, 80)} (pass --no-call to skip calling tools).`,
+    )
+    if (loosened.length > 0) notes.push(`${loosenedSummary(loosened)} in the sample.`)
+    return { path: file, status, recorded: true, tool: tool.name }
+  } catch (err) {
+    const why = err instanceof Error ? firstLine(err.message) : String(err)
+    return placeholder('echo', { text: 'hello' }, truncate(why, 120))
+  } finally {
+    await session?.close()
+  }
+}
+
+const GITIGNORE_LINE = 'reports/'
+
+/** Add `reports/` to .gitignore (created when missing). */
+function ensureGitignore(dir: string): 'created' | 'updated' | 'present' {
+  const file = path.join(dir, '.gitignore')
+  if (!fs.existsSync(file)) {
+    fs.writeFileSync(file, `${GITIGNORE_LINE}\n`, 'utf8')
+    return 'created'
+  }
+  const text = fs.readFileSync(file, 'utf8')
+  if (/^\/?reports\/?\s*$/m.test(text)) return 'present'
+  fs.writeFileSync(
+    file,
+    `${text}${text === '' || text.endsWith('\n') ? '' : '\n'}${GITIGNORE_LINE}\n`,
+    'utf8',
+  )
+  return 'updated'
+}
+
+/** The scaffolded `ci` profile: the workflow runs `vib run --profile ci` and nothing else. */
+export const CI_PROFILE = { reporters: [...CI_REPORTERS], check: true, requireManifest: true }
+
+/** Ensure an existing vibrissa.json has the `ci` profile the workflow uses. */
+function ensureCiProfile(configPath: string, notes: string[]): 'added' | 'present' | 'skipped' {
+  const text = fs.readFileSync(configPath, 'utf8')
+  let config: Record<string, JsonValue>
+  try {
+    config = JSON.parse(text) as Record<string, JsonValue>
+  } catch {
+    notes.push(
+      `Add a "ci" profile to ${configPath} by hand: ${JSON.stringify({ ci: CI_PROFILE })}.`,
+    )
+    return 'skipped'
+  }
+  const profiles = isObject(config.profiles) ? config.profiles : {}
+  if (profiles.ci !== undefined) return 'present'
+  config.profiles = { ...profiles, ci: CI_PROFILE }
+  fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8')
+  return 'added'
+}
+
+function describeEntry(entry: ServerEntry): string {
+  if (typeof entry.url === 'string') return entry.url
+  return [entry.cmd, ...(Array.isArray(entry.args) ? entry.args : [])].join(' ')
+}
+
 export async function initCommand(argv: string[]): Promise<number> {
   const flags = parseCommonFlags(argv)
   const dir = resolvePathFromCwd(takeFlag(argv, '--dir') ?? '.')
   const force = hasFlag(argv, '--force')
+  const ci = hasFlag(argv, '--ci')
   const claude = takeOptionalFlag(argv, '--from-claude-config')
+  const configPath = path.join(dir, 'vibrissa.json')
+  const files: Array<{ path: string; status: string; what: string }> = []
+  const notes: string[] = []
+  const c = colors()
+
+  // `vib init --ci` in a configured project: only the workflow (+ the ci profile it uses).
+  if (ci && fs.existsSync(configPath) && !force) {
+    const workflow = path.join(dir, '.github', 'workflows', 'vibrissa.yml')
+    files.push({ what: 'ci', path: workflow, status: writeFile(workflow, ciWorkflow(dir), false) })
+    const profile = ensureCiProfile(configPath, notes)
+    files.push({
+      what: 'profile',
+      path: configPath,
+      status: profile === 'added' ? 'updated' : profile,
+    })
+    if (flags.json) {
+      printJson({
+        ok: true,
+        dir,
+        files,
+        ...(notes.length ? { notes } : {}),
+        next: ['vib run --profile ci'],
+      })
+      return 0
+    }
+    console.log(
+      `${c.green(c.bold('vib init --ci'))} ${c.dim('· vibrissa.json exists; writing CI only')}`,
+    )
+    for (const f of files) console.log(`  ${f.what.padEnd(7)} ${f.status.padEnd(7)} ${f.path}`)
+    for (const note of notes) console.log(c.yellow(`note: ${note}`))
+    if (files[0].status === 'skipped')
+      console.log(c.yellow('The workflow already exists; re-run with --force to replace it.'))
+    return 0
+  }
 
   let detected: Detected
   if (claude !== undefined) detected = fromClaudeConfig(dir, claude)
@@ -346,6 +608,7 @@ export async function initCommand(argv: string[]): Promise<number> {
       detected = { servers: { default: { cmd, args, cwd: '.' } }, source: '--server', notes: [] }
     }
   } else detected = detectServer(dir)
+  notes.push(...detected.notes)
   if (flags.protocol !== undefined) {
     for (const entry of Object.values(detected.servers))
       entry.protocol = flags.protocol as JsonValue
@@ -353,10 +616,6 @@ export async function initCommand(argv: string[]): Promise<number> {
   const names = Object.keys(detected.servers)
   const defaultServer = names.includes('default') ? 'default' : names[0]
 
-  const configPath = path.join(dir, 'vibrissa.json')
-  const casesDir = path.join(dir, 'tests', 'integration')
-  const samplePath = path.join(casesDir, 'echo.basic.json')
-  const flowPath = path.join(casesDir, 'flow.sample.json')
   const config = {
     $schema: schemaRefFor(configPath, dir, 'vibrissa.schema.json'),
     servers: detected.servers,
@@ -365,35 +624,27 @@ export async function initCommand(argv: string[]): Promise<number> {
     manifest: 'tests/integration/__manifest__.json',
     timeoutMs: flags.timeoutMs ?? 15000,
     reporters: ['console'],
-    profiles: {
-      ci: { reporters: [...CI_REPORTERS], check: true },
-    },
+    profiles: { ci: CI_PROFILE },
   }
-
-  const files: Array<{ path: string; status: WriteStatus; what: string }> = []
   files.push({
     what: 'config',
     path: configPath,
     status: writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, force),
   })
-  files.push({
-    what: 'sample',
-    path: samplePath,
-    status: writeFile(
-      samplePath,
-      `${JSON.stringify(sampleCase(samplePath, dir), null, 2)}\n`,
-      force,
-    ),
-  })
+  const sample = await writeSample(dir, configPath, force, !hasFlag(argv, '--no-call'), notes)
+  files.push({ what: 'sample', path: sample.path, status: sample.status })
+  const flowPath = path.join(path.dirname(sample.path), 'flow.sample.json')
   files.push({
     what: 'flow',
     path: flowPath,
     status: writeFile(flowPath, `${JSON.stringify(sampleFlow(flowPath, dir), null, 2)}\n`, force),
   })
-  if (hasFlag(argv, '--ci')) {
+  if (ci) {
     const workflow = path.join(dir, '.github', 'workflows', 'vibrissa.yml')
     files.push({ what: 'ci', path: workflow, status: writeFile(workflow, ciWorkflow(dir), force) })
   }
+  const gitignore = ensureGitignore(dir)
+  files.push({ what: 'gitignore', path: path.join(dir, '.gitignore'), status: gitignore })
 
   const pkgPath = path.join(dir, 'package.json')
   let pkgNote = 'no package.json (skipped the npm script)'
@@ -423,22 +674,36 @@ export async function initCommand(argv: string[]): Promise<number> {
       defaultServer,
       source: detected.source,
       files,
+      sample: {
+        recorded: sample.recorded,
+        ...(sample.tool ? { tool: sample.tool } : {}),
+        ...(sample.reason ? { reason: sample.reason } : {}),
+      },
       package: pkgNote,
-      notes: detected.notes,
+      ...(notes.length ? { notes } : {}),
       next,
     })
     return 0
   }
-  const c = colors()
-  console.log(
-    c.green(c.bold('vib init')) + c.dim(` · servers from ${detected.source}: ${names.join(', ')}`),
-  )
+  const where =
+    detected.source === 'default'
+      ? 'a guess (no entry point found)'
+      : detected.source === '--server'
+        ? 'from --server'
+        : `detected from ${detected.source}`
+  const servers =
+    names.length === 1
+      ? `server "${names[0]}" = ${describeEntry(detected.servers[names[0]])} (${where})`
+      : `${names.length} servers from ${detected.source}: ${names.join(', ')} (default "${defaultServer}")`
+  console.log(`${c.green(c.bold('vib init'))} · ${servers}`)
   for (const f of files)
     console.log(
-      `  ${f.what.padEnd(7)} ${(f.status === 'wrote' ? c.green : c.yellow)(f.status.padEnd(7))} ${f.path}`,
+      `  ${f.what.padEnd(9)} ${(f.status === 'skipped' ? c.yellow : c.green)(f.status.padEnd(7))} ${f.path}`,
     )
-  console.log(`  package ${pkgNote}`)
-  for (const note of detected.notes) console.log(c.yellow(`note: ${note}`))
+  console.log(`  ${'package'.padEnd(9)} ${pkgNote}`)
+  if (!sample.recorded && sample.reason)
+    console.log(c.yellow(`note: wrote a skipped sample: ${sample.reason}.`))
+  for (const note of notes) console.log(c.yellow(`note: ${note}`))
   if (skipped)
     console.log(
       c.yellow(

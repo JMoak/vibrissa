@@ -136,12 +136,13 @@ describe('Runner: fixture suite', () => {
     ).toHaveLength(5)
   })
 
-  it('passes on the legacy era (protocol: legacy via the "legacy" profile)', async () => {
+  it('passes on the legacy era against the same lock (protocol: legacy via the profile)', async () => {
     const { result, events } = await run(fixtureOptions('legacy'))
     expect(result.exitCode).toBe(0)
     expect(ofType(events, 'session:start')[0]).toMatchObject({ era: 'legacy' })
+    // protocolVersion / listMeta differ by era and are ignored by default: one lock, both eras.
     expect(ofType(events, 'manifest:ok')[0].path).toBe(
-      path.join(FIXTURE, 'tests/__manifest__.legacy.json'),
+      path.join(FIXTURE, 'tests/__manifest__.json'),
     )
     expect(ofType(events, 'case:end').some((e) => e.case.id.includes('task.'))).toBe(false)
     expect(outcomeOf(events, 'mrtr.confirm-accept').status).toBe('passed')
@@ -223,7 +224,8 @@ describe('Runner: concurrency, repeat and flake', () => {
       'cases/task.json#2',
     ])
     expect(flaky.result.summary.passRates).toEqual({ 'cases/task.json': 0.5 })
-    expect(flaky.result.summary).toMatchObject({ passed: 1, failed: 1 })
+    // Status counts are per execution and sum to runs; the flaky verdict is in ok / passRates.
+    expect(flaky.result.summary).toMatchObject({ total: 2, runs: 2, passed: 1, failed: 1 })
     expect(flaky.result.ok).toBe(true)
     expect(flaky.events.at(-1)).toMatchObject({ type: 'run:end', ok: true })
 
@@ -233,7 +235,27 @@ describe('Runner: concurrency, repeat and flake', () => {
     expect(strictFloor.result.exitCode).toBe(1)
     const hard = await run(suite({ 'task.json': firstTaskCase() }, { repeat: 2 }))
     expect(hard.result.exitCode).toBe(1)
+    expect(hard.result.summary).toMatchObject({ total: 2, runs: 2, passed: 1, failed: 1 })
     expect(hard.events.at(-1)).toMatchObject({ type: 'run:end', ok: false })
+    const once = await run(suite({ 'task.json': firstTaskCase() }))
+    expect(once.result.summary.runs).toBeUndefined()
+  })
+
+  it('--repeat with 2 cases (and under --shard) counts every execution', async () => {
+    const cases = { 'a.json': echoCase('a'), 'b.json': echoCase('b') }
+    const outDir = mkTmpDir('vibrissa-repeat-')
+    const both = await run(suite(cases, { repeat: 2, reporters: ['json'], outDir }))
+    expect(both.result.summary).toMatchObject({ total: 4, runs: 4, passed: 4, failed: 0 })
+    const report = JSON.parse(fs.readFileSync(path.join(outDir, 'results.json'), 'utf8'))
+    expect(report.summary).toMatchObject({ total: 2, runs: 4, passed: 4 })
+
+    const shard = await run(suite(cases, { repeat: 2, shard: { index: 1, total: 2 } }))
+    expect(shard.result.summary).toMatchObject({ total: 2, runs: 2, passed: 2 })
+    expect(ofType(shard.events, 'case:end').map((e) => e.case.id)).toEqual([
+      'cases/a.json#1',
+      'cases/a.json#2',
+    ])
+    expect(shard.out.join('\n')).toMatch(/1 case, 2 runs|2 runs/)
   })
 
   it('failFast stops after the first failing case', async () => {
@@ -359,8 +381,9 @@ describe('Runner: flows, MRTR, tasks and errors', () => {
     )
     const unanswered = outcomeOf(events, 'unanswered')
     expect(unanswered.errorKind).toBe('error')
-    expect(unanswered.reason).toMatch(
-      /^Unanswered input request at tool "confirm": the server asked for elicitation\/create "Proceed with ship\?"\. Add "respond": \{ "elicitation\/create": \{ "action": "accept"/,
+    // A paste-ready answer derived from the requestedSchema (confirm: boolean → true).
+    expect(unanswered.reason).toBe(
+      'Unanswered input request at tool "confirm": the server asked for elicitation/create "Proceed with ship?". Add to the step: "respond": {"elicitation/create":{"action":"accept","content":{"confirm":true}}} (edit the sample values), or assert only the request with "expectInputRequired".',
     )
     expect(unanswered.actual).toMatchObject({ confirm: { method: 'elicitation/create' } })
     expect(outcomeOf(events, 'by-key').status).toBe('passed')
@@ -403,6 +426,82 @@ describe('Runner: flows, MRTR, tasks and errors', () => {
     expect(outcomeOf(events, 'timeout').errorKind).toBe('timeout')
   })
 
+  it('says when an expected error became a success that violates outputSchema', async () => {
+    const { events } = await run(
+      suite({
+        'typed.json': {
+          tool: 'typed',
+          args: { a: 1, b: 2, broken: true },
+          expectError: { code: 'InvalidParams' },
+        },
+      }),
+    )
+    expect(outcomeOf(events, 'typed.json').reason).toBe(
+      'Expected an error at tool "typed", but the call succeeded and violated its outputSchema at structuredContent.sum: must be number, got string. Remove "expectError", or fix the server.',
+    )
+  })
+
+  it('lists available tools with a did-you-mean when a tool does not exist', async () => {
+    const { events } = await run(suite({ 'typo.json': { tool: 'ehco', args: { text: 'x' } } }))
+    expect(outcomeOf(events, 'typo.json').reason).toMatch(
+      /Tool "ehco" is not on the server; did you mean "echo"\? Available: confirm, echo, fail, sleep, slow, typed\.$/,
+    )
+  })
+
+  it('makes mismatches patchable: field, RFC 6901 pointer into the case file, stepIndex', async () => {
+    const { events } = await run(
+      suite({
+        'single.json': { ...echoCase('a', 'b') },
+        'flow.json': {
+          steps: [
+            { tool: 'echo', args: { text: 'x' } },
+            {
+              tool: 'echo',
+              args: { text: 'y' },
+              expect: { content: [{ type: 'text', text: 'z' }] },
+            },
+          ],
+        },
+        'code.json': { tool: 'echo', args: {}, expectError: { code: 'MethodNotFound' } },
+      }),
+    )
+    expect(outcomeOf(events, 'single.json').mismatches?.[0]).toMatchObject({
+      path: 'content[0].text',
+      field: 'expect',
+      pointer: '/expect/content/0/text',
+    })
+    expect(outcomeOf(events, 'single.json').mismatches?.[0].stepIndex).toBeUndefined()
+    expect(outcomeOf(events, 'flow.json').mismatches?.[0]).toMatchObject({
+      field: 'expect',
+      pointer: '/steps/1/expect/content/0/text',
+      stepIndex: 1,
+    })
+    expect(outcomeOf(events, 'code.json').mismatches?.[0]).toMatchObject({
+      field: 'expectError',
+      pointer: '/expectError/code',
+    })
+  })
+
+  it('skips (not fails) a teardown step whose capture never happened', async () => {
+    const { events } = await run(
+      suite({
+        'flow.json': {
+          steps: [
+            { tool: 'echo', args: {}, capture: { sid: 'content[0].text' } },
+            { tool: 'echo', args: { text: 'never' } },
+          ],
+          teardown: [{ name: 'close', tool: 'echo', args: { text: 'close {{sid}}' } }],
+        },
+      }),
+    )
+    const outcome = outcomeOf(events, 'flow.json')
+    expect(outcome.reason).toMatch(/^Step 1 \(tool echo\): Call failed/)
+    expect(outcome.steps?.map((s) => s.status)).toEqual(['failed', 'skipped', 'skipped'])
+    expect(outcome.steps?.[2].reason).toBe(
+      'skipped: {{sid}} was never captured (an earlier step failed or was skipped)',
+    )
+  })
+
   it('expectTask fails clearly when the server answers directly (legacy era)', async () => {
     const options = suite({ 'task.json': firstTaskCase() })
     options.servers = { echo: { cmd: 'node', args: [SERVER], cwd: FIXTURE, protocol: 'legacy' } }
@@ -429,6 +528,20 @@ describe('Runner: flows, MRTR, tasks and errors', () => {
     expect(result.exitCode).toBe(0)
   })
 
+  it('skips $ref fragments under the case globs with one info line', async () => {
+    const options = suite({
+      'a.json': { tool: 'echo', args: { text: 'a' }, expect: { $ref: './shared/a-result.json' } },
+    })
+    writeJson(path.join(options.rootDir, 'cases/shared/a-result.json'), {
+      content: [{ type: 'text', text: 'a' }],
+    })
+    const { result, out } = await run(options)
+    expect(result).toMatchObject({ exitCode: 0, summary: { total: 1, passed: 1 } })
+    expect(out).toContainEqual(
+      'info: skipped 1 $ref fragment file(s) matched by the case globs (not cases): cases/shared/a-result.json',
+    )
+  })
+
   it('treats unloadable cases as failures and keeps running', async () => {
     const options = suite({ 'b-pass.json': echoCase('ok') })
     fs.writeFileSync(path.join(options.rootDir, 'cases/a-broken.json'), '{ not valid json', 'utf8')
@@ -451,16 +564,36 @@ describe('Runner: flows, MRTR, tasks and errors', () => {
   })
 
   it('exits 1 on an empty selection unless allowEmpty', async () => {
+    // Said once: an error when it fails the run, a warning only under allowEmpty.
     const empty = await run(suite({}, { globs: ['nothing/**/*.json'] }))
     expect(empty.result.exitCode).toBe(1)
-    expect(empty.result.warnings[0]).toMatch(
-      /^No test cases matched globs: nothing\/\*\*\/\*\.json/,
-    )
-    expect(empty.out.some((line) => line.includes('No test cases matched globs'))).toBe(true)
+    expect(empty.result.warnings).toEqual([])
+    expect(empty.out.filter((line) => line.includes('No test cases matched globs'))).toEqual([
+      expect.stringMatching(/^error: No test cases matched globs: nothing\/\*\*\/\*\.json/),
+    ])
     const allowed = await run(suite({}, { globs: ['nothing/**/*.json'], allowEmpty: true }))
     expect(allowed.result.exitCode).toBe(0)
+    expect(allowed.result.warnings[0]).toMatch(/^No test cases matched globs/)
+    expect(allowed.out.some((line) => line.startsWith('error:'))).toBe(false)
     const filtered = await run(suite({ 'a.json': echoCase('a') }, { tags: ['none'] }))
-    expect(filtered.result.warnings[0]).toMatch(/^No test cases left after filters \(--tag none\)/)
+    expect(filtered.result.exitCode).toBe(1)
+    expect(filtered.result.warnings).toEqual([])
+    expect(filtered.out).toContainEqual(
+      expect.stringMatching(/^error: No test cases left after filters \(--tag none\)/),
+    )
+  })
+
+  it('announces shards on run:start', async () => {
+    const { events } = await run(
+      suite(
+        { 'a.json': echoCase('a'), 'b.json': echoCase('b') },
+        { shard: { index: 2, total: 2 } },
+      ),
+    )
+    expect(ofType(events, 'run:start')[0]).toMatchObject({
+      totalCases: 1,
+      shard: { index: 2, total: 2 },
+    })
   })
 })
 
@@ -489,6 +622,18 @@ describe('Runner: --update', () => {
       path.join(options.rootDir, 'cases/commented.json'),
       '// keep me\n{ "tool": "echo", "args": { "text": "c" }, "expect": { "content": [] } }\n',
     )
+    // Without --update, the hint appears only where --update would actually rewrite.
+    const before = await run(options)
+    expect(outcomeOf(before.events, 'golden').reason).toMatch(
+      /Use --update to accept the new output\.$/,
+    )
+    expect(outcomeOf(before.events, 'matcher').reason).toMatch(
+      /--update would not rewrite it: content\[0\]\.text \(\$regex\) is a matcher that no longer matches; fix the matcher by hand, or rerun with --update=all/,
+    )
+    expect(outcomeOf(before.events, 'commented').reason).toMatch(
+      /--update would not rewrite it: the file has comments/,
+    )
+
     const updated = await run({ ...options, update: true })
     expect(outcomeOf(updated.events, 'golden').status).toBe('updated')
     expect(outcomeOf(updated.events, 'golden')).toMatchObject({
@@ -499,10 +644,18 @@ describe('Runner: --update', () => {
       'passed',
       'updated',
     ])
-    expect(outcomeOf(updated.events, 'matcher').status).toBe('failed')
-    expect(outcomeOf(updated.events, 'commented').status).toBe('failed')
+    const matcherOutcome = outcomeOf(updated.events, 'matcher')
+    expect(matcherOutcome.status).toBe('failed')
+    expect(matcherOutcome.reason).not.toMatch(/Use --update/)
+    expect(matcherOutcome.updateSkipped?.reason).toMatch(
+      /content\[0\]\.text \(\$regex\) is a matcher/,
+    )
+    expect(outcomeOf(updated.events, 'commented')).toMatchObject({
+      status: 'failed',
+      updateSkipped: { reason: expect.stringMatching(/the file has comments/) },
+    })
     expect(updated.result.warnings.join('\n')).toMatch(
-      /Not updating cases\/matcher\.json: "expect" contains matchers/,
+      /Not updating cases\/matcher\.json: content\[0\]\.text \(\$regex\) is a matcher/,
     )
     expect(updated.result.warnings.join('\n')).toMatch(
       /Not updating cases\/commented\.json: the file has comments/,
@@ -520,10 +673,57 @@ describe('Runner: --update', () => {
 
     const all = await run({ ...options, update: true, updateAll: true, grep: 'matcher' })
     expect(outcomeOf(all.events, 'matcher').status).toBe('updated')
+    expect(all.result.warnings).toContainEqual(
+      'Updated cases/matcher.json: replaced content[0].text ($regex) with literal values (--update=all).',
+    )
     const matcher = JSON.parse(
       fs.readFileSync(path.join(options.rootDir, 'cases/matcher.json'), 'utf8'),
     )
     expect(matcher.expect).toEqual({ content: [{ type: 'text', text: 'hello' }] })
+  })
+
+  it('patches only mismatched leaves, keeps passing matchers and the file format', async () => {
+    const dir = mkTmpDir()
+    const file = path.join(dir, 'cases/typed.json')
+    const original = {
+      tool: 'typed',
+      args: { a: 2, b: 2 },
+      expect: {
+        content: { $type: 'array' },
+        structuredContent: { sum: 5 },
+      },
+    }
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.writeFileSync(file, `${JSON.stringify(original, null, 4)}\n`)
+    const options: RunnerOptions = {
+      ...suite({}),
+      rootDir: dir,
+      globs: ['cases/*.json'],
+    }
+    const { events } = await run({ ...options, update: true })
+    expect(outcomeOf(events, 'typed.json').status).toBe('updated')
+    const text = fs.readFileSync(file, 'utf8')
+    expect(text).toBe(
+      `${JSON.stringify({ ...original, expect: { content: { $type: 'array' }, structuredContent: { sum: 4 } } }, null, 4)}\n`,
+    )
+  })
+
+  it('reports why expectError is not rewritten (updateSkipped, never silent)', async () => {
+    const { events, result } = await run(
+      suite(
+        { 'err.json': { tool: 'echo', args: {}, expectError: { code: 'MethodNotFound' } } },
+        { update: true },
+      ),
+    )
+    const outcome = outcomeOf(events, 'err.json')
+    expect(outcome.status).toBe('failed')
+    expect(outcome.updateSkipped).toEqual({
+      reason:
+        '--update never rewrites "expectError"; edit it by hand (expected vs got is in the mismatch list)',
+    })
+    expect(result.warnings.join('\n')).toMatch(
+      /Not updating cases\/err\.json: --update never rewrites "expectError"/,
+    )
   })
 })
 
@@ -579,10 +779,35 @@ describe('Runner: manifest lock and traces', () => {
 
     const drift = await run({ ...options, manifest: lock })
     expect(drift.result.exitCode).toBe(1)
-    expect(ofType(drift.events, 'manifest:diff')[0]).toMatchObject({
-      path: lock,
-      server: 'echo',
-      summary: '1 tool changed (echo: description)',
+    const event = ofType(drift.events, 'manifest:diff')[0]
+    expect(event).toMatchObject({ path: lock, server: 'echo' })
+    // One-liner, then the rendered sub-path diff (word-level for prose), then the tip.
+    expect(event.summary.split('\n')).toEqual([
+      '1 tool changed (echo: description)',
+      '  tools:',
+      '    ~ echo',
+      '        description: Echo text [-back (old description)-]{+back, optionally uppercased+}',
+      'Review the change, then accept it with --update-manifest (or "vib manifest record").',
+    ])
+    expect(event.diff).toEqual({
+      identical: false,
+      breaking: false,
+      tools: {
+        changed: [
+          {
+            key: 'echo',
+            breaking: false,
+            fields: [
+              {
+                path: 'description',
+                before: 'Echo text back (old description)',
+                after: 'Echo text back, optionally uppercased',
+                breaking: false,
+              },
+            ],
+          },
+        ],
+      },
     })
     expect(drift.result.manifests[0].status).toBe('diff')
 
@@ -599,6 +824,30 @@ describe('Runner: manifest lock and traces', () => {
     expect(missing.result.exitCode).toBe(0)
     expect(missing.result.warnings[0]).toMatch(
       /^No manifest lock at nope\/__manifest__\.json\. Run "vib manifest record"/,
+    )
+  })
+
+  it('requireManifest: a missing lock fails the run with a record hint (incl. --server)', async () => {
+    const options = suite(
+      { 'a.json': echoCase('a'), 'b.json': { ...echoCase('b'), server: 'other' } },
+      { lockManifest: true, requireManifest: true, manifest: 'locks/__manifest__.json' },
+    )
+    options.servers = { ...options.servers, other: { cmd: 'node', args: [SERVER], cwd: FIXTURE } }
+    const { result, events } = await run(options)
+    expect(result.exitCode).toBe(1)
+    const diffs = ofType(events, 'manifest:diff')
+    expect(diffs.map((d) => d.summary)).toEqual([
+      'No manifest lock at locks/__manifest__.json, and requireManifest is on. Record it with "vib manifest record" (or vib run --update-manifest), review it, and commit it.',
+      'No manifest lock at locks/__manifest__.other.json for server "other", and requireManifest is on. Record it with "vib manifest record --server other" (or vib run --update-manifest), review it, and commit it.',
+    ])
+    expect(diffs[0].diff).toMatchObject({ error: 'missing', errorKind: 'load' })
+    expect(result.manifests.map((m) => m.status)).toEqual(['missing-required', 'missing-required'])
+
+    // Without requireManifest it is a warning, and the hint names the server.
+    const relaxed = await run({ ...options, requireManifest: false })
+    expect(relaxed.result.exitCode).toBe(0)
+    expect(relaxed.result.warnings).toContainEqual(
+      expect.stringMatching(/for server "other"\. Run "vib manifest record --server other"/),
     )
   })
 
@@ -624,6 +873,7 @@ describe('Runner: manifest lock and traces', () => {
         "import readline from 'node:readline'",
         'const rl = readline.createInterface({ input: process.stdin })',
         "const send = (m) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...m }) + '\\n')",
+        "process.stdout.write('debug: noisy server booting\\n')",
         "rl.on('line', (line) => {",
         '  let m',
         '  try { m = JSON.parse(line) } catch { return }',
@@ -663,6 +913,12 @@ describe('Runner: manifest lock and traces', () => {
       .split('\n')
     expect(trace).toHaveLength(2)
     expect(JSON.parse(trace[0])).toMatchObject({ dir: 'out', message: { method: 'tools/call' } })
+    // Non-JSON-RPC stdout is reported even without --check.
+    expect(result.warnings).toContainEqual(
+      expect.stringMatching(
+        /^Server "noisy" wrote 1 non-JSON-RPC line\(s\) to stdout \(e\.g\. "debug: noisy server booting"\)/,
+      ),
+    )
   })
 })
 
@@ -687,7 +943,10 @@ describe('runner helpers', () => {
   it('maps case ids to safe trace names', () => {
     expect(traceName('cases/echo.basic.json')).toBe('cases/echo.basic')
     expect(traceName('cases/echo.basic.json#3')).toBe('cases/echo.basic.run3')
-    expect(traceName('C:/tmp/x/a.json')).toBe('tmp/x/a')
+    // Outside rootDir: a flat, collision-free name instead of mirroring the absolute path.
+    expect(traceName('C:/tmp/x/a.json')).toMatch(/^_external\/a-[0-9a-f]{8}$/)
+    expect(traceName('/home/me/suite/a.json#2')).toMatch(/^_external\/a-[0-9a-f]{8}\.run2$/)
+    expect(traceName('C:/tmp/x/a.json')).not.toBe(traceName('C:/tmp/y/a.json'))
     expect(traceName('../up/a.json')).toBe('_up/up/a')
   })
 

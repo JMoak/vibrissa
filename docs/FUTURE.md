@@ -24,3 +24,5 @@ Settled by 2.0 (from V2_SCOPE §8):
 - A changed description fails the manifest check by default; `--update-manifest` accepts.
 - Flows run on one session per worker and are never split across workers or shards.
 - HTTP auth is static headers only.
+- One manifest lock serves both protocol eras: `protocolVersion` and `listMeta` are ignored by
+  default (`vib manifest diff --strict` compares them).

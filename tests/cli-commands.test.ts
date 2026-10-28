@@ -1,9 +1,11 @@
+import { type ChildProcess, spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { Readable } from 'node:stream'
-import { afterEach, describe, expect, it, vi } from 'vitest'
-import { main } from '../src/cli'
+import { buildSync } from 'esbuild'
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
+import { describeError, endSentence, main } from '../src/cli'
 import { callCommand } from '../src/cli/call'
 import { checkCommand } from '../src/cli/check'
 import { discoverCommand } from '../src/cli/discover'
@@ -19,6 +21,7 @@ import { recordCommand } from '../src/cli/record'
 import { resourcesCommand } from '../src/cli/resources'
 import { toolsCommand } from '../src/cli/tools'
 import { loadConfig } from '../src/config'
+import { SessionStartError } from '../src/session/index'
 import type { TestCase } from '../src/types'
 
 const FIXTURE_DIR = path.join(process.cwd(), 'tests/fixtures/echo-server')
@@ -36,6 +39,7 @@ afterEach(() => {
 
 /** Silence console output; `json()` parses the last console.log call as JSON. */
 function capture() {
+  for (const spy of spies.splice(0)) spy.mockRestore()
   const log = vi.spyOn(console, 'log').mockImplementation(() => {})
   const err = vi.spyOn(console, 'error').mockImplementation(() => {})
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
@@ -101,7 +105,7 @@ describe('explore commands', () => {
     const io = capture()
     expect(await toolsCommand(['--config', fixtureConfig])).toBe(0)
     const text = io.out()
-    expect(text).toMatch(/6 tools \(ttl 60000ms, public\)/)
+    expect(text).toMatch(/6 tools {2}cache: 60000 ms \(public\)/)
     expect(text).toMatch(
       /echo\s+Echo\s+Echo text back, optionally uppercased\s+text\*: string, uppercase: boolean\s+read-only/,
     )
@@ -261,8 +265,10 @@ describe('probe commands', () => {
       kind: 'protocol',
       code: -32602,
       codeName: 'InvalidParams',
+      type: 'ToolError',
     })
-    expect(payload.hint).toMatch(/inputSchema/)
+    expect(payload.error.hint).toMatch(/inputSchema/)
+    expect(payload.hint).toBeUndefined()
   })
 
   it('read reads a resource and expands templates', async () => {
@@ -777,8 +783,11 @@ describe('fuzz', () => {
     const payload = io.json()
     expect(payload.cases).toHaveLength(1)
     expect(payload.cases[0].id).toBe(failure.id)
-    expect(payload.recorded).toEqual([path.join(tmp, `typed-${failure.id}.json`)])
-    const written = readJson(payload.recorded[0])
+    expect(payload.recorded).toEqual([
+      { path: path.join(tmp, `typed-${failure.id}.json`), inSuite: false },
+    ])
+    expect(payload.notes[0]).toMatch(/outside the suite globs/)
+    const written = readJson(payload.recorded[0].path)
     expect(written).toMatchObject({
       name: `fuzz ${failure.id}: ${failure.reason}`,
       tags: ['fuzz'],
@@ -930,7 +939,10 @@ describe('init', () => {
     capture()
     const code = await initCommand(['--dir', tmp, '--server', 'node server/index.js'])
     expect(code).toBe(0)
-    expect(fs.existsSync(path.join(tmp, 'tests/integration/echo.basic.json'))).toBe(true)
+    // The server does not exist here, so the sample is a skipped placeholder.
+    const sample = readJson(path.join(tmp, 'tests/integration/sample.json'))
+    expect(sample.skip).toMatch(/^edit args for your server \(the server did not start/)
+    expect(fs.readFileSync(path.join(tmp, '.gitignore'), 'utf8')).toBe('reports/\n')
     const flow = readJson(path.join(tmp, 'tests/integration/flow.sample.json'))
     expect(flow.steps?.[0].capture).toEqual({ noteId: 'structuredContent.id' })
     expect(flow.skip).toMatch(/sample/)
@@ -943,7 +955,11 @@ describe('init', () => {
       default: { cmd: 'node', args: ['server/index.js'], cwd: '.' },
     })
     expect(config.defaultServer).toBe('default')
-    expect(config.profiles.ci).toMatchObject({ check: true })
+    expect(config.profiles.ci).toEqual({
+      reporters: ['console', 'github', 'junit', 'json'],
+      check: true,
+      requireManifest: true,
+    })
     expect(fs.existsSync(path.join(tmp, '.github'))).toBe(false)
   })
 
@@ -951,12 +967,10 @@ describe('init', () => {
     const tmp = mkTmpDir()
     fs.writeFileSync(path.join(tmp, 'package.json'), '{"name":"demo"}')
     const io = capture()
-    expect(await initCommand(['--dir', tmp, '--ci', '--json'])).toBe(0)
+    expect(await initCommand(['--dir', tmp, '--ci', '--no-call', '--json'])).toBe(0)
     const workflow = fs.readFileSync(path.join(tmp, '.github/workflows/vibrissa.yml'), 'utf8')
     expect(workflow).toContain('- run: npm ci')
-    expect(workflow).toContain(
-      '- run: npx vib run --profile ci --check --reporter console,github,junit,json',
-    )
+    expect(workflow).toContain('- run: npx vib run --profile ci\n')
     expect(workflow).toMatch(/upload-artifact@v4\n {8}if: failure\(\)\n[\s\S]*path: reports\//)
     expect(io.json().files.map((f: { what: string }) => f.what)).toContain('ci')
     // The ci profile resolves to the same reporters the workflow passes.
@@ -978,7 +992,9 @@ describe('init', () => {
       }),
     )
     let io = capture()
-    expect(await initCommand(['--dir', claude, '--from-claude-config', '--json'])).toBe(0)
+    expect(
+      await initCommand(['--dir', claude, '--from-claude-config', '--no-call', '--json']),
+    ).toBe(0)
     let payload = io.json()
     expect(payload.servers.notes).toEqual({
       cmd: 'uv',
@@ -991,7 +1007,7 @@ describe('init', () => {
     const py = mkTmpDir()
     fs.writeFileSync(path.join(py, 'pyproject.toml'), '[project]\nname = "weather-mcp"\n')
     io = capture()
-    expect(await initCommand(['--dir', py, '--json'])).toBe(0)
+    expect(await initCommand(['--dir', py, '--no-call', '--json'])).toBe(0)
     payload = io.json()
     expect(payload.servers.default).toEqual({
       cmd: 'python',
@@ -1002,7 +1018,7 @@ describe('init', () => {
     const go = mkTmpDir()
     fs.writeFileSync(path.join(go, 'go.mod'), 'module example.com/srv\n')
     io = capture()
-    expect(await initCommand(['--dir', go, '--json'])).toBe(0)
+    expect(await initCommand(['--dir', go, '--no-call', '--json'])).toBe(0)
     expect(io.json().servers.default).toEqual({ cmd: 'go', args: ['run', '.'], cwd: '.' })
   })
 })
@@ -1052,7 +1068,591 @@ describe('explain, conformance, dispatcher', () => {
         '--json',
       ]),
     ).toBe(2)
-    expect(io.json()).toMatchObject({ ok: false, error: { type: 'SessionStartError' } })
-    expect(io.err()).toMatch(/error: Server/)
+    expect(io.json()).toMatchObject({
+      ok: false,
+      error: { type: 'SessionStartError', code: expect.any(String), hint: expect.any(String) },
+    })
+    // Under --json the error is only the JSON envelope (nothing duplicated on stderr).
+    expect(io.err()).toBe('')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Dogfood round
+// ---------------------------------------------------------------------------
+
+const ECHO_SERVER = path.join(FIXTURE_DIR, 'server/index.js')
+const VOLATILE_SERVER = path.join(process.cwd(), 'tests/fixtures/cli/volatile-server.js')
+
+describe('HTTP servers: the CLI exits cleanly (Windows UV_HANDLE_CLOSING regression)', () => {
+  let server: ChildProcess
+  let url = ''
+  let bundle = ''
+
+  beforeAll(async () => {
+    const dir = path.join(process.cwd(), 'node_modules', '.cache', 'vibrissa-cli-test')
+    fs.mkdirSync(dir, { recursive: true })
+    bundle = path.join(dir, 'cli.mjs')
+    buildSync({
+      entryPoints: [path.join(process.cwd(), 'src/cli.ts')],
+      outfile: bundle,
+      bundle: true,
+      platform: 'node',
+      format: 'esm',
+      packages: 'external',
+      logLevel: 'error',
+    })
+    server = spawn(process.execPath, [ECHO_SERVER, '--http', '0'], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+    })
+    url = await new Promise<string>((resolve, reject) => {
+      let text = ''
+      const timer = setTimeout(
+        () => reject(new Error(`no URL from the HTTP fixture: ${text}`)),
+        10_000,
+      )
+      server.stderr?.on('data', (chunk: Buffer) => {
+        text += chunk.toString()
+        const match = /listening (http:\/\/\S+)/.exec(text)
+        if (match) {
+          clearTimeout(timer)
+          resolve(match[1])
+        }
+      })
+    })
+  }, 30_000)
+
+  afterAll(() => {
+    server?.kill()
+  })
+
+  function vib(...args: string[]) {
+    return spawnSync(process.execPath, [bundle, ...args, '--server', url, '--json'], {
+      encoding: 'utf8',
+      timeout: 20_000,
+    })
+  }
+
+  it.each([['discover'], ['tools'], ['call', 'echo', '--arg', 'text=over http']])(
+    'vib %s exits 0 with an ok envelope',
+    (...args) => {
+      const run = vib(...args)
+      expect(run.stderr).not.toMatch(/Assertion failed|UV_HANDLE_CLOSING/)
+      expect(run.status).toBe(0)
+      expect(JSON.parse(run.stdout).ok).toBe(true)
+    },
+  )
+
+  it('discover over HTTP reports the transport', () => {
+    const payload = JSON.parse(vib('discover').stdout)
+    expect(payload.transport).toEqual({ type: 'http', url })
+    expect(payload.raw).toBeUndefined()
+  })
+})
+
+describe('target validation and output checks', () => {
+  it('tools <name> shows one tool; unknown names exit 2 with did-you-mean', async () => {
+    let io = capture()
+    expect(await main(['tools', 'echo', '--config', fixtureConfig, '--json'])).toBe(0)
+    expect(io.json()).toMatchObject({ ok: true, tool: { name: 'echo', title: 'Echo' } })
+    io = capture()
+    expect(await main(['tools', 'echo', '--config', fixtureConfig])).toBe(0)
+    expect(io.out()).toMatch(/Description\n {2}Echo text back/)
+    expect(io.out()).toContain('inputSchema')
+    io = capture()
+    expect(await main(['tools', 'ecoh', '--config', fixtureConfig, '--json'])).toBe(2)
+    expect(io.json().error).toMatchObject({ code: 'unknown-tool' })
+    expect(io.json().error.hint).toMatch(/Did you mean "echo"\?/)
+  })
+
+  it('call / read / get-prompt check names against the server lists', async () => {
+    let io = capture()
+    expect(await main(['call', 'ecoh', '--config', fixtureConfig, '--json'])).toBe(2)
+    expect(io.json().error.code).toBe('unknown-tool')
+    io = capture()
+    // --expect-missing sends it anyway: the server answers an error (exit 1).
+    expect(
+      await main(['call', 'ecoh', '--expect-missing', '--config', fixtureConfig, '--json']),
+    ).toBe(1)
+    expect(io.json()).toMatchObject({ ok: false, kind: 'error', error: { code: -32602 } })
+    io = capture()
+    expect(await main(['read', 'fixture://readm', '--config', fixtureConfig, '--json'])).toBe(2)
+    expect(io.json().error).toMatchObject({ code: 'unknown-resource' })
+    expect(io.json().error.hint).toMatch(/fixture:\/\/readme/)
+    io = capture()
+    // A URI matching a listed template is fine.
+    expect(await main(['read', 'fixture://users/9', '--config', fixtureConfig, '--json'])).toBe(0)
+    io = capture()
+    expect(await main(['get-prompt', 'grete', '--config', fixtureConfig, '--json'])).toBe(2)
+    expect(io.json().error).toMatchObject({ code: 'unknown-prompt' })
+    expect(io.json().error.hint).toMatch(/Did you mean "greet"\?/)
+  })
+
+  it('call warns about outputSchema violations by default; --validate fails', async () => {
+    const io = capture()
+    const argv = [
+      'typed',
+      '--config',
+      fixtureConfig,
+      '--args',
+      '{"a":1,"b":2,"broken":true}',
+      '--json',
+    ]
+    expect(await callCommand(argv)).toBe(0)
+    const payload = io.json()
+    expect(payload.ok).toBe(true)
+    expect(payload.validation).toMatchObject({ checked: true, ok: false })
+    expect(payload.warnings[0]).toMatch(
+      /structuredContent does not match the outputSchema of "typed"/,
+    )
+  })
+
+  it('discover --json carries transport and next, not raw; input_required has no inputRequests', async () => {
+    let io = capture()
+    expect(await discoverCommand(['--config', fixtureConfig, '--json'])).toBe(0)
+    const info = io.json()
+    expect(info.ok).toBe(true)
+    expect(info.raw).toBeUndefined()
+    expect(info.transport).toEqual({ type: 'stdio', command: 'node server/index.js' })
+    expect(info.next).toContain('vib tools')
+    io = capture()
+    await callCommand(['confirm', '--config', fixtureConfig, '--json'])
+    expect(io.json().requests).toBeDefined()
+    expect(io.json().inputRequests).toBeUndefined()
+  })
+})
+
+describe('record: suite paths, names, volatility, output checks', () => {
+  function project(): { dir: string; config: string } {
+    const dir = mkTmpDir()
+    const config = path.join(dir, 'vibrissa.json')
+    fs.writeFileSync(
+      config,
+      JSON.stringify({
+        servers: {
+          default: { cmd: 'node', args: [VOLATILE_SERVER], protocol: 'legacy' },
+          other: { cmd: 'node', args: [VOLATILE_SERVER], protocol: 'legacy' },
+          echo: { cmd: 'node', args: [ECHO_SERVER] },
+        },
+        defaultServer: 'default',
+        globs: ['cases/**/*.json'],
+        timeoutMs: 5000,
+      }),
+    )
+    return { dir, config }
+  }
+
+  it('loosens timestamps, UUIDs and epoch-ms, writes into the suite dir, and the golden replays', async () => {
+    const { dir, config } = project()
+    let io = capture()
+    expect(await recordCommand(['stamp', '--config', config, '--json'])).toBe(0)
+    const payload = io.json()
+    expect(payload).toMatchObject({
+      ok: true,
+      inSuite: true,
+      path: path.join(dir, 'cases', 'stamp.json'),
+    })
+    expect(payload.loosened.map((l: { path: string }) => l.path)).toEqual([
+      'content[0].text',
+      'structuredContent.at',
+      'structuredContent.id',
+      'structuredContent.ms',
+    ])
+    expect(payload.notes[0]).toMatch(
+      /^loosened 4 volatile fields .* docs\/CASES\.md#generated-ids-and-timestamps/,
+    )
+    const written = readJson(payload.path)
+    expect(written.name).toBe('stamp')
+    expect(written.expect).toMatchObject({
+      structuredContent: {
+        at: { $schema: { type: 'string', format: 'date-time' } },
+        id: { $schema: { type: 'string', format: 'uuid' } },
+        ms: { $type: 'integer' },
+        stable: 'same',
+      },
+    })
+    // A second recording gets a fresh file name.
+    io = capture()
+    expect(await recordCommand(['stamp', '--config', config, '--json'])).toBe(0)
+    expect(io.json().path).toBe(path.join(dir, 'cases', 'stamp-2.json'))
+    // The loosened golden passes on a fresh run.
+    io = capture()
+    expect(await main(['run', '--config', config, '--cases', payload.path, '--allow-empty'])).toBe(
+      0,
+    )
+  }, 60_000)
+
+  it('the stable check loosens values that change between calls; --no-stable-check / --exact keep them', async () => {
+    const { config, dir } = project()
+    let io = capture()
+    expect(await recordCommand(['counter', '--config', config, '--json'])).toBe(0)
+    expect(io.json().loosened).toEqual([
+      { path: 'content[0].text', reason: 'changed', was: 'call #1' },
+    ])
+    expect(readJson(io.json().path).expect).toEqual({
+      content: [{ type: 'text', text: { $regex: '^call #[\\s\\S]*$' } }],
+    })
+    io = capture()
+    expect(
+      await recordCommand([
+        'counter',
+        '--no-stable-check',
+        '--config',
+        config,
+        '--out',
+        path.join(dir, 'cases', 'c1.json'),
+        '--json',
+      ]),
+    ).toBe(0)
+    expect(readJson(io.json().path).expect).toEqual({
+      content: [{ type: 'text', text: 'call #1' }],
+    })
+    io = capture()
+    expect(
+      await recordCommand([
+        'stamp',
+        '--exact',
+        '--config',
+        config,
+        '--out',
+        path.join(dir, 'cases', 'exact.json'),
+        '--json',
+      ]),
+    ).toBe(0)
+    expect(io.json().loosened).toBeUndefined()
+    expect(
+      typeof (readJson(io.json().path).expect as { structuredContent: { at: unknown } })
+        .structuredContent.at,
+    ).toBe('string')
+    io = capture()
+    expect(await recordCommand(['wipe', '--config', config, '--json'])).toBe(0)
+    expect(io.json().notes.join(' ')).toMatch(
+      /Stable check skipped: "wipe" is annotated destructive/,
+    )
+  }, 60_000)
+
+  it('refuses goldens that violate the outputSchema unless --allow-invalid-output', async () => {
+    const { config, dir } = project()
+    let io = capture()
+    expect(await recordCommand(['broken', '--config', config, '--json'])).toBe(1)
+    expect(io.json()).toMatchObject({ ok: false, error: { code: 'invalid-output' } })
+    expect(fs.existsSync(path.join(dir, 'cases'))).toBe(false)
+    io = capture()
+    expect(
+      await recordCommand(['broken', '--allow-invalid-output', '--config', config, '--json']),
+    ).toBe(0)
+    expect(io.json().notes.join(' ')).toMatch(/violates the outputSchema/)
+  }, 30_000)
+
+  it('writes "server" for a non-default --server; default names summarize args; outside-suite --out warns', async () => {
+    const { config, dir } = project()
+    let io = capture()
+    expect(
+      await recordCommand(['counter', '--server', 'other', '--config', config, '--json']),
+    ).toBe(0)
+    expect(readJson(io.json().path).server).toBe('other')
+    io = capture()
+    expect(
+      await recordCommand([
+        'echo',
+        '--arg',
+        'text=hello',
+        '--server',
+        'echo',
+        '--config',
+        config,
+        '--json',
+      ]),
+    ).toBe(0)
+    expect(io.json().path).toBe(path.join(dir, 'cases', 'echo-text-hello.json'))
+    expect(readJson(io.json().path)).toMatchObject({ name: 'echo text=hello', server: 'echo' })
+    io = capture()
+    expect(
+      await recordCommand([
+        'counter',
+        '--config',
+        config,
+        '--out',
+        path.join(dir, 'elsewhere', 'x.json'),
+        '--json',
+      ]),
+    ).toBe(0)
+    expect(io.json().inSuite).toBe(false)
+    expect(io.json().notes.join(' ')).toMatch(/outside the suite globs \(cases\/\*\*\/\*\.json\)/)
+    io = capture()
+    expect(await main(['record', 'countr', '--config', config, '--json'])).toBe(2)
+    expect(io.json().error.hint).toMatch(/Did you mean "counter"\?/)
+  }, 60_000)
+})
+
+describe('explain on the real loader', () => {
+  function suite(): { dir: string; config: string } {
+    const dir = mkTmpDir()
+    const config = path.join(dir, 'vibrissa.json')
+    fs.writeFileSync(
+      config,
+      JSON.stringify({
+        servers: { default: { cmd: 'node', args: ['x.js'] } },
+        globs: ['cases/**/*.json'],
+      }),
+    )
+    const cases = path.join(dir, 'cases')
+    // Fragments live outside the case globs (vib run would load them as cases otherwise).
+    fs.mkdirSync(path.join(dir, 'shared'), { recursive: true })
+    fs.mkdirSync(cases, { recursive: true })
+    fs.writeFileSync(
+      path.join(dir, 'shared', 'text.json'),
+      JSON.stringify({ type: 'text', text: { $regex: '^hi' } }),
+    )
+    fs.writeFileSync(
+      path.join(cases, 'good.json'),
+      JSON.stringify({
+        name: 'good one',
+        tool: 'echo',
+        args: { text: 'hi' },
+        expect: { content: [{ $ref: '../shared/text.json' }] },
+      }),
+    )
+    fs.writeFileSync(
+      path.join(cases, 'weak.json'),
+      JSON.stringify({ name: 'weak one', tool: 'echo', expectError: {} }),
+    )
+    fs.writeFileSync(
+      path.join(cases, 'bad.json'),
+      JSON.stringify({ name: 'bad one', tool: 'echo', expct: {} }),
+    )
+    return { dir, config }
+  }
+
+  it('no arguments explains the whole suite with load errors and weak-assertion flags', async () => {
+    const { config } = suite()
+    const io = capture()
+    expect(await explainCommand(['--config', config, '--json'])).toBe(1)
+    const payload = io.json()
+    expect(payload.ok).toBe(false)
+    expect(payload.summary).toEqual({ cases: 3, errors: 1, flagged: 1 })
+    const byName = new Map(payload.cases.map((c: { name: string }) => [c.name, c]))
+    expect((byName.get('bad one') as { errors: string[] }).errors[0]).toMatch(/expct/)
+    expect((byName.get('weak one') as { flags: Array<{ code: string }> }).flags).toEqual([
+      { code: 'any-error', at: 'case', message: expect.stringMatching(/accepts any error/) },
+    ])
+    const good = byName.get('good one') as {
+      refs: unknown
+      flags?: unknown
+      errors?: unknown
+      steps: Array<{ expect: Array<{ path: string; text: string }> }>
+    }
+    expect(good.refs).toEqual([{ path: 'expect.content[0]', ref: '../shared/text.json' }])
+    expect(good.flags).toBeUndefined() // empty arrays are dropped from --json
+    expect(good.errors).toBeUndefined()
+    expect(good.steps[0].expect.map((a) => `${a.path} ${a.text}`)).toContain(
+      'content[0].text matches /^hi/',
+    )
+  })
+
+  it('accepts a case name; --brief shows only problems', async () => {
+    const { config } = suite()
+    let io = capture()
+    expect(await explainCommand(['good one', '--config', config])).toBe(0)
+    expect(io.out()).toMatch(/good one/)
+    expect(io.out()).toMatch(/is inlined from the fragment \.\.\/shared\/text\.json/)
+    io = capture()
+    expect(await explainCommand(['--config', config, '--brief'])).toBe(1)
+    expect(io.out()).not.toMatch(/good one/)
+    expect(io.out()).toMatch(/weak one[\s\S]*expectError \{\} accepts any error/)
+    io = capture()
+    await expect(explainCommand(['god one', '--config', config])).rejects.toThrow(
+      /Did you mean "good one"\?/,
+    )
+  })
+})
+
+describe('fuzz, migrate, init, spawn hints', () => {
+  it('fuzz output: expectation counts, n/a rows, no inject row, grouped root causes, --brief', async () => {
+    let io = capture()
+    await fuzzCommand(['echo', '--runs', '20', '--config', fixtureConfig])
+    let text = io.out()
+    expect(text).toMatch(/by expectation: \d+ should succeed · \d+ should be rejected/)
+    expect(text).toMatch(
+      /output-matches-output-schema\s+error\s+n\/a\s+-\s+-\s+\(the tool declares no outputSchema\)/,
+    )
+    expect(text).not.toMatch(/no-echo-of-injection-payload/)
+    io = capture()
+    await fuzzCommand(['typed', '--runs', '30', '--seed', '7', '--config', fixtureConfig])
+    text = io.out()
+    expect(text).toMatch(/Failures \(1 root cause, \d+ cases\)/)
+    expect(text).toMatch(/✗ output-matches-output-schema · \d+ cases/)
+    expect(text).toMatch(/also: /)
+    io = capture()
+    await fuzzCommand([
+      'typed',
+      '--runs',
+      '30',
+      '--seed',
+      '7',
+      '--brief',
+      '--config',
+      fixtureConfig,
+    ])
+    expect(io.out()).not.toMatch(/INVARIANT/)
+    expect(io.out()).toMatch(/Failures \(1 root cause/)
+  }, 60_000)
+
+  it('migrate reports leftover v1 keys and exits 1 on unreadable case files', async () => {
+    const dir = mkTmpDir()
+    const config = path.join(dir, 'vibrissa.json')
+    fs.writeFileSync(
+      config,
+      JSON.stringify({
+        server: { cmd: 'node', args: ['x.js'] },
+        display: 'pretty',
+        globs: ['cases/*.json'],
+      }),
+    )
+    fs.mkdirSync(path.join(dir, 'cases'))
+    fs.writeFileSync(path.join(dir, 'cases', 'broken.json'), '{ "tool": ')
+    const io = capture()
+    expect(await migrateCommand(['--config', config, '--json'])).toBe(1)
+    const payload = io.json()
+    expect(payload.ok).toBe(false)
+    expect(payload.skipped).toHaveLength(1)
+    expect(payload.notes.join(' ')).toMatch(/display has no effect in v2/)
+  })
+
+  it('init records a real sample from a server that starts; --ci later writes only the workflow', async () => {
+    const dir = mkTmpDir()
+    let io = capture()
+    expect(await initCommand(['--dir', dir, '--server', `node "${ECHO_SERVER}"`, '--json'])).toBe(0)
+    const payload = io.json()
+    expect(payload.sample).toEqual({ recorded: true, tool: 'echo' })
+    const sample = readJson(path.join(dir, 'tests/integration/echo-text-hello.json'))
+    expect(sample).toMatchObject({
+      name: 'echo text=hello',
+      tool: 'echo',
+      args: { text: 'hello' },
+      expect: { content: [{ type: 'text', text: 'hello' }] },
+    })
+    expect(sample.skip).toBeUndefined()
+    fs.rmSync(path.join(dir, 'tests/integration/flow.sample.json'))
+    io = capture()
+    expect(await initCommand(['--dir', dir, '--ci', '--json'])).toBe(0)
+    expect(
+      io.json().files.map((f: { what: string; status: string }) => `${f.what}:${f.status}`),
+    ).toEqual(['ci:wrote', 'profile:present'])
+    expect(fs.existsSync(path.join(dir, 'tests/integration/flow.sample.json'))).toBe(false)
+  }, 30_000)
+
+  it('without vibrissa.json, connection errors say how to configure the server', async () => {
+    const dir = mkTmpDir()
+    const cwd = process.cwd()
+    const io = capture()
+    process.chdir(dir)
+    const sentence =
+      /No vibrissa\.json found; using the default server command `node dist\/index\.js`/g
+    try {
+      // Human output: the note once (on stderr), not repeated in the error.
+      expect(await main(['tools'])).toBe(2)
+      const human = `${io.warn()}\n${io.err()}`
+      expect(human.match(sentence)).toHaveLength(1)
+      expect(io.warn()).toMatch(/note: No vibrissa\.json found/)
+      expect(io.err()).toMatch(/error: Server/)
+      // --json: no note, so the hint lives once in the error envelope.
+      const json = capture()
+      expect(await main(['tools', '--json'])).toBe(2)
+      expect(json.warn()).toBe('')
+      expect(JSON.stringify(json.json()).match(sentence)).toHaveLength(1)
+    } finally {
+      process.chdir(cwd)
+    }
+  }, 30_000)
+})
+
+describe('docs-agent verification fixes', () => {
+  it('explain skips $ref fragments under the globs like vib run, with an info line', async () => {
+    const dir = mkTmpDir()
+    const config = path.join(dir, 'vibrissa.json')
+    fs.writeFileSync(
+      config,
+      JSON.stringify({
+        servers: { default: { cmd: 'node', args: ['x.js'] } },
+        globs: ['cases/**/*.json'],
+      }),
+    )
+    fs.mkdirSync(path.join(dir, 'cases', 'shared'), { recursive: true })
+    fs.writeFileSync(
+      path.join(dir, 'cases', 'shared', 'text.json'),
+      JSON.stringify({ type: 'text', text: 'hi' }),
+    )
+    fs.writeFileSync(
+      path.join(dir, 'cases', 'echo.json'),
+      JSON.stringify({
+        name: 'echo hi',
+        tool: 'echo',
+        args: { text: 'hi' },
+        expect: { content: [{ $ref: './shared/text.json' }] },
+      }),
+    )
+    let io = capture()
+    expect(await explainCommand(['--config', config, '--json'])).toBe(0)
+    const payload = io.json()
+    expect(payload).toMatchObject({
+      ok: true,
+      summary: { cases: 1, errors: 0 },
+      fragments: ['cases/shared/text.json'],
+    })
+    expect(payload.cases.map((c: { name: string }) => c.name)).toEqual(['echo hi'])
+    io = capture()
+    expect(await explainCommand(['--config', config])).toBe(0)
+    expect(io.out()).toMatch(
+      /info: skipped 1 \$ref fragment file \(not cases\): cases\/shared\/text\.json/,
+    )
+    expect(io.out()).not.toMatch(/load error/)
+  })
+
+  it('check --list --json carries ok: true', async () => {
+    const io = capture()
+    expect(await checkCommand(['--list', '--json'])).toBe(0)
+    expect(io.json()).toMatchObject({ ok: true, checks: expect.any(Array) })
+  })
+
+  it('server start errors end as a sentence and point at the server command, not --help', async () => {
+    let io = capture()
+    expect(
+      await main(['fuzz', 'echo', '--config', fixtureConfig, '--server', 'nonexistent-cmd-xyz']),
+    ).toBe(2)
+    const human = io.err()
+    expect(human).not.toMatch(/--help for usage/)
+    expect(human).not.toMatch(/,\s+Fix the server command/)
+    expect(human).toMatch(
+      /[.!?)"'`] Fix the server command in vibrissa\.json, or try one with --server/,
+    )
+    io = capture()
+    expect(
+      await main([
+        'fuzz',
+        'echo',
+        '--config',
+        fixtureConfig,
+        '--server',
+        'nonexistent-cmd-xyz',
+        '--json',
+      ]),
+    ).toBe(2)
+    const { error } = io.json()
+    expect(error.message).toMatch(/[.!?)"'`]$/)
+    expect(error.hint).toMatch(/^Fix the server command/)
+  }, 30_000)
+
+  it('endSentence closes trailing commas and colons', () => {
+    expect(endSentence("'x' is not recognized as an internal or external command,")).toBe(
+      "'x' is not recognized as an internal or external command.",
+    )
+    expect(endSentence('failed: ')).toBe('failed.')
+    expect(endSentence('Done.')).toBe('Done.')
+    expect(
+      describeError(new SessionStartError('Server failed: boom,', 'spawn'), 'fuzz').human,
+    ).toBe(
+      'Server failed: boom. Fix the server command in vibrissa.json, or try one with --server "<cmd> <args>" (vib init --server "<cmd>" writes it to the config).',
+    )
   })
 })

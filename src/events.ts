@@ -30,6 +30,12 @@ export interface Mismatch {
   message: string
   expected?: unknown
   actual?: unknown
+  /** Which case field the mismatch belongs to (machine-patchable failures). */
+  field?: 'expect' | 'expectError' | 'expectInputRequired' | 'expectTask' | 'structuredContent'
+  /** RFC 6901 JSON Pointer into the case file (e.g. "/steps/1/expect/content/0/text"). */
+  pointer?: string
+  /** 0-based step index for flows. */
+  stepIndex?: number
 }
 
 export type CaseStatus = 'passed' | 'failed' | 'skipped' | 'updated'
@@ -52,6 +58,8 @@ export interface CaseOutcome {
   steps?: Array<{ step: StepRef; durationMs: number; status: CaseStatus; reason?: string }>
   /** Budget breach, if `budgetMs` was set and exceeded. */
   budget?: { budgetMs: number; actualMs: number }
+  /** Under --update: why this failing case was not rewritten (matchers, expectError, ...). */
+  updateSkipped?: { reason: string }
 }
 
 export interface CheckOutcome {
@@ -63,18 +71,31 @@ export interface CheckOutcome {
 }
 
 export interface RunSummary {
+  /** Case executions (cases × repeat). Distinct cases = distinct case ids (without `#<n>`). */
   total: number
+  /** Status counts are per execution and sum to `total`; per-case verdicts: passRates / ok. */
   passed: number
   failed: number
   skipped: number
   updated: number
   durationMs: number
+  /** Present when --repeat > 1: executions (= total; cases × repeat, fewer on failFast). */
+  runs?: number
   /** Present when --repeat > 1: pass rate per case id. */
   passRates?: Record<string, number>
 }
 
 export type RunEvent =
-  | { type: 'run:start'; totalCases: number; servers: string[]; startedAt: number; repeat?: number }
+  | {
+      type: 'run:start'
+      /** Case runs announced (cases × repeat). */
+      totalCases: number
+      servers: string[]
+      startedAt: number
+      repeat?: number
+      /** Present when the run is one shard of a suite (`--shard i/n`). */
+      shard?: { index: number; total: number }
+    }
   | {
       type: 'session:start'
       server: string

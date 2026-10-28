@@ -45,23 +45,23 @@ directory**, not the shell's.
 {
   "$schema": "./node_modules/@jmoak/vibrissa/schema/vibrissa.schema.json",
   "servers": {
-    "local": { "cmd": "node", "args": ["dist/index.js"], "protocol": "auto" },
+    "default": { "cmd": "node", "args": ["dist/index.js"], "protocol": "auto" },
     "staging": {
       "url": "https://mcp.example.com/mcp",
       "headers": { "Authorization": "Bearer ${MCP_TOKEN}" }
     }
   },
-  "defaultServer": "local",
-  "globs": ["tests/integration/**/*.json", "!tests/integration/**/__manifest__*.json"],
+  "defaultServer": "default",
+  "globs": ["tests/integration/**/*.json"],
   "manifest": "tests/integration/__manifest__.json",
   "normalize": { "stripMeta": ["io.modelcontextprotocol/*"], "dropKeys": ["resultType"] },
   "timeoutMs": 15000,
   "budgetMs": 2000,
   "reporters": ["console", "junit"],
   "profiles": {
-    "ci": { "reporters": ["console", "junit", "github", "json"], "check": true },
+    "ci": { "reporters": ["console", "github", "junit", "json"], "check": true, "requireManifest": true },
     "smoke": { "tags": ["smoke"], "failFast": true, "defaultServer": "staging" },
-    "legacy": { "servers": { "local": { "protocol": "legacy" } } }
+    "legacy": { "servers": { "default": { "protocol": "legacy" } } }
   }
 }
 ```
@@ -111,7 +111,7 @@ CLI flags that touch servers:
 | `budgetMs` | integer >= 0 | none | Default latency budget per case/step in ms; slower fails. |
 | `failFast` | boolean | `false` | Stop at the first failing case. Default false. |
 | `allowEmpty` | boolean | `false` | If true, matching zero case files exits 0. Default false (fail loud). |
-| `reporters` | string or string[] | `["console"]` | Reporters to run: console, json, junit, github, tap. Default ["console"]. |
+| `reporters` | string or string[] | `["console"]` | Reporters to run: console, json, junit, github, tap. Default ["console"]. `[]` runs no reporter at all. |
 | `tags` | string[] | none | Run only cases carrying at least one of these tags. |
 | `excludeTags` | string[] | none | Skip cases carrying any of these tags. |
 | `grep` | string | none | Run only cases whose name matches this regular expression. |
@@ -125,7 +125,8 @@ CLI flags that touch servers:
 | `hooks` | object | none | Suite-level steps run once per server session. |
 | `profiles` | object | none | Named overlays merged over the base config with --profile <name>. |
 | `checks` | object | none | Tuning for spec-sanity checks and description lint (vib check, vib run --check). Profiles extend allow and merge severity. |
-| `manifestIgnore` | string[] | `["server.version"]` | Dotted manifest paths ignored when diffing against the lock (e.g. "server.version", "tools.*.description"). Default ["server.version"]. |
+| `manifestIgnore` | string[] | `["server.version", "protocolVersion", "listMeta"]` | Dotted manifest paths ignored when diffing against the lock (e.g. "tools.*.description"). Default ["server.version", "protocolVersion", "listMeta"]: release and protocol-era noise, so one lock serves both eras. `vib manifest diff --strict` compares everything. |
+| `requireManifest` | boolean | `false` | Fail the run when a server's manifest lock file is missing (instead of warning). Turn it on in CI so an unrecorded surface cannot pass silently. Default false. |
 | `outDir` | string | `"reports"` | Directory for reporter artifacts (junit.xml, results.json, traces/), relative to the config file. Default "reports". |
 
 ## Servers
@@ -148,7 +149,7 @@ Exactly one of the two.
 | `spawnTimeoutMs` | integer >= 0 | Max time (ms) to spawn/connect and finish the handshake. Default: timeoutMs clamped to 2000..10000. |
 
 ```json
-{ "servers": { "local": { "cmd": "node", "args": ["dist/index.js"], "cwd": ".", "env": { "LOG_LEVEL": "warn" } } } }
+{ "servers": { "default": { "cmd": "node", "args": ["dist/index.js"], "cwd": ".", "env": { "LOG_LEVEL": "warn" } } } }
 ```
 
 Server stderr is captured per case and attached to failures and traces.
@@ -197,7 +198,7 @@ Use `auto` unless you need to prove a server works on one era. A common pattern 
 `legacy` profile that reruns the same suite on the old handshake:
 
 ```json
-{ "profiles": { "legacy": { "servers": { "local": { "protocol": "legacy" } } } } }
+{ "profiles": { "legacy": { "servers": { "default": { "protocol": "legacy" } } } } }
 ```
 
 ## `defaultServer`
@@ -217,7 +218,12 @@ line.
 ```
 
 Zero matching files fails the run (`allowEmpty: false`), because a silently empty suite
-is a broken suite. Keep `$ref` fragment files outside the globs.
+is a broken suite.
+
+Matched files that are not cases are skipped, with one `info:` line: the manifest lock
+(the configured path, its per-server siblings, and any file shaped like a lock) and `$ref`
+fragments (a JSON file with no operation that a case references, or that lives in a
+`shared/` or `fragments/` directory). No `!` exclusions are needed for them.
 
 ## `normalize`
 
@@ -243,29 +249,33 @@ Path of the manifest lock written by `vib manifest record` and checked by `vib r
 Default `tests/integration/__manifest__.json`. The lock is a snapshot of the server's
 surface (discover info, tools, resources, resource templates, prompts). A run fails when
 the live surface drifts from it; `vib run --update-manifest` accepts the change. Without
-a lock, `vib run` only warns. See [CLI.md](./CLI.md#vib-manifest).
+a lock, `vib run` warns, or fails with [`requireManifest`](#requiremanifest). See
+[CLI.md](./CLI.md#vib-manifest).
 
 Each server is locked separately: `defaultServer` uses this path, every other server a
 sibling file, `__manifest__.<server>.json`.
 
-The lock is JSON in the case directory, so **exclude it from `globs`**, or `vib run`
-loads it as a broken case:
+The lock may sit in the case directory; `vib run` never loads it as a case.
 
-```json
-{ "globs": ["tests/integration/**/*.json", "!tests/integration/**/__manifest__*.json"] }
-```
+### `requireManifest`
 
-`vib init` writes this exclusion for you.
+> Fail the run when a server's manifest lock file is missing (instead of warning). Turn it
+> on in CI so an unrecorded surface cannot pass silently. Default false.
+
+The `ci` profile that `vib init` writes sets it.
 
 ### `manifestIgnore`
 
-Dotted paths in the manifest that the drift check ignores. Default `["server.version"]`,
-so a version bump alone is not drift. Set `[]` to lock the version too. Sections are keyed
+Dotted paths in the manifest that the drift check ignores. Default
+`["server.version", "protocolVersion", "listMeta"]`: release and protocol-era noise, so a
+version bump is not drift and one lock serves both protocol eras (a `legacy` profile runs
+against the same lock). Set `[]`, or use `vib manifest diff --strict`, to compare
+everything. Sections are keyed
 by tool, prompt, or resource name/URI, and `*` matches any one key: `tools.*.annotations`,
 `tools.echo.description`, `capabilities.experimental`, `listMeta` (the list cache hints).
 
 ```json
-{ "manifestIgnore": ["server.version", "listMeta", "tools.*.annotations"] }
+{ "manifestIgnore": ["server.version", "protocolVersion", "listMeta", "tools.*.annotations"] }
 ```
 
 Ignoring `description` paths gives up rug-pull detection for those tools. Prefer
@@ -308,6 +318,9 @@ comma-separated string also works):
 | `junit` | `reports/junit.xml` for GitHub, GitLab, and Jenkins test dashboards. |
 | `github` | Workflow annotations plus a markdown job summary (`$GITHUB_STEP_SUMMARY`, else `reports/summary.md`). Annotations only inside GitHub Actions. |
 | `tap` | TAP 14 on stdout. Do not combine with `console`, which also writes to stdout. |
+
+`"reporters": []` runs none (useful from the library, or with `vib run --json`, which adds
+its own JSON output).
 
 Artifacts go to `reports/` under the config directory (`outDir` or `--out-dir` to move
 them), and transcripts to `reports/traces/`. See [CI.md](./CI.md) for how to wire each
@@ -382,16 +395,18 @@ In detail:
   as a whole, not merged key by key.
 - Fields that do not fit the transport are dropped (`args`, `cwd`, `env` on an HTTP server;
   `headers` on a stdio server).
-- A new name adds a server.
+- A name that is not in the base `servers` must define a server (`cmd` or `url`); a field
+  patch for an unknown name is an error: `profile x patches unknown server 'nope'; servers
+  are: default. Fix the name, or give it "cmd" / "url" to define a new server.`
 
 ```json
 {
-  "servers": { "local": { "cmd": "node", "args": ["dist/index.js"] } },
+  "servers": { "default": { "cmd": "node", "args": ["dist/index.js"] } },
   "profiles": {
-    "ci": { "reporters": ["console", "junit", "github", "json"], "check": true, "repeat": 1 },
+    "ci": { "reporters": ["console", "github", "junit", "json"], "check": true, "requireManifest": true },
     "smoke": { "tags": ["smoke"], "failFast": true },
-    "debug": { "servers": { "local": { "env": { "DEBUG": "*" } } }, "trace": true },
-    "built": { "servers": { "local": { "args": ["build/server.js"] } } }
+    "debug": { "servers": { "default": { "env": { "DEBUG": "*" } } }, "trace": true },
+    "built": { "servers": { "default": { "args": ["build/server.js"] } } }
   }
 }
 ```
@@ -426,10 +441,19 @@ Case files use a different syntax, `{{env.NAME}}`, resolved at run time (see
 ## Validation and warnings
 
 - A wrong type or value is an error that names the key and the fix, for example
-  `Invalid config at servers.local: expected exactly one of "cmd" (stdio) or "url"
+  `Invalid config at servers.default: expected exactly one of "cmd" (stdio) or "url"
   (Streamable HTTP), got an object.`
-- An unknown key is a warning, not an error: `Unknown config key at timeout (vibrissa.json):
-  ignored.` Warnings print on every command. Do not ignore them.
+- An unknown key is an error (exit `2`) with a did-you-mean, in the base and in profiles.
+  Every problem in the file is reported at once:
+
+  ```
+  Invalid config (vibrissa.json): 2 problems:
+    - Unknown config key at timeOutMs (vibrissa.json): did you mean "timeoutMs"? ...
+    - Unknown config key at reporter (vibrissa.json): did you mean "reporters"? ...
+  ```
+
+- Warnings (for example an unset `${VAR}`) print on every command. Do not ignore them.
 - Setting both `server` and `servers.default` warns; `servers.default` wins.
 - Numbers or booleans in `env` and `headers` are converted to strings with a warning.
-- The v1 key `display` is accepted and ignored (use `--pretty` / `--no-pretty`).
+- The v1 key `display` is accepted and ignored (use `--pretty` / `--no-pretty`);
+  `vib migrate` reports it.

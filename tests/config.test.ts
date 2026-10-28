@@ -262,7 +262,7 @@ describe('config v2: servers, profiles, env', () => {
     )
   })
 
-  it('validates values with actionable messages and warns on unknown keys', () => {
+  it('validates values with actionable messages; unknown keys are errors', () => {
     const tmp = mkTmpDir()
     writeConfig(tmp, { timeoutMs: 'soon' })
     expect(() => resolveOptions(tmp)).toThrow(ConfigError)
@@ -278,10 +278,70 @@ describe('config v2: servers, profiles, env', () => {
     writeConfig(tmp, { servers: { x: { cmd: 'node', protocol: 'newest' } } })
     expect(() => resolveOptions(tmp)).toThrow(/servers\.x\.protocol/)
 
-    writeConfig(tmp, { server: { cmd: 'node' }, colour: true, shard: '2/4', display: 'pretty' })
+    writeConfig(tmp, { server: { cmd: 'node' }, shard: '2/4', display: 'pretty' })
     const { options, warnings } = loadConfig(tmp)
     expect(options.shard).toEqual({ index: 2, total: 4 })
-    expect(warnings).toEqual([expect.stringMatching(/Unknown config key at colour/)])
+    expect(warnings).toEqual([])
+
+    // An unknown key would silently fall back to a default: it is a ConfigError (exit 2).
+    writeConfig(tmp, { server: { cmd: 'node' }, colour: true })
+    expect(() => loadConfig(tmp)).toThrow(ConfigError)
+    expect(() => loadConfig(tmp)).toThrow(
+      /^Unknown config key at colour \(vibrissa\.json\): Check spelling against schema\/vibrissa\.schema\.json\.$/,
+    )
+  })
+
+  it('suggests the right key and reports every problem at once', () => {
+    const tmp = mkTmpDir()
+    writeConfig(tmp, { server: { cmd: 'node', argz: [] }, globz: ['x'], timeoutMS: 5, repeat: 0 })
+    let message = ''
+    try {
+      loadConfig(tmp)
+    } catch (err) {
+      message = (err as Error).message
+    }
+    expect(message).toMatch(/^Invalid config \(vibrissa\.json\): 4 problems:\n/)
+    expect(message).toContain('Unknown config key at globz (vibrissa.json): did you mean "globs"?')
+    expect(message).toContain(
+      'Unknown config key at timeoutMS (vibrissa.json): did you mean "timeoutMs"?',
+    )
+    expect(message).toContain('Invalid config at repeat (vibrissa.json): expected an integer >= 1')
+    expect(message).toContain(
+      'Unknown config key at server.argz (vibrissa.json): did you mean "args"?',
+    )
+
+    writeConfig(tmp, { server: { cmd: 'node' }, profiles: { ci: { failfast: true } } })
+    expect(() => loadConfig(tmp)).toThrow(
+      /Unknown config key at profiles\.ci\.failfast .*"failFast"/,
+    )
+  })
+
+  it('rejects profiles that patch servers that do not exist', () => {
+    const tmp = mkTmpDir()
+    writeConfig(tmp, {
+      server: { cmd: 'node' },
+      profiles: { legacy: { servers: { local: { protocol: 'legacy' } } } },
+    })
+    expect(() => loadConfig(tmp)).toThrow(
+      /profile legacy patches unknown server 'local'; servers are: default\./,
+    )
+    // A profile may define a new server outright.
+    writeConfig(tmp, {
+      server: { cmd: 'node' },
+      profiles: { extra: { servers: { local: { cmd: 'node', args: ['x.js'] } } } },
+    })
+    expect(loadConfig(tmp, { profile: 'extra' }).options.servers.local).toMatchObject({
+      cmd: 'node',
+    })
+  })
+
+  it('accepts requireManifest (file and profile)', () => {
+    const tmp = mkTmpDir()
+    writeConfig(tmp, { server: { cmd: 'node' }, profiles: { ci: { requireManifest: true } } })
+    expect(resolveOptions(tmp).requireManifest).toBeUndefined()
+    expect(resolveOptions(tmp, { profile: 'ci' }).requireManifest).toBe(true)
+    writeConfig(tmp, { server: { cmd: 'node' }, requireManifest: 'yes' })
+    expect(() => resolveOptions(tmp)).toThrow(/Invalid config at requireManifest .*true or false/)
   })
 
   it('accepts protocol shorthands', () => {
@@ -306,7 +366,7 @@ describe('config v2: servers, profiles, env', () => {
     const { options, warnings } = loadConfig(tmp)
     expect(warnings).toEqual([])
     expect(options.checks).toEqual({})
-    expect(options.manifestIgnore).toEqual(['server.version'])
+    expect(options.manifestIgnore).toEqual(['server.version', 'protocolVersion', 'listMeta'])
     expect(options.outDir).toBeUndefined()
   })
 

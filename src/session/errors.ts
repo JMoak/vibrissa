@@ -154,6 +154,16 @@ function toJsonValue(value: unknown): JsonValue | undefined {
   }
 }
 
+/**
+ * The stable name for a protocol error: `ResourceNotFound` for the resource-not-found shape
+ * on either era (`-32002`, or `-32602` with `data` exactly `{ uri }`), else the code's name.
+ * `errorMatchesCode(e, "InvalidParams")` still matches the `-32602` form by number.
+ */
+export function protocolCodeName(code: number, data?: JsonValue): string | undefined {
+  if (isResourceNotFound({ code, data })) return 'ResourceNotFound'
+  return errorCodeName(code)
+}
+
 /** Build a ToolError from a raw JSON-RPC `error` object (as received on the wire). */
 export function fromJsonRpcError(error: {
   code?: unknown
@@ -162,10 +172,11 @@ export function fromJsonRpcError(error: {
 }): ToolError {
   const code = typeof error.code === 'number' ? error.code : undefined
   const data = toJsonValue(error.data)
+  const codeName = code !== undefined ? protocolCodeName(code, data) : undefined
   return {
     kind: 'protocol',
     ...(code !== undefined ? { code } : {}),
-    ...(code !== undefined && errorCodeName(code) ? { codeName: errorCodeName(code) } : {}),
+    ...(codeName ? { codeName } : {}),
     message: stripMcpErrorPrefix(
       typeof error.message === 'string' ? error.message : 'Unknown error',
     ),
@@ -186,10 +197,11 @@ export interface ErrorContext {
 export function toToolError(err: unknown, ctx: ErrorContext): ToolError {
   if (err instanceof ProtocolError) {
     const data = toJsonValue(err.data)
+    const codeName = protocolCodeName(err.code, data)
     return {
       kind: 'protocol',
       code: err.code,
-      ...(errorCodeName(err.code) ? { codeName: errorCodeName(err.code) } : {}),
+      ...(codeName ? { codeName } : {}),
       message: stripMcpErrorPrefix(err.message),
       ...(data !== undefined ? { data } : {}),
     }

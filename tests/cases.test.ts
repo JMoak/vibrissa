@@ -123,6 +123,37 @@ describe('loadCases', () => {
     expect(caseIdFor(file, dir)).toBe('x.json')
   })
 
+  it('skips $ref fragments matched by the globs (referenced, or in shared/ / fragments/)', async () => {
+    const dir = mkTmpDir()
+    write(dir, 'tests/integration/echo.json', {
+      tool: 'echo',
+      args: { text: 'x' },
+      expect: { content: [{ $ref: './parts/text-block.json' }] },
+    })
+    write(dir, 'tests/integration/parts/text-block.json', { type: 'text', text: 'x' }) // referenced
+    write(dir, 'tests/integration/shared/user.json', { $partial: true, id: { $type: 'string' } })
+    write(dir, 'tests/integration/fragments/list.json', [{ a: 1 }])
+    write(dir, 'tests/integration/stray.json', { name: 'forgot the tool' }) // still a load error
+    const { cases, matched, fragments } = await loadCases({
+      rootDir: dir,
+      globs: ['tests/integration/**/*.json'],
+    })
+    expect(fragments).toEqual([
+      'tests/integration/fragments/list.json',
+      'tests/integration/parts/text-block.json',
+      'tests/integration/shared/user.json',
+    ])
+    expect(cases.map((c) => [c.ref.id, c.error === undefined])).toEqual([
+      ['tests/integration/echo.json', true],
+      ['tests/integration/stray.json', false],
+    ])
+    expect(matched).toBe(2)
+    // A real case living in shared/ is still a case (it has an operation).
+    write(dir, 'tests/integration/shared/real.json', { tool: 'echo', args: { text: 'y' } })
+    const again = loadCasesSync({ rootDir: dir, globs: ['tests/integration/**/*.json'] })
+    expect(again.cases.map((c) => c.ref.id)).toContain('tests/integration/shared/real.json')
+  })
+
   it('never loads manifest locks as cases, even when the globs match them', async () => {
     const dir = mkTmpDir()
     const lock = JSON.parse(fs.readFileSync(path.join(FIXTURE, 'tests/__manifest__.json'), 'utf8'))
@@ -195,6 +226,36 @@ describe('case validation', () => {
     expect(load(dir, 'code.json', { tool: 'echo', expectError: { code: true } }).error).toMatch(
       /expectError: "code" must be a code name or number, got true/,
     )
+  })
+
+  it('rejects unknown $ matcher keys with a did-you-mean', () => {
+    const typo = load(dir, 'partail.json', {
+      tool: 'echo',
+      expect: { $partail: true, content: [{ text: { $regx: 'a' } }] },
+    })
+    expect(typo.error).toContain(
+      'expect at (root): "$partail" is not a matcher; did you mean "$partial"? Use {"$literal": ...} for data with a literal $-key',
+    )
+    expect(typo.error).toContain(
+      'expect at content[0].text: "$regx" is not a matcher; did you mean "$regex"?',
+    )
+    // Data that really has $-keys is fine inside $literal; a string $schema is data.
+    const literal = load(dir, 'literal.json', {
+      tool: 'echo',
+      expect: { schema: { $literal: { $id: 'x', $defs: {} } }, $schema: 'https://example.com/s' },
+    })
+    expect(literal.error).toBeUndefined()
+  })
+
+  it('rejects unknown expectError code names with a did-you-mean', () => {
+    expect(
+      load(dir, 'code1.json', { tool: 'echo', expectError: { code: 'InvalidParam' } }).error,
+    ).toMatch(
+      /expectError: "code" "InvalidParam" is not a known error code; did you mean "InvalidParams"\? Use the numeric JSON-RPC code/,
+    )
+    for (const code of ['InvalidParams', 'RequestTimedOut', 'ResourceNotFound', -32000]) {
+      expect(load(dir, 'code2.json', { tool: 'echo', expectError: { code } }).error).toBeUndefined()
+    }
   })
 
   it('lints matchers when the case loads', () => {

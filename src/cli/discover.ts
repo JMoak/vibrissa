@@ -1,4 +1,5 @@
-import type { DiscoverInfo, JsonValue } from '../types.js'
+import type { DiscoverInfo, JsonValue, ServerConfig } from '../types.js'
+import { isHttpServerConfig } from '../types.js'
 import { printJson } from './args.js'
 import { colors, isObject, preview } from './format.js'
 import { describeServerTarget, parseCommonFlags, startSession } from './resolve.js'
@@ -50,13 +51,23 @@ export function formatDiscover(info: DiscoverInfo, target?: string): string {
   return out.join('\n')
 }
 
+/** `{ type: 'stdio', command }` or `{ type: 'http', url }` for --json output. */
+export function transportOf(server: ServerConfig): JsonValue {
+  if (isHttpServerConfig(server)) return { type: 'http', url: server.url }
+  return { type: 'stdio', command: [server.cmd, ...(server.args ?? [])].join(' ') }
+}
+
+export const DISCOVER_NEXT = ['vib tools', 'vib resources', 'vib prompts', 'vib check']
+
 export async function discoverCommand(argv: string[]): Promise<number> {
   const flags = parseCommonFlags(argv)
   const { session, server } = await startSession(flags)
   try {
     const info = await session.discover()
-    if (flags.json) printJson(info)
-    else console.log(formatDiscover(info, describeServerTarget(server)))
+    if (flags.json) {
+      const { raw: _raw, ...rest } = info
+      printJson({ ok: true, ...rest, transport: transportOf(server), next: DISCOVER_NEXT })
+    } else console.log(formatDiscover(info, describeServerTarget(server)))
     return 0
   } finally {
     await session.close()

@@ -19,6 +19,7 @@ import {
   sortOutcomes,
 } from './outcomes.js'
 import { findUnresolvedRefs } from './refs.js'
+import { clip } from './text.js'
 import type { ListMeta, ManifestLike, ToolSummary } from './types.js'
 
 // ---------------------------------------------------------------------------
@@ -441,6 +442,42 @@ function schemaRefs(input: SpecInput): CheckResult {
   return { findings, passDetail: `${refsChecked} schema(s) checked` }
 }
 
+const MAX_NOISE_SAMPLES = 3
+
+function stdoutClean(input: SpecInput): CheckResult {
+  const noise = input.stdoutNoise as unknown
+  if (!isRecord(noise)) {
+    if (input.transport === 'stdio') {
+      return {
+        findings: [
+          {
+            message: 'not checked: no stdout capture supplied (stdoutNoise)',
+            informational: true,
+          },
+        ],
+      }
+    }
+    const why = input.transport === 'http' ? 'not applicable (http transport)' : 'not checked'
+    return { findings: [], passDetail: why }
+  }
+  const sample = Array.isArray(noise.sample)
+    ? noise.sample.filter((s): s is string => typeof s === 'string')
+    : []
+  const lines =
+    typeof noise.lines === 'number' && Number.isFinite(noise.lines) ? noise.lines : sample.length
+  if (lines <= 0) return { findings: [], passDetail: 'stdout carried only JSON-RPC' }
+  const shown = sample.slice(0, MAX_NOISE_SAMPLES).map((s) => q(clip(s, 120)))
+  const more = sample.length > shown.length ? ` (+${sample.length - shown.length} more)` : ''
+  const eg = shown.length ? `, e.g. ${shown.join(', ')}${more}` : ''
+  return {
+    findings: [
+      {
+        message: `${lines} non-JSON-RPC line(s) on stdout${eg}. Write logs to stderr: on the stdio transport stdout must carry only JSON-RPC messages`,
+      },
+    ],
+  }
+}
+
 function serverIdentity(input: SpecInput): CheckResult {
   const s = isRecord(input.server) ? input.server : {}
   const findings: Finding[] = []
@@ -518,6 +555,7 @@ function capabilities(input: SpecInput): CheckResult {
 // biome-ignore format: one check per line keeps the table scannable
 export const SPEC_CHECKS: readonly SpecCheck[] = [
   { id: 'spec/protocol-version', title: 'Discover reports a recognized protocol version', severity: 'failed', run: protocolVersion },
+  { id: 'spec/stdout-clean', title: 'stdio server keeps stdout for JSON-RPC only', severity: 'failed', run: stdoutClean },
   { id: 'spec/tools-list-stable', title: 'tools/list is deterministic across calls', severity: 'failed', run: toolsListStable },
   { id: 'spec/list-cache-metadata', title: 'List results carry ttlMs and cacheScope', severity: 'failed', run: listCacheMetadata },
   { id: 'spec/schema-valid', title: 'Tool schemas are valid JSON Schema 2020-12', severity: 'failed', run: schemaValid },

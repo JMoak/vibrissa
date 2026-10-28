@@ -4,7 +4,7 @@ import path from 'node:path'
 import { PassThrough, Readable } from 'node:stream'
 import { buildSync } from 'esbuild'
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
-import { recordCommand } from '../src/cli/record'
+import { recordCommand, tapCallStatus } from '../src/cli/record'
 import { McpSession } from '../src/session/index'
 import {
   type TapEntry,
@@ -13,7 +13,7 @@ import {
   reconstructCalls,
   selectCalls,
 } from '../src/tap/entries'
-import { FrameParser, TapRecorder, runTapProxy } from '../src/tap/proxy'
+import { FrameParser, TapRecorder, lastSeq, runTapProxy } from '../src/tap/proxy'
 import type { ServerConfig, TestCase } from '../src/types'
 
 const ROOT = process.cwd()
@@ -480,4 +480,63 @@ describe('vib tap with a real McpSession client', () => {
     expect(calls[0].respond).toEqual(CONFIRM)
     expect(calls[0].result).toMatchObject({ content: [{ text: 'confirmed: old' }] })
   }, 30_000)
+})
+
+describe('tap capture file housekeeping', () => {
+  it('creates the capture even when nothing is captured, and says so', async () => {
+    const out = path.join(tmpDir(), 'nested', 'empty.ndjson')
+    const stderr = new PassThrough()
+    let text = ''
+    stderr.on('data', (c: Buffer) => {
+      text += c.toString()
+    })
+    const stdin = new PassThrough()
+    const done = runTapProxy({
+      cmd: 'node',
+      args: [ECHO],
+      out,
+      stdin,
+      stdout: new PassThrough(),
+      stderr,
+    })
+    stdin.end()
+    const result = await done
+    expect(result.entries).toBe(0)
+    expect(fs.existsSync(out)).toBe(true)
+    expect(fs.readFileSync(out, 'utf8')).toBe('')
+    expect(text).toMatch(/nothing captured/)
+  }, 20_000)
+
+  it('continues seq when appending to an existing capture', async () => {
+    const out = path.join(tmpDir(), 'seq.ndjson')
+    fs.writeFileSync(
+      out,
+      `${JSON.stringify({ ts: new Date().toISOString(), seq: 41, from: 'client', method: 'tools/list', id: 1, result: {}, durationMs: 1 })}\n`,
+    )
+    expect(lastSeq(out)).toBe(41)
+    const recorder = new TapRecorder(() => {}, lastSeq(out))
+    const entries: TapEntry[] = []
+    const r2 = new TapRecorder((e) => entries.push(e), lastSeq(out))
+    r2.observe('client', { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'x' } })
+    r2.observe('server', { jsonrpc: '2.0', id: 1, result: {} })
+    expect(entries[0].seq).toBe(42)
+    expect(recorder).toBeDefined()
+    expect(lastSeq(path.join(tmpDir(), 'missing.ndjson'))).toBe(0)
+  })
+
+  it('lists isError results as errors in --from-tap', () => {
+    const calls = reconstructCalls([
+      {
+        ts: new Date().toISOString(),
+        seq: 1,
+        from: 'client',
+        method: 'tools/call',
+        id: 1,
+        params: { name: 'fail', arguments: {} },
+        result: { content: [{ type: 'text', text: 'nope' }], isError: true },
+        durationMs: 1,
+      },
+    ])
+    expect(tapCallStatus(calls[0])).toBe('error')
+  })
 })

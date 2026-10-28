@@ -1,6 +1,8 @@
 {
   "vibrissa": 2,
   "protocolVersion": "2026-07-28",
+  "transport": "stdio",
+  "stdoutNoise": { "lines": 0, "sample": [] },
   "server": {
     "name": "notes-server",
     "version": "1.4.2"

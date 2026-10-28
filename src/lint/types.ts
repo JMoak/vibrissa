@@ -83,4 +83,13 @@ export interface ManifestLike {
   resourceTemplates?: ResourceTemplateSummary[]
   prompts?: PromptSummary[]
   listMeta?: ListMeta
+  /** How the session reached the server. Decides whether stdout hygiene applies. */
+  transport?: 'stdio' | 'http'
+  /** Non-JSON-RPC lines a stdio server wrote to stdout (from `session.stdoutNoise`). */
+  stdoutNoise?: StdoutNoise
+}
+
+export interface StdoutNoise {
+  lines: number
+  sample: string[]
 }

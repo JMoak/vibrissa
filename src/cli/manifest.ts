@@ -12,7 +12,14 @@ import {
   writeManifest,
 } from '../manifest.js'
 import type { RunOptions } from '../types.js'
-import { printJson, resolvePathFromCwd, takeFlag } from './args.js'
+import {
+  UsageError,
+  VALUE_FLAGS,
+  normalizeArgv,
+  printJson,
+  resolvePathFromCwd,
+  takeFlag,
+} from './args.js'
 import { type CommandHelp, formatCommandHelp } from './format.js'
 import {
   type CommonCliFlags,
@@ -20,6 +27,7 @@ import {
   parseCommonFlags,
   startSession,
 } from './resolve.js'
+import { assertCommandFlags, usageFailure } from './run.js'
 
 export const manifestHelp: CommandHelp = {
   name: 'manifest',
@@ -27,16 +35,18 @@ export const manifestHelp: CommandHelp = {
   summary: 'Record, diff or show the manifest lock (tools, schemas, descriptions, capabilities)',
   usage: [
     'vib manifest record [--out <path>] [--server <name|cmd|url>] [--json]',
-    'vib manifest diff   [--out <path>] [--json]',
+    'vib manifest diff   [--out <path>] [--strict] [--json]',
     'vib manifest show   [--json]',
   ],
   description: [
     'record  snapshot server/discover + tools/list + resources + templates + prompts into the',
     '        lock file (default: "manifest" in vibrissa.json, tests/integration/__manifest__.json).',
     'diff    compare the live server with the lock; exit 1 on drift. `vib run` does this too.',
+    '        Each change says whether it is breaking (removed tool/property, newly required, ...).',
     'show    print the live manifest without writing anything.',
     'Servers other than defaultServer use a sibling lock: __manifest__.<server>.json.',
-    'Paths in "manifestIgnore" (default ["server.version"]) are not compared.',
+    'Paths in "manifestIgnore" (default server.version, protocolVersion, listMeta) are not',
+    'compared, so one lock serves both protocol eras; --strict compares everything.',
     'Full reference: docs/CLI.md.',
   ].join('\n'),
   flags: [
@@ -44,6 +54,7 @@ export const manifestHelp: CommandHelp = {
       flag: '--out <path>',
       text: 'Lock file to write (record) or compare (diff); relative to the shell cwd',
     },
+    { flag: '--strict', text: 'diff: compare everything (ignore no paths)' },
   ],
   common: true,
   examples: [
@@ -54,6 +65,8 @@ export const manifestHelp: CommandHelp = {
   ],
   extraFlags: ['--manifest'],
 }
+
+const MANIFEST_VALUE_FLAGS: ReadonlySet<string> = new Set([...VALUE_FLAGS, '--out', '--manifest'])
 
 /** Full `vib manifest --help` text. */
 export const help: string = formatCommandHelp(manifestHelp)
@@ -118,22 +131,32 @@ export async function manifestCommand(argv: string[]): Promise<number> {
     console.log(help)
     return 0
   }
+  const json = argv.includes('--json')
   const sub = argv[0] && !argv[0].startsWith('-') ? argv[0] : undefined
   if (sub !== 'record' && sub !== 'diff' && sub !== 'show') {
-    console.error(
-      `Unknown manifest action ${sub ? `"${sub}"` : '(none)'}: expected record, diff or show. Example: vib manifest record`,
+    return usageFailure(
+      new UsageError(
+        `Unknown manifest action ${sub ? `"${sub}"` : '(none)'}: expected record, diff or show.`,
+        {
+          code: 'unknown-action',
+          hint: 'Example: vib manifest record',
+          next: ['vib manifest --help'],
+        },
+      ),
+      'manifest',
+      json,
     )
-    return 2
   }
-  const rest = argv.slice(1)
+  const rest = normalizeArgv(argv.slice(1), MANIFEST_VALUE_FLAGS)
   let flags: CommonCliFlags
   try {
+    assertCommandFlags(rest, manifestHelp, MANIFEST_VALUE_FLAGS)
     flags = parseCommonFlags(rest)
   } catch (err) {
-    console.error(err instanceof Error ? err.message : String(err))
-    return 2
+    return usageFailure(err, 'manifest', json)
   }
   const outFlag = takeFlag(rest, '--out') ?? takeFlag(rest, '--manifest')
+  const strict = rest.includes('--strict')
 
   const { session, options, server, serverName } = await startSession(flags)
   try {
@@ -141,7 +164,7 @@ export async function manifestCommand(argv: string[]): Promise<number> {
     const { manifest } = await captureManifest(session)
 
     if (sub === 'show') {
-      if (flags.json) printJson(manifest)
+      if (flags.json) printJson({ ok: true, server: serverName, manifest })
       else console.log(formatManifest(manifest, describeServerTarget(server)))
       return 0
     }
@@ -177,12 +200,21 @@ export async function manifestCommand(argv: string[]): Promise<number> {
 
     // diff
     if (!fs.existsSync(file)) {
-      const message = `No manifest lock at ${display(file)}. Create it with "vib manifest record".`
-      if (flags.json) printJson({ ok: false, path: file, error: message })
-      else console.error(message)
-      return 2
+      const named = flags.server !== undefined && Object.hasOwn(options.servers, flags.server)
+      const record = `vib manifest record${named ? ` --server ${flags.server}` : ''}`
+      return usageFailure(
+        new UsageError(`No manifest lock at ${display(file)}.`, {
+          code: 'manifest-missing',
+          hint: `Create it with "${record}".`,
+          next: [record],
+        }),
+        'manifest',
+        Boolean(flags.json),
+      )
     }
-    const diff = diffManifest(readManifest(file), manifest, { ignore: manifestIgnoreOf(options) })
+    const diff = diffManifest(readManifest(file), manifest, {
+      ignore: strict ? [] : manifestIgnoreOf(options),
+    })
     if (flags.json) {
       printJson({
         ok: diff.identical,

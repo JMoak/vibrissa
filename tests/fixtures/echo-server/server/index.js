@@ -8,6 +8,8 @@
 //   node server/index.js               stdio (default; `serveStdio` picks the era per connection)
 //   node server/index.js --http 0      Streamable HTTP on 127.0.0.1:<port> (0 = random), path /mcp.
 //                                      Prints `[echo-server] listening <url>` on stderr once bound.
+//   node server/index.js --noisy       stdio, but first writes a non-JSON-RPC line to stdout
+//                                      (stdout-pollution tests).
 //
 // Surface (keep in sync with tests/session.test.ts):
 //   tools      echo, fail, confirm (MRTR elicitation), slow (tasks extension), typed (outputSchema),
@@ -396,6 +398,8 @@ async function sendWebResponse(res, response) {
 
 const port = httpPort(process.argv)
 if (port === undefined) {
+  // --noisy: the classic bug, a stray console.log on stdout before serving.
+  if (process.argv.includes('--noisy')) console.log('Starting echo fixture...')
   serveStdio(() => createServer())
   process.stderr.write('[echo-server] ready\n')
 } else {

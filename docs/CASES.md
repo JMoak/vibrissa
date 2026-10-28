@@ -49,8 +49,9 @@ This is the v1 shape, and it is still the most common one. Every v1 case file is
 v2 case file.
 
 One file holds one case. Put cases anywhere the config `globs` match (default
-`tests/integration/**/*.json`). Keep shared `$ref` fragments and the manifest lock out of
-the case globs, or exclude them with a `!` glob (see [CONFIG.md](./CONFIG.md#globs)).
+`tests/integration/**/*.json`). JSON files under the globs that are not cases are skipped
+automatically: the manifest lock (and anything shaped like one), and `$ref` fragments
+(files a case references, or files in a `shared/` or `fragments/` directory).
 
 ## How a case runs
 
@@ -58,8 +59,9 @@ For a single-operation case, and for each step of a flow:
 
 1. **Interpolate** `{{capture}}` and `{{env.NAME}}` placeholders in `args` and `expect`.
 2. **Call** the operation (`tools/call`, `resources/read`, or `prompts/get`) on the case's
-   server session. Tool `args` that do not match the tool's `inputSchema` produce a
-   warning (a likely authoring mistake), unless the step has `expectError`.
+   server session. Calling a tool the server does not list fails with a did-you-mean.
+   Tool `args` that do not match the tool's `inputSchema` produce a warning (a likely
+   authoring mistake), unless the step has `expectError`.
 3. **Answer input requests.** If the server returns `input_required`, answer from
    `respond` and retry until the call completes. An unanswered request fails the step and
    prints the request.
@@ -119,14 +121,16 @@ A case needs exactly one of `tool`, `resource`, `resourceTemplate`, `prompt`, or
 and a step exactly one operation. `expect` and `expectError` cannot both be set.
 
 Case files are checked when they load. Unknown keys fail the case with a suggestion
-(`"expct" is not a case key. Did you mean "expect"?`), and so do malformed matchers and
-undefined placeholders. A broken file is reported as a failed case (`errorKind: "load"`);
+(`"expct" is not a case key. Did you mean "expect"?`), and so do unknown matchers
+(`"$partail" is not a matcher; did you mean "$partial"?`), unknown error-code names
+(`"InvalidParam" is not a known error code; did you mean "InvalidParams"?`), malformed
+matchers, and undefined placeholders. A broken file is reported as a failed case (`errorKind: "load"`);
 it is never silently skipped, even by tag filters.
 
 Comments are allowed: case files may use `//` and `/* */` comments and trailing commas,
 and keys named `$comment` or starting with `//` are ignored. (Editors validating against
-the schema flag these keys; `vib run --update` cannot preserve comments when it rewrites
-a file.)
+the schema flag these keys, and `vib run --update` never rewrites a file that has
+comments.)
 
 ## Operations
 
@@ -382,8 +386,9 @@ Suite-wide setup and teardown live in config (`hooks`, see
 A step with `"ignoreErrors": true` never fails the case and never stops a flow. When it
 fails, the step is still reported as failed, with the reason `ignored (ignoreErrors): ...`,
 and the case outcome is unaffected. Outside `teardown` an ignored failure also produces a
-warning, so it stays visible. A failed step captures nothing, so a later step that uses
-its captures fails.
+warning, so it stays visible. A failed step captures nothing: a later step that uses its
+captures fails, except in `teardown`, where such a step is reported as skipped
+(`{{h}} was never captured`) rather than failed.
 
 Use it in `teardown` for cleanup that may legitimately find nothing to clean, or on a
 best-effort step in a flow (a warm-up call, an optional reset).
@@ -449,9 +454,14 @@ every round that asks with that method.
 | `sampling/createMessage` | `{ "role": "assistant", "content": { "type": "text", "text": "ok" }, "model": "scripted", "stopReason": "endTurn" }` |
 | `roots/list` | `{ "roots": [{ "uri": "file:///repo", "name": "repo" }] }` |
 
-If the server asks for something `respond` does not answer, the step fails with
-`Unanswered input request at tool "...": the server asked for <method> "<message>"` and a
-ready-to-paste `respond` entry.
+If the server asks for something `respond` does not answer, the step fails with a
+ready-to-paste entry built from the request's `requestedSchema`:
+
+```
+Unanswered input request at tool "confirm": the server asked for elicitation/create "Proceed with x?".
+Add to the step: "respond": {"elicitation/create":{"action":"accept","content":{"confirm":true}}}
+(edit the sample values), or assert only the request with "expectInputRequired".
+```
 
 ### `expectInputRequired`
 
@@ -637,8 +647,10 @@ file. Remote URLs are not supported; vendor the fragment into the repo. Full rul
 }
 ```
 
-Keep fragment files outside the case globs, or every fragment is loaded as a (broken)
-case.
+Fragment files may live under the case globs: a JSON file with no operation and no
+`steps` is skipped (with one `info:` line) when a case references it or it sits in a
+`shared/` or `fragments/` directory. A fragment that nothing references, outside those
+directories, is loaded as a case and fails, so you notice it.
 
 ## Error codes
 
@@ -654,7 +666,7 @@ versions; Vibrissa maps wire codes and SDK errors onto them.
 | `MethodNotFound` | -32601 | |
 | `InvalidParams` | -32602 | Also unknown tools and, on 2026-07-28, unknown resources. |
 | `InternalError` | -32603 | |
-| `ResourceNotFound` | -32002 | Also matches -32602 with `data` exactly `{ "uri": ... }` (the 2026-07-28 shape). |
+| `ResourceNotFound` | -32002 | Also the 2026-07-28 shape, -32602 with `data` exactly `{ "uri": ... }`. Reported as `ResourceNotFound` on both eras. |
 | `HeaderMismatch` | -32020 | 2026-07-28 HTTP binding: header and body disagree. |
 | `MissingRequiredClientCapability` | -32021 | 2026-07-28. |
 | `UnsupportedProtocolVersion` | -32022 | 2026-07-28. |
@@ -775,8 +787,12 @@ Assert the shape, not the words:
 
 ### Generated ids and timestamps
 
-The fixture's task handle has both (2026-07-28 connections; tag such cases so a legacy
-profile can exclude them):
+`vib record` loosens these for you: ISO timestamps become a `date-time` `$schema`, UUIDs a
+`uuid` `$schema`, epoch-millisecond numbers `{"$type": "integer"}`, text with an embedded
+timestamp a `$regex`, and values that changed between two back-to-back calls are loosened
+too (`--exact` keeps everything verbatim; see [CLI.md](./CLI.md#vib-record)). The same
+matchers by hand, on the fixture's task handle, which has both (2026-07-28 connections;
+tag such cases so a legacy profile can exclude them):
 
 ```json
 {

@@ -18,7 +18,7 @@ a client.
 
 ```bash
 npm i -D @jmoak/vibrissa
-npx vib init                      # vibrissa.json + a sample case
+npx vib init                      # vibrissa.json + a real sample case from your server
 npx vib discover                  # protocol era, capabilities, identity
 npx vib tools                     # what the server exposes
 npx vib call echo --arg text=hello
@@ -157,8 +157,11 @@ annotations, changed capabilities, and **changed descriptions**.
 
 It is `package-lock.json` for your MCP surface. It also catches rug pulls: a tool
 description that changes after review, the move behind tool-poisoning attacks, shows up
-as a reviewed diff in git instead of a silent change. Accept intended changes with
-`vib run --update-manifest` and commit the lock with the PR that caused them.
+as a reviewed diff in git instead of a silent change. Each change is marked breaking or
+not (a removed property or a newly required one is; a reworded description is drift, but
+not breaking), with a word diff for prose. Accept intended changes with
+`vib run --update-manifest` and commit the lock with the PR that caused them. One lock
+serves both protocol eras; `requireManifest: true` makes a missing lock fail CI.
 
 ## Checks and fuzz
 
@@ -196,7 +199,7 @@ jobs:
         with: { node-version: 22, cache: npm }
       - run: npm ci
       - run: npm run build --if-present
-      - run: npx vib run --profile ci --check --reporter console,github,junit,json
+      - run: npx vib run --profile ci
       - uses: actions/upload-artifact@v4
         if: failure()
         with: { name: vibrissa-reports, path: reports/ }
@@ -211,17 +214,28 @@ failing case gets a JSON-RPC transcript under `reports/traces/`. Details:
 ## Agents write great cases
 
 JSON cases are the most generatable test format there is, and `record` keeps agents
-honest. Point your coding agent at the same loop you use:
+honest. Start the agent with **`vib help cases`**: the whole case format, every matcher,
+flows, MRTR, and tasks on one screen. Then the same loop you use:
 
 1. `vib tools --json`: the agent reads the contract, schemas included.
 2. `vib call <tool> --args '{...}' --json`: it probes behavior and edge cases.
-3. `vib record ...`: real responses become goldens. No hallucinated envelopes.
+3. `vib record ...`: real responses become goldens. No hallucinated envelopes, and
+   timestamps, UUIDs, and values that change between calls are loosened to matchers
+   automatically. (The stable check calls the tool twice; pass `--no-stable-check` for
+   tools with side effects. Tools annotated destructive are called once.)
 4. `vib tap -- node dist/index.js`: or record real client sessions and pick calls with
    `vib record --from-tap`.
-5. `vib run --json`: the agent verifies its own suite from one JSON report on stdout.
+5. `vib run --json --brief`: the agent verifies its own suite from one JSON report on
+   stdout, listing only what failed.
+
+Everything is built for that loop: `--json` always prints one object with `ok` (errors
+too, as `{ "ok": false, "error": { "type", "code", "message", "hint" }, "next" }`), unknown
+flags, tools, keys, matchers, and error codes all fail with a did-you-mean, and every
+error message says what to do next.
 
 The worst an agent can do is record a case you don't want, and that is a one-file JSON
-review. `vib explain <case>` paraphrases what a case asserts, for faster PR review.
+review. `vib explain` paraphrases what each case asserts and flags weak assertions (a
+bare `$partial`, `expectError: {}`, no expectation), for faster PR review.
 
 Cases can also be emitted from a [`tdd-dsl`](https://github.com/Rosavera-I/tdd-dsl)
 contract: `tdd-dsl emit --target vibrissa --out-dir tests/integration contract.tdd`.
@@ -234,18 +248,18 @@ contract: `tdd-dsl emit --target vibrissa --out-dir tests/integration contract.t
 {
   "$schema": "./node_modules/@jmoak/vibrissa/schema/vibrissa.schema.json",
   "servers": {
-    "local": { "cmd": "node", "args": ["dist/index.js"] },
+    "default": { "cmd": "node", "args": ["dist/index.js"] },
     "staging": {
       "url": "https://mcp.example.com/mcp",
       "headers": { "Authorization": "Bearer ${MCP_TOKEN}" }
     }
   },
-  "defaultServer": "local",
-  "globs": ["tests/integration/**/*.json", "!tests/integration/**/__manifest__*.json"],
+  "defaultServer": "default",
+  "globs": ["tests/integration/**/*.json"],
   "timeoutMs": 15000,
   "profiles": {
-    "ci": { "reporters": ["console", "github", "junit", "json"], "check": true },
-    "legacy": { "servers": { "local": { "protocol": "legacy" } } }
+    "ci": { "reporters": ["console", "github", "junit", "json"], "check": true, "requireManifest": true },
+    "legacy": { "servers": { "default": { "protocol": "legacy" } } }
   }
 }
 ```
@@ -273,14 +287,21 @@ process.exitCode = await runCases(options) // 0 ok, 1 failures, 2 config error
 The v1 call shape (`runCases({ server: { cmd, args }, globs })`) still works.
 `new Runner(options).execute()` returns the full result instead of an exit code.
 
-Teams with an existing runner can expand cases into Vitest tests, one `it` per case:
+### Vitest bridge
+
+Teams with an existing Vitest suite can run the contract suite inside it, gated on the same
+things as `vib run`:
 
 ```ts
 // tests/mcp.contract.test.ts
 import { describeCases } from '@jmoak/vibrissa/vitest'
 
-await describeCases('tests/integration/**/*.json')
+await describeCases({ profile: 'ci', checks: true })
 ```
+
+It registers a manifest-lock test per server, a checks test (with `checks`), and one `it`
+per case. A string argument is a case glob. Options (`config`, `profile`, `globs`,
+`checks`, `lockManifest`, `title`, `api`, runner options): [docs/CI.md](./docs/CI.md#inside-a-vitest-suite).
 
 Also exported: `McpSession`, `loadCases`, `executeCase`, `matchValue`,
 `normalizeResult`, `diffManifest`, `createReporters`, `registerReporter`, `runChecks`,

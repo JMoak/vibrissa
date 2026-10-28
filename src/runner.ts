@@ -13,6 +13,7 @@
  *
  * See docs/V2_ARCHITECTURE.md ("Runner") for the semantics of every case key.
  */
+import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import {
@@ -48,18 +49,20 @@ import {
   type ManifestDiff,
   captureManifest,
   diffManifest,
+  formatDiff,
   manifestPathFor,
   readManifest,
   summarizeDiff,
   writeManifest,
 } from './manifest.js'
-import { escapeDirectives, matchValue } from './match.js'
+import { escapeDirectives, isMatcherObject, matchValue } from './match.js'
 import { normalizeResult } from './normalize.js'
 import { resolveRootDir, resolveServerConfig } from './paths.js'
 import { createReporters, fanout } from './reporters/index.js'
 import type { JsonReport } from './reporters/json.js'
 import { baseCaseId, resolveOutDir } from './reporters/shared.js'
-import { validate } from './schema.js'
+import { suggestRespond } from './respond-hint.js'
+import { appendIndex, appendKey, validate } from './schema.js'
 import {
   type CallOptions,
   McpSession,
@@ -79,6 +82,7 @@ import type {
   ToolSummary,
   TranscriptEntry,
 } from './types.js'
+import { isHttpServerConfig } from './types.js'
 
 // ---------------------------------------------------------------------------
 // Options & results
@@ -96,6 +100,8 @@ export interface RunnerOptions extends RunOptions {
   stderr?: (line: string) => void
   /** Reporter instances added to the ones named in `reporters`. */
   extraReporters?: Reporter[]
+  /** Informational lines (e.g. skipped `$ref` fragments). Default: `stdout`. */
+  info?: (line: string) => void
   /** `--update=all`: also rewrite expectations that contain matchers. */
   updateAll?: boolean
   /** `--update-manifest`: rewrite the manifest lock on drift (or create it when missing). */
@@ -117,7 +123,8 @@ export interface RunnerOptions extends RunOptions {
 export interface ManifestResult {
   server: string
   path: string
-  status: 'ok' | 'diff' | 'missing' | 'updated' | 'created' | 'error'
+  /** `missing-required`: no lock while requireManifest is on (fails the run). */
+  status: 'ok' | 'diff' | 'missing' | 'missing-required' | 'updated' | 'created' | 'error'
   diff?: ManifestDiff
   summary?: string
 }
@@ -157,26 +164,13 @@ function short(value: unknown, max = 80): string {
 function joinPath(base: string, relative: string): string {
   if (relative === '') return base
   if (relative.startsWith('[')) return `${base}${relative}`
-  return `${base}.${relative}`
+  return base === '' ? relative : `${base}.${relative}`
 }
 
 function summarizeMismatches(label: string, mismatches: Mismatch[]): string {
   const first = mismatches[0]
   const more = mismatches.length > 1 ? ` (+${mismatches.length - 1} more)` : ''
   return `${label} at ${first.path}: ${first.message}${more}`
-}
-
-function hasDirective(value: unknown): boolean {
-  if (Array.isArray(value)) return value.some(hasDirective)
-  if (!isObject(value)) return false
-  return Object.entries(value).some(([key, child]) => key.startsWith('$') || hasDirective(child))
-}
-
-function hasPlaceholder(value: unknown): boolean {
-  if (typeof value === 'string') return value.includes('{{')
-  if (Array.isArray(value)) return value.some(hasPlaceholder)
-  if (isObject(value)) return Object.values(value).some(hasPlaceholder)
-  return false
 }
 
 function getIn(root: unknown, source: Array<string | number>): unknown {
@@ -188,8 +182,75 @@ function getIn(root: unknown, source: Array<string | number>): unknown {
   return node
 }
 
+function levenshtein(a: string, b: string): number {
+  const row = Array.from({ length: b.length + 1 }, (_, i) => i)
+  for (let i = 1; i <= a.length; i++) {
+    let prev = row[0]
+    row[0] = i
+    for (let j = 1; j <= b.length; j++) {
+      const tmp = row[j]
+      row[j] = Math.min(row[j] + 1, row[j - 1] + 1, prev + (a[i - 1] === b[j - 1] ? 0 : 1))
+      prev = tmp
+    }
+  }
+  return row[b.length]
+}
+
+/** Closest name (case-insensitive edit distance within max(2, len/3)), for did-you-mean hints. */
+function suggestName(input: string, names: Iterable<string>): string | undefined {
+  let best: string | undefined
+  let bestScore = Number.POSITIVE_INFINITY
+  for (const name of names) {
+    const score = levenshtein(input.toLowerCase(), name.toLowerCase())
+    if (score < bestScore) {
+      bestScore = score
+      best = name
+    }
+  }
+  return bestScore <= Math.max(2, Math.floor(input.length / 3)) ? best : undefined
+}
+
 // ---------------------------------------------------------------------------
-// expectInputRequired views
+// Matcher paths → RFC 6901 pointers into the case file
+// ---------------------------------------------------------------------------
+
+/** `content[0].text` / `_meta["a/b"]` / `(root)` → path segments. */
+export function matcherPathSegments(path: string): string[] {
+  if (path === '' || path === '(root)') return []
+  const out: string[] = []
+  let i = 0
+  while (i < path.length) {
+    const ch = path[i]
+    if (ch === '.') {
+      i++
+    } else if (ch === '[') {
+      if (path[i + 1] === '"') {
+        let j = i + 2
+        while (j < path.length && path[j] !== '"') j += path[j] === '\\' ? 2 : 1
+        out.push(JSON.parse(path.slice(i + 1, j + 1)) as string)
+        i = j + 2
+      } else {
+        const end = path.indexOf(']', i)
+        out.push(path.slice(i + 1, end === -1 ? undefined : end))
+        i = end === -1 ? path.length : end + 1
+      }
+    } else {
+      let j = i
+      while (j < path.length && path[j] !== '.' && path[j] !== '[') j++
+      out.push(path.slice(i, j))
+      i = j
+    }
+  }
+  return out
+}
+
+/** RFC 6901 JSON Pointer for path segments (`["steps", 1, "expect"]` → `/steps/1/expect`). */
+export function toPointer(segments: Array<string | number>): string {
+  return segments.map((s) => `/${String(s).replace(/~/g, '~0').replace(/\//g, '~1')}`).join('')
+}
+
+// ---------------------------------------------------------------------------
+// expectInputRequired views & respond suggestions
 // ---------------------------------------------------------------------------
 
 /**
@@ -235,30 +296,20 @@ export function inputRequestView(expected: JsonValue, rounds: JsonValue[]): Json
   return wantsMethodView(expected) ? byMethod : byKey
 }
 
-function describeRequests(requests: JsonValue): { text: string; method?: string } {
-  if (!isObject(requests)) return { text: short(requests) }
+function describeRequests(requests: JsonValue): string {
+  if (!isObject(requests)) return short(requests)
   const parts: string[] = []
-  let method: string | undefined
   for (const [key, entry] of Object.entries(requests)) {
-    const m = isObject(entry) && typeof entry.method === 'string' ? entry.method : key
-    method ??= m
+    const method = isObject(entry) && typeof entry.method === 'string' ? entry.method : key
     const params = isObject(entry) && isObject(entry.params) ? entry.params : undefined
     const message = typeof params?.message === 'string' ? ` ${JSON.stringify(params.message)}` : ''
-    parts.push(`${m}${message}`)
+    parts.push(`${method}${message}`)
   }
-  return { text: parts.join(', ') || 'input', method }
+  return parts.join(', ') || 'input'
 }
 
-function exampleAnswer(method: string | undefined): string {
-  switch (method) {
-    case 'sampling/createMessage':
-      return '{ "role": "assistant", "content": { "type": "text", "text": "..." }, "model": "scripted" }'
-    case 'roots/list':
-      return '{ "roots": [] }'
-    default:
-      return '{ "action": "accept", "content": { ... } }'
-  }
-}
+// Paste-ready `respond` suggestions are shared with `vib call` / `vib record`.
+export { suggestRespond }
 
 // ---------------------------------------------------------------------------
 // Case execution (shared by the runner, the vitest bridge and `vib diff`)
@@ -271,15 +322,22 @@ export interface ExecuteContext {
   timeoutMs: number
   /** Default case budget (config `budgetMs`). */
   budgetMs?: number
-  /** Tool definitions by name: outputSchema enforcement and args pre-validation. */
+  /** Tool definitions by name: outputSchema enforcement, args pre-validation, name hints. */
   tools?: Map<string, ToolSummary>
   /** Values visible to `{{name}}` before the case captures anything (suite setup). */
   vars?: Record<string, JsonValue>
   env?: Record<string, string | undefined>
-  /** `failing` (= --update) rewrites plain goldens; `all` also rewrites matcher goldens. */
+  /**
+   * `failing` (= --update) rewrites mismatched plain leaves of `expect`; `all` (=
+   * --update=all) also replaces mismatched matchers and `$ref`s with literal values.
+   */
   update?: 'off' | 'failing' | 'all'
   /** Case as written in its file (no `$ref` expansion): decides what --update may rewrite. */
   source?: TestCase
+  /** Set when the case file must not be rewritten (e.g. it has comments): the reason. */
+  cannotRewrite?: string
+  /** Mention `--update` in failure reasons when it would help. Default true. */
+  updateHint?: boolean
   /** Case id for messages. */
   caseId?: string
   onStepStart?: (step: StepRef) => void | Promise<void>
@@ -299,7 +357,7 @@ export interface CaseExecution {
   /** tracePath / stderrPath are filled in by the runner. */
   outcome: CaseOutcome
   /** Normalized observation of every executed step, in run order (used by `vib diff`). */
-  observations: Array<{ step: StepRef; observed: JsonValue }>
+  observations: Array<{ step: StepRef; observed: JsonValue; planned: PlannedStep }>
   /** Goldens accepted under --update (the caller writes them). */
   updates: ExpectationUpdate[]
   warnings: string[]
@@ -308,15 +366,18 @@ export interface CaseExecution {
 }
 
 type FailureKind = NonNullable<CaseOutcome['errorKind']>
+type MismatchField = NonNullable<Mismatch['field']>
 
 interface Failure {
   kind: FailureKind
   reason: string
+  /** The case field the failure is about (drives pointers and --update notes). */
+  field?: MismatchField
   mismatches?: Mismatch[]
   expected?: JsonValue
   actual?: JsonValue
   budget?: { budgetMs: number; actualMs: number }
-  /** A plain `expect` mismatch (eligible for --update). */
+  /** A mismatch of `expect` (the only field --update rewrites). */
   golden?: boolean
 }
 
@@ -356,7 +417,20 @@ function errorView(error: ToolError): JsonObject {
   }
 }
 
-function callFailedReason(what: string, error: ToolError): string {
+/** "Tool "ech" is not on the server; did you mean "echo"? Available: ..." (or undefined). */
+function unknownToolHint(
+  kind: string,
+  target: string,
+  tools: Map<string, ToolSummary> | undefined,
+): string | undefined {
+  if (kind !== 'tool' || !tools || tools.size === 0 || tools.has(target)) return undefined
+  const names = [...tools.keys()].sort()
+  const near = suggestName(target, names)
+  const shown = names.length > 12 ? `${names.slice(0, 12).join(', ')}, ...` : names.join(', ')
+  return `Tool "${target}" is not on the server${near ? `; did you mean "${near}"?` : '.'} Available: ${shown}.`
+}
+
+function callFailedReason(what: string, error: ToolError, toolHint: string | undefined): string {
   if (error.kind === 'timeout' || error.kind === 'transport') return error.message
   if (error.kind === 'tool') {
     return `Tool returned an error at ${what}: ${error.message || '(no text content)'}. Add "expectError" (or an "expect" with "isError": true) if the error is the expected behavior.`
@@ -369,53 +443,39 @@ function callFailedReason(what: string, error: ToolError): string {
         ? `[${code}] `
         : ''
   const hint =
-    code !== undefined
+    toolHint ??
+    (code !== undefined
       ? `Add "expectError": { "code": ${JSON.stringify(code)} } if this error is the expected behavior.`
-      : 'Add "expectError" if this error is the expected behavior.'
+      : 'Add "expectError" if this error is the expected behavior.')
   return `Call failed at ${what}: ${label}${error.message}. ${hint}`
 }
 
-function checkOutputSchema(
-  tool: ToolSummary | undefined,
-  raw: JsonValue,
-  what: string,
-  warnings: string[],
-): Failure | undefined {
-  if (!tool || tool.outputSchema === undefined || !isObject(raw) || raw.isError === true) {
-    return undefined
-  }
+function schemaMismatches(tool: ToolSummary, raw: JsonValue, warnings: string[]): Mismatch[] {
+  if (tool.outputSchema === undefined || !isObject(raw) || raw.isError === true) return []
   const structured = raw.structuredContent
   if (structured === undefined) {
-    return {
-      kind: 'assertion',
-      reason: `Output schema violation at ${what}: structuredContent is missing, but the tool declares an outputSchema. Fix the server, or set "validateOutput": false.`,
-      mismatches: [
-        {
-          path: 'structuredContent',
-          message: 'missing (the tool declares an outputSchema, so results must include it)',
-        },
-      ],
-    }
+    return [
+      {
+        path: 'structuredContent',
+        message: 'missing (the tool declares an outputSchema, so results must include it)',
+        field: 'structuredContent',
+      },
+    ]
   }
   const result = validate(tool.outputSchema, structured)
   if (result.schemaError !== undefined) {
     warnings.push(
       `outputSchema of tool "${tool.name}" could not be compiled (${result.schemaError}); structuredContent was not validated. Run "vib check" for details.`,
     )
-    return undefined
+    return []
   }
-  if (result.ok) return undefined
-  const mismatches: Mismatch[] = result.errors.map((issue) => ({
+  if (result.ok) return []
+  return result.errors.map((issue) => ({
     path: joinPath('structuredContent', issue.path),
     message: `does not match the tool's outputSchema: ${issue.message}`,
     actual: (getPath(structured, issue.path) ?? null) as unknown,
+    field: 'structuredContent' as const,
   }))
-  return {
-    kind: 'assertion',
-    reason: `${summarizeMismatches('Output schema violation', mismatches)}. The outputSchema of ${what} rejects its own structuredContent; fix the server, or set "validateOutput": false.`,
-    mismatches,
-    actual: structured,
-  }
 }
 
 async function callOperation(
@@ -506,10 +566,13 @@ async function evaluateStep(
       step.expect === undefined &&
       step.expectError === undefined
     if (!assertsRequestOnly) {
-      const { text, method } = describeRequests(outcome.requests)
+      const respond = JSON.stringify({
+        ...(step.respond ?? {}),
+        ...suggestRespond(outcome.requests),
+      })
       failures.push({
         kind: 'error',
-        reason: `Unanswered input request at ${what}: the server asked for ${text}. Add "respond": { "${method ?? 'elicitation/create'}": ${exampleAnswer(method)} } to the step, or assert only the request with "expectInputRequired".`,
+        reason: `Unanswered input request at ${what}: the server asked for ${describeRequests(outcome.requests)}. Add to the step: "respond": ${respond} (edit the sample values), or assert only the request with "expectInputRequired".`,
         actual: norm(outcome.requests),
       })
     }
@@ -519,6 +582,7 @@ async function evaluateStep(
     if (rounds.length === 0) {
       failures.push({
         kind: 'assertion',
+        field: 'expectInputRequired',
         reason: `Expected an input request at ${what}, but the server answered without asking (no input_required round). Remove "expectInputRequired", or check the server.`,
         expected: step.expectInputRequired,
       })
@@ -528,6 +592,7 @@ async function evaluateStep(
       if (mismatches.length > 0) {
         failures.push({
           kind: 'assertion',
+          field: 'expectInputRequired',
           reason: `${summarizeMismatches('Input request mismatch', mismatches)} (${what}).`,
           mismatches,
           expected: step.expectInputRequired,
@@ -541,6 +606,7 @@ async function evaluateStep(
     if (outcome.task === undefined) {
       failures.push({
         kind: 'assertion',
+        field: 'expectTask',
         reason: `Expected a task at ${what}, but the server answered directly (tasks need a 2026-07-28 connection and a server that supports the tasks extension).`,
         expected: step.expectTask,
       })
@@ -550,6 +616,7 @@ async function evaluateStep(
       if (mismatches.length > 0) {
         failures.push({
           kind: 'assertion',
+          field: 'expectTask',
           reason: `${summarizeMismatches('Task mismatch', mismatches)} (${what}).`,
           mismatches,
           expected: step.expectTask,
@@ -581,9 +648,15 @@ async function evaluateStep(
               : `no code (${error.kind} error)`
         failures.push({
           kind: 'assertion',
+          field: 'expectError',
           reason: `Error code mismatch at ${what}: expected ${JSON.stringify(expected.code)}, got ${got}. Message: ${error.message}`,
           mismatches: [
-            { path: 'code', message: `expected ${JSON.stringify(expected.code)}, got ${got}` },
+            {
+              path: 'code',
+              message: `expected ${JSON.stringify(expected.code)}, got ${got}`,
+              expected: expected.code,
+              actual: error.codeName ?? error.code,
+            },
           ],
           expected: expected as unknown as JsonValue,
           actual,
@@ -594,6 +667,7 @@ async function evaluateStep(
         if (mismatches.length > 0) {
           failures.push({
             kind: 'assertion',
+            field: 'expectError',
             reason: `Error message mismatch at ${what}: ${mismatches[0].message}.`,
             mismatches: mismatches.map((m) => ({
               ...m,
@@ -613,8 +687,9 @@ async function evaluateStep(
       if (mismatches.length > 0) {
         failures.push({
           kind: 'assertion',
+          field: 'expect',
           golden: true,
-          reason: `${summarizeMismatches('Expectation failed', mismatches)}. Use --update to accept the new output.`,
+          reason: `${summarizeMismatches('Expectation failed', mismatches)}.`,
           mismatches,
           expected: step.expect,
           actual: normalized,
@@ -623,7 +698,7 @@ async function evaluateStep(
     } else {
       failures.push({
         kind: error.kind === 'timeout' ? 'timeout' : 'error',
-        reason: callFailedReason(what, error),
+        reason: callFailedReason(what, error, unknownToolHint(kind, target, ctx.tools)),
         actual: view,
       })
     }
@@ -631,27 +706,43 @@ async function evaluateStep(
     normalized = norm(outcome.result)
     observed = normalized
     captureSource = normalized
+    const raw = outcome.result
+    const isTaskHandle = isObject(raw) && raw.resultType === 'task'
+    const schemaIssues =
+      kind === 'tool' && tool && step.validateOutput !== false && !isTaskHandle
+        ? schemaMismatches(tool, raw, warnings)
+        : []
     if (step.expectError !== undefined) {
+      const violated =
+        schemaIssues.length > 0
+          ? ` and violated its outputSchema at ${schemaIssues[0].path}: ${schemaIssues[0].message.replace(/^does not match the tool's outputSchema: /, '')}`
+          : ''
       failures.push({
         kind: 'assertion',
-        reason: `Expected an error at ${what}, but the call succeeded. Remove "expectError", or fix the server.`,
+        field: 'expectError',
+        reason: `Expected an error at ${what}, but the call succeeded${violated}. Remove "expectError", or fix the server.`,
+        ...(schemaIssues.length > 0 ? { mismatches: schemaIssues } : {}),
         expected: step.expectError as unknown as JsonValue,
         actual: normalized,
       })
     } else {
-      const raw = outcome.result
-      const isTaskHandle = isObject(raw) && raw.resultType === 'task'
-      if (kind === 'tool' && step.validateOutput !== false && !isTaskHandle) {
-        const schemaFailure = checkOutputSchema(tool, raw, what, warnings)
-        if (schemaFailure) failures.push(schemaFailure)
+      if (schemaIssues.length > 0) {
+        failures.push({
+          kind: 'assertion',
+          field: 'structuredContent',
+          reason: `${summarizeMismatches('Output schema violation', schemaIssues)}. The outputSchema of ${what} rejects its own structuredContent; fix the server, or set "validateOutput": false.`,
+          mismatches: schemaIssues,
+          actual: isObject(raw) ? (raw.structuredContent ?? null) : null,
+        })
       }
       if (step.expect !== undefined) {
         const mismatches = matchValue(step.expect, normalized)
         if (mismatches.length > 0) {
           failures.push({
             kind: 'assertion',
+            field: 'expect',
             golden: true,
-            reason: `${summarizeMismatches('Expectation failed', mismatches)}. Use --update to accept the new output.`,
+            reason: `${summarizeMismatches('Expectation failed', mismatches)}.`,
             mismatches,
             expected: step.expect,
             actual: normalized,
@@ -661,14 +752,7 @@ async function evaluateStep(
     }
   }
 
-  return {
-    durationMs: outcome.durationMs,
-    failures,
-    observed,
-    captureSource,
-    normalized,
-    warnings,
-  }
+  return { durationMs: outcome.durationMs, failures, observed, captureSource, normalized, warnings }
 }
 
 function stepRefFor(planned: PlannedStep, index: number): StepRef {
@@ -695,26 +779,194 @@ function stepLabel(planned: PlannedStep, ref: StepRef, plan: PlannedStep[]): str
   return `${phase} ${position}${planned.step.name ? ` "${planned.step.name}"` : ''} (${ref.kind} ${ref.target})`
 }
 
-function updatable(
+// ---------------------------------------------------------------------------
+// --update: leaf-level rewrites
+// ---------------------------------------------------------------------------
+
+interface Blocked {
+  path: string
+  why: 'matcher' | 'placeholder' | 'ref'
+  detail: string
+}
+
+interface Reconciled {
+  value: JsonValue
+  blocked: Blocked[]
+  replaced: string[]
+}
+
+function displayPath(path: string): string {
+  return path === '' ? '(root)' : path
+}
+
+function matcherNames(value: JsonObject): string {
+  return Object.keys(value)
+    .filter((key) => key.startsWith('$'))
+    .join(' + ')
+}
+
+/**
+ * Patch only what mismatches: walk the expectation as written (`src`) alongside its resolved
+ * form (`res`: `$ref`s expanded, `{{captures}}` interpolated) and the actual value. Subtrees
+ * that still match are kept verbatim (matchers included); mismatched plain leaves take the
+ * actual value; mismatched matchers / `$ref`s are blocked, or replaced in `all` mode.
+ */
+function reconcile(
+  src: JsonValue,
+  res: JsonValue,
+  act: JsonValue,
+  path: string,
+  partial: boolean,
+  mode: 'failing' | 'all',
+  out: Reconciled,
+): JsonValue {
+  if (matchValue(res, act, { partial }).length === 0) return src
+  const where = displayPath(path)
+  if (typeof src === 'string' && src.includes('{{')) {
+    out.blocked.push({ path: where, why: 'placeholder', detail: src })
+    return src
+  }
+  if (isObject(src) && Object.hasOwn(src, '$ref')) {
+    if (mode === 'all') {
+      out.replaced.push(`${where} ($ref ${short(src.$ref, 60)})`)
+      return escapeDirectives(act)
+    }
+    out.blocked.push({ path: where, why: 'ref', detail: String(src.$ref) })
+    return src
+  }
+  if (isMatcherObject(src)) {
+    const names = isObject(src) ? matcherNames(src) : 'matcher'
+    if (mode === 'all') {
+      out.replaced.push(`${where} (${names})`)
+      return escapeDirectives(act)
+    }
+    out.blocked.push({ path: where, why: 'matcher', detail: names })
+    return src
+  }
+  if (isObject(src) && isObject(res) && isObject(act)) {
+    const childPartial = typeof src.$partial === 'boolean' ? src.$partial : partial
+    const result: JsonObject = {}
+    for (const key of Object.keys(src)) {
+      if (key === '$partial') {
+        result[key] = src[key]
+        continue
+      }
+      const child = appendKey(path, key)
+      if (!Object.hasOwn(act, key)) {
+        // Gone from the live result: drop it, unless it is a matcher that accepts absence.
+        if (matchValue(res[key] ?? null, undefined, { partial: childPartial }).length === 0) {
+          result[key] = src[key]
+        }
+        continue
+      }
+      result[key] = reconcile(src[key], res[key] ?? null, act[key], child, childPartial, mode, out)
+    }
+    if (!childPartial) {
+      for (const key of Object.keys(act)) {
+        if (!Object.hasOwn(src, key)) result[key] = escapeDirectives(act[key])
+      }
+    }
+    return result
+  }
+  if (Array.isArray(src) && Array.isArray(res) && Array.isArray(act)) {
+    return act.map((item, i) =>
+      i < src.length
+        ? reconcile(src[i], res[i] ?? null, item, appendIndex(path, i), partial, mode, out)
+        : escapeDirectives(item),
+    )
+  }
+  return escapeDirectives(act)
+}
+
+function blockedReason(blocked: Blocked[]): string {
+  const placeholders = blocked.filter((b) => b.why === 'placeholder')
+  if (placeholders.length > 0) {
+    return `${placeholders.map((b) => b.path).join(', ')} uses {{captured}} values (accepting live output would freeze them); edit it by hand`
+  }
+  const refs = blocked.filter((b) => b.why === 'ref')
+  const matchers = blocked.filter((b) => b.why === 'matcher')
+  const parts: string[] = []
+  if (matchers.length > 0) {
+    const list = matchers.map((b) => `${b.path} (${b.detail})`).join(', ')
+    parts.push(
+      `${list} ${matchers.length === 1 ? 'is a matcher that no longer matches' : 'are matchers that no longer match'}; fix the matcher by hand`,
+    )
+  }
+  if (refs.length > 0) {
+    parts.push(
+      `${refs.map((b) => `${b.path} ($ref ${b.detail})`).join(', ')} comes from a shared fragment; edit the fragment`,
+    )
+  }
+  return `${parts.join('; ')}, or rerun with --update=all to replace ${blocked.length === 1 ? 'it' : 'them'} with the literal live value`
+}
+
+interface RewritePlan {
+  ok: boolean
+  /** Why --update cannot (or did not) rewrite this expectation. */
+  why?: string
+  value?: JsonValue
+  replaced?: string[]
+  previous?: JsonValue
+}
+
+function planRewrite(
   ctx: ExecuteContext,
   planned: PlannedStep,
-): { ok: true } | { ok: false; why: string } {
+  resolvedExpect: JsonValue,
+  actual: JsonValue | undefined,
+  mode: 'failing' | 'all',
+): RewritePlan {
+  if (ctx.cannotRewrite) return { ok: false, why: ctx.cannotRewrite }
   if (!ctx.source) return { ok: false, why: 'it is not backed by a case file' }
-  const written = getIn(ctx.source, [...planned.source, 'expect'])
-  if (written === undefined) return { ok: false, why: 'the case file has no "expect" there' }
-  if (hasPlaceholder(written)) {
-    return {
-      ok: false,
-      why: '"expect" uses {{captured}} values; accepting live output would freeze them. Update it by hand',
-    }
+  const written = getIn(ctx.source, [...planned.source, 'expect']) as JsonValue | undefined
+  if (written === undefined || actual === undefined) {
+    return { ok: false, why: 'the case file has no "expect" there' }
   }
-  if (ctx.update !== 'all' && hasDirective(written)) {
-    return {
-      ok: false,
-      why: '"expect" contains matchers ($partial, $regex, $ref, ...); update it by hand, or rerun with --update=all to replace it with the literal output',
-    }
+  const out: Reconciled = { value: null, blocked: [], replaced: [] }
+  out.value = reconcile(written, resolvedExpect, actual, '', false, mode, out)
+  if (out.blocked.length > 0) return { ok: false, why: blockedReason(out.blocked) }
+  return { ok: true, value: out.value, replaced: out.replaced, previous: written }
+}
+
+/** Why --update does not help with a non-`expect` failure. */
+function notRewrittenReason(failure: Failure): string {
+  switch (failure.field) {
+    case 'expectError':
+      return '--update never rewrites "expectError"; edit it by hand (expected vs got is in the mismatch list)'
+    case 'expectInputRequired':
+      return '--update does not rewrite "expectInputRequired"; edit it by hand'
+    case 'expectTask':
+      return '--update does not rewrite "expectTask"; edit it by hand'
+    case 'structuredContent':
+      return 'the server violates its own outputSchema; --update cannot fix that (fix the server, or set "validateOutput": false)'
+    default:
+      if (failure.kind === 'budget')
+        return 'a budget breach is not a golden; raise "budgetMs" or speed up the server'
+      if (failure.kind === 'timeout')
+        return 'the call timed out; --update only rewrites "expect" goldens'
+      return 'the step failed before its "expect" could be compared; --update only rewrites "expect" goldens'
   }
-  return { ok: true }
+}
+
+function annotate(
+  failure: Failure,
+  planned: PlannedStep,
+  stepIndex: number | undefined,
+): Mismatch[] | undefined {
+  if (!failure.mismatches) return undefined
+  return failure.mismatches.map((m) => {
+    const field = m.field ?? failure.field
+    const pointer =
+      field && field !== 'structuredContent'
+        ? toPointer([...planned.source, field, ...matcherPathSegments(m.path)])
+        : undefined
+    return {
+      ...m,
+      ...(field ? { field } : {}),
+      ...(pointer !== undefined ? { pointer } : {}),
+      ...(stepIndex !== undefined ? { stepIndex } : {}),
+    }
+  })
 }
 
 /**
@@ -731,7 +983,10 @@ export async function executeCase(data: TestCase, ctx: ExecuteContext): Promise<
   const updates: ExpectationUpdate[] = []
   const warnings: string[] = []
   const steps: NonNullable<CaseOutcome['steps']> = []
-  let first: { failure: Failure; label: string } | undefined
+  const mode = ctx.update ?? 'off'
+  const hints = ctx.updateHint !== false
+  let first: { failure: Failure; label: string; planned?: PlannedStep; index?: number } | undefined
+  let updateSkipped: string | undefined
   let accepted: { expected?: JsonValue; actual?: JsonValue } | undefined
   let operationsMs = 0
 
@@ -743,11 +998,37 @@ export async function executeCase(data: TestCase, ctx: ExecuteContext): Promise<
       steps.push({ step: ref, durationMs: 0, status: 'skipped', reason: 'an earlier step failed' })
       continue
     }
+
+    let step: Step
+    try {
+      step = interpolateStep(planned.step, scope, planned.at)
+    } catch (err) {
+      if (planned.phase === 'teardown' && err instanceof InterpolationError) {
+        // A capture the teardown needs never happened (its step failed or was skipped).
+        const reason = `skipped: {{${err.placeholder}}} was never captured (an earlier step failed or was skipped)`
+        steps.push({ step: ref, durationMs: 0, status: 'skipped', reason })
+        if (multi) {
+          await ctx.onStepStart?.(ref)
+          await ctx.onStepEnd?.(ref, { durationMs: 0, status: 'skipped', reason })
+        }
+        continue
+      }
+      step = planned.step
+      if (multi) await ctx.onStepStart?.(ref)
+      const failure: Failure = { kind: 'error', reason: errorText(err) }
+      if (!planned.step.ignoreErrors && !first) first = { failure, label, planned, index: i }
+      const status: CaseStatus = 'failed'
+      const reason = planned.step.ignoreErrors
+        ? `ignored (ignoreErrors): ${failure.reason}`
+        : failure.reason
+      steps.push({ step: ref, durationMs: 0, status, reason })
+      if (multi) await ctx.onStepEnd?.(ref, { durationMs: 0, status, reason })
+      continue
+    }
     if (multi) await ctx.onStepStart?.(ref)
 
     let evaluation: StepEvaluation
     try {
-      const step = interpolateStep(planned.step, scope, planned.at)
       const normalize = effectiveNormalize(ctx.normalize, data.normalize, planned.step.normalize)
       evaluation = await evaluateStep(
         { ...step, validateOutput: planned.step.validateOutput ?? data.validateOutput },
@@ -755,35 +1036,44 @@ export async function executeCase(data: TestCase, ctx: ExecuteContext): Promise<
         { ...ctx, timeoutMs: planned.step.timeoutMs ?? data.timeoutMs ?? ctx.timeoutMs },
       )
     } catch (err) {
-      const reason =
-        err instanceof InterpolationError ? err.message : `Step crashed: ${errorText(err)}`
       evaluation = {
         durationMs: 0,
         observed: null,
         warnings: [],
-        failures: [{ kind: 'error', reason }],
+        failures: [{ kind: 'error', reason: `Step crashed: ${errorText(err)}` }],
       }
     }
     warnings.push(...evaluation.warnings)
-    observations.push({ step: ref, observed: evaluation.observed })
+    observations.push({ step: ref, observed: evaluation.observed, planned })
 
-    // --update: accept a plain golden mismatch, keep going with the live value.
+    // Golden mismatch: rewrite it (--update), or say whether --update would.
     let updated = false
     const golden = evaluation.failures.find((f) => f.golden)
-    if (golden && ctx.update && ctx.update !== 'off') {
-      const verdict = updatable(ctx, planned)
-      if (verdict.ok && evaluation.normalized !== undefined) {
-        updates.push({
-          source: [...planned.source, 'expect'],
-          value: escapeDirectives(evaluation.normalized),
-        })
-        accepted ??= { expected: golden.expected, actual: golden.actual }
+    if (golden && step.expect !== undefined) {
+      const rewrite = planRewrite(
+        ctx,
+        planned,
+        step.expect,
+        evaluation.normalized,
+        mode === 'all' ? 'all' : 'failing',
+      )
+      if (mode !== 'off' && rewrite.ok && rewrite.value !== undefined) {
+        updates.push({ source: [...planned.source, 'expect'], value: rewrite.value })
+        accepted ??= { expected: rewrite.previous, actual: rewrite.value }
+        if (rewrite.replaced?.length) {
+          warnings.push(
+            `Updated ${ctx.caseId ?? 'case'}${multi ? ` (${label})` : ''}: replaced ${rewrite.replaced.join(', ')} with literal values (--update=all).`,
+          )
+        }
         evaluation.failures = evaluation.failures.filter((f) => f !== golden)
         updated = true
-      } else if (!verdict.ok) {
-        warnings.push(
-          `Not updating ${ctx.caseId ?? 'case'}${multi ? ` (${label})` : ''}: ${verdict.why}.`,
-        )
+      } else if (mode !== 'off') {
+        golden.reason = `${golden.reason} Not rewritten by --update: ${rewrite.why}.`
+        updateSkipped ??= rewrite.why
+      } else if (hints) {
+        golden.reason = rewrite.ok
+          ? `${golden.reason} Use --update to accept the new output.`
+          : `${golden.reason} --update would not rewrite it: ${rewrite.why}.`
       }
     }
 
@@ -837,7 +1127,7 @@ export async function executeCase(data: TestCase, ctx: ExecuteContext): Promise<
         }
       } else {
         reason = failure.reason
-        if (!first) first = { failure, label }
+        if (!first) first = { failure, label, planned, index: i }
       }
     }
     steps.push({
@@ -877,10 +1167,17 @@ export async function executeCase(data: TestCase, ctx: ExecuteContext): Promise<
     const f = first.failure
     outcome.reason = multi && first.label ? `${first.label}: ${f.reason}` : f.reason
     outcome.errorKind = f.kind
-    if (f.mismatches) outcome.mismatches = f.mismatches
+    const mismatches = first.planned
+      ? annotate(f, first.planned, multi ? first.index : undefined)
+      : f.mismatches
+    if (mismatches) outcome.mismatches = mismatches
     if (f.expected !== undefined) outcome.expected = f.expected
     if (f.actual !== undefined) outcome.actual = f.actual
     if (f.budget) outcome.budget = f.budget
+    if (mode !== 'off') {
+      const why = f.golden ? updateSkipped : notRewrittenReason(f)
+      if (why) outcome.updateSkipped = { reason: why }
+    }
   } else if (accepted) {
     if (accepted.expected !== undefined) outcome.expected = accepted.expected
     if (accepted.actual !== undefined) outcome.actual = accepted.actual
@@ -889,35 +1186,52 @@ export async function executeCase(data: TestCase, ctx: ExecuteContext): Promise<
   return { outcome, observations, updates, warnings, vars }
 }
 
-/** Write accepted goldens back into the case file (2-space JSON, key order kept). */
+/** The indent the file uses (`"  "`, `"    "`, `"\t"`), for rewrites that keep its format. */
+export function detectIndent(text: string | undefined): string | number {
+  const match = /^([ \t]+)["}\]]/m.exec(text ?? '')
+  return match ? match[1] : 2
+}
+
+/** Write accepted goldens back into the case file (its own indent and EOL; key order kept). */
 export function applyUpdates(loaded: LoadedCase, updates: ExpectationUpdate[]): void {
   if (!loaded.source || updates.length === 0) return
   const clone = structuredClone(loaded.source) as unknown as Record<string, unknown>
   for (const update of updates) setIn(clone, update.source, update.value)
   const eol = loaded.text?.includes('\r\n') ? '\r\n' : '\n'
-  const json = JSON.stringify(clone, null, 2).replace(/\n/g, eol)
+  const json = JSON.stringify(clone, null, detectIndent(loaded.text)).replace(/\n/g, eol)
   fs.writeFileSync(loaded.path, `${json}${eol}`, 'utf8')
   loaded.source = clone as unknown as TestCase
+  loaded.text = `${json}${eol}`
 }
 
 // ---------------------------------------------------------------------------
 // Traces
 // ---------------------------------------------------------------------------
 
-/** `cases/echo.basic.json#2` → `cases/echo.basic.run2` (a safe relative path, no extension). */
+/**
+ * Trace file name (relative, no extension) for a case id: `cases/echo.basic.json#2` →
+ * `cases/echo.basic.run2`. Cases outside rootDir (absolute ids) get a flat
+ * `_external/<basename>-<hash>` name instead of mirroring the absolute path.
+ */
 export function traceName(caseId: string): string {
   const hash = caseId.lastIndexOf('#')
   const file = hash === -1 ? caseId : caseId.slice(0, hash)
   const run = hash === -1 ? undefined : caseId.slice(hash + 1)
+  const suffix = run ? `.run${run}` : ''
+  if (/^([A-Za-z]:)?[\\/]/.test(file)) {
+    const base = (file.split(/[\\/]/).pop() ?? 'case')
+      .replace(/\.jsonc?$/i, '')
+      .replace(/[^\w.-]/g, '_')
+    const digest = createHash('sha1').update(file).digest('hex').slice(0, 8)
+    return `_external/${base || 'case'}-${digest}${suffix}`
+  }
   const safe = file
     .replace(/\.jsonc?$/i, '')
-    .replace(/^[A-Za-z]:/, '')
-    .replace(/^\/+/, '')
     .split('/')
     .filter((segment) => segment !== '' && segment !== '.')
     .map((segment) => (segment === '..' ? '_up' : segment.replace(/[<>:"|?*\\#]/g, '_')))
     .join('/')
-  return `${safe || 'case'}${run ? `.run${run}` : ''}`
+  return `${safe || 'case'}${suffix}`
 }
 
 // ---------------------------------------------------------------------------
@@ -943,6 +1257,17 @@ interface ServerState {
   tools?: Map<string, ToolSummary>
 }
 
+/** `session.stdoutNoise` when the session tracks it (feature-detected). */
+function noiseOf(session: McpSession): { lines: number; sample: string[] } | undefined {
+  const noise = (session as unknown as { stdoutNoise?: { lines?: unknown; sample?: unknown } })
+    .stdoutNoise
+  if (!noise || typeof noise.lines !== 'number') return undefined
+  const sample = Array.isArray(noise.sample)
+    ? noise.sample.filter((s): s is string => typeof s === 'string')
+    : []
+  return { lines: noise.lines, sample }
+}
+
 interface BaselineCase {
   failed: boolean
   durationMs: number
@@ -963,6 +1288,8 @@ export class Runner {
   private baselineActive = false
   private stopped = false
   private fatal: Error | undefined
+  /** Every session started per server (restarts included), for the stdout-noise report. */
+  private readonly sessionsByServer = new Map<string, McpSession[]>()
 
   constructor(options: RunnerOptions) {
     this.options = options
@@ -984,7 +1311,8 @@ export class Runner {
       stderr: opts.stderr ?? ((line) => console.error(line)),
     }
     const reporters = [
-      ...createReporters(opts.reporters?.length ? opts.reporters : ['console'], this.ctx),
+      // `reporters: []` means none (e.g. `vib run --json` attaches its own); unset means console.
+      ...createReporters(opts.reporters ?? ['console'], this.ctx),
       ...(opts.extraReporters ?? []),
     ]
     this.reporter = fanout(reporters)
@@ -1051,8 +1379,18 @@ export class Runner {
       servers,
       startedAt,
       ...(repeat > 1 ? { repeat } : {}),
+      ...(opts.shard && opts.shard.total > 1
+        ? { shard: { index: opts.shard.index, total: opts.shard.total } }
+        : {}),
     })
     for (const warning of loaded.warnings) await this.warn(warning)
+    if (loaded.fragments?.length) {
+      const shown = loaded.fragments.slice(0, 5).join(', ')
+      const more = loaded.fragments.length > 5 ? `, +${loaded.fragments.length - 5} more` : ''
+      ;(opts.info ?? this.ctx.stdout)(
+        `info: skipped ${loaded.fragments.length} $ref fragment file(s) matched by the case globs (not cases): ${shown}${more}`,
+      )
+    }
 
     if (repeatIgnored) {
       await this.warn('--update ignores --repeat: each case runs once while goldens are rewritten.')
@@ -1070,8 +1408,10 @@ export class Runner {
       const message =
         loaded.matched === 0
           ? `No test cases matched globs: ${opts.globs.join(', ')} (from ${this.rootDir}). Check "globs" in vibrissa.json or pass --cases <glob>.`
-          : `No test cases left after filters (${filters}): ${loaded.matched} case file(s) matched the globs. Loosen the filters.`
-      await this.warn(message)
+          : `No test cases left after filters (${filters}): ${loaded.matched} case file(s) matched the globs. Check the tag / grep spelling, or loosen the filters (--allow-empty accepts an empty selection).`
+      // Said once: an error (stderr, exit 1) when it fails the run, a warning under allowEmpty.
+      if (opts.allowEmpty) await this.warn(message)
+      else this.ctx.stderr(`error: ${message}`)
       return this.finish(startedAt, opts.allowEmpty, repeat)
     }
 
@@ -1110,6 +1450,9 @@ export class Runner {
           worker.trace?.push(entry)
         },
       })
+      const started = this.sessionsByServer.get(worker.server) ?? []
+      started.push(worker.session)
+      this.sessionsByServer.set(worker.server, started)
     } catch (err) {
       worker.startError = err instanceof Error ? err : new Error(String(err))
       if (err instanceof SessionStartError && err.code === 'config') this.fatal ??= err
@@ -1188,7 +1531,28 @@ export class Runner {
       if (worker.session && !worker.session.closed) await this.suiteTeardown(worker, state)
       await worker.session?.close()
     }
+    await this.warnStdoutNoise(server)
     await this.emit({ type: 'session:end', server })
+  }
+
+  /** stdio servers must keep stdout for JSON-RPC: report stray lines (even without --check). */
+  private async warnStdoutNoise(server: string): Promise<void> {
+    let lines = 0
+    const sample: string[] = []
+    for (const session of this.sessionsByServer.get(server) ?? []) {
+      const noise = noiseOf(session)
+      if (!noise) continue
+      lines += noise.lines
+      sample.push(...noise.sample)
+    }
+    if (lines === 0) return
+    const shown = sample
+      .slice(0, 2)
+      .map((s) => JSON.stringify(s.length > 80 ? `${s.slice(0, 79)}…` : s))
+      .join(', ')
+    await this.warn(
+      `Server "${server}" wrote ${lines} non-JSON-RPC line(s) to stdout${shown ? ` (e.g. ${shown})` : ''}. On stdio, stdout must carry only JSON-RPC: log to stderr instead (vib check: spec/stdout-clean).`,
+    )
   }
 
   private async toolDefinitions(
@@ -1295,7 +1659,15 @@ export class Runner {
     await this.emit({ type: 'case:start', case: run.ref })
     let outcome: CaseOutcome
     if (run.loaded.error) {
-      outcome = { status: 'failed', durationMs: 0, errorKind: 'load', reason: run.loaded.error }
+      outcome = {
+        status: 'failed',
+        durationMs: 0,
+        errorKind: 'load',
+        reason: run.loaded.error,
+        ...(this.options.update || this.options.updateAll
+          ? { updateSkipped: { reason: 'the case did not load; fix the file first' } }
+          : {}),
+      }
     } else if (run.loaded.skip) {
       outcome = { status: 'skipped', durationMs: 0, reason: run.loaded.skip }
     } else {
@@ -1314,21 +1686,20 @@ export class Runner {
     const opts = this.options
     const { loaded, ref } = run
     await this.emit({ type: 'case:start', case: ref })
-    let update: ExecuteContext['update'] = 'off'
-    if (opts.update || opts.updateAll) {
-      if (loaded.text !== undefined && caseFileHasComments(loaded.text)) {
-        await this.warn(
-          `Not updating ${loaded.ref.id}: the file has comments that a rewrite would drop. Update it by hand.`,
-        )
-      } else {
-        update = opts.updateAll ? 'all' : 'failing'
-      }
-    }
+    const update: ExecuteContext['update'] =
+      opts.update || opts.updateAll ? (opts.updateAll ? 'all' : 'failing') : 'off'
+    const cannotRewrite =
+      loaded.text !== undefined && caseFileHasComments(loaded.text)
+        ? 'the file has comments that a rewrite would drop; edit it by hand'
+        : undefined
     worker.trace = []
-    const execution = await executeCase(
-      loaded.data as TestCase,
-      this.executeContext(worker, state, update, loaded, ref),
-    )
+    const execution = await executeCase(loaded.data as TestCase, {
+      ...this.executeContext(worker, state, update, loaded, ref),
+      ...(cannotRewrite ? { cannotRewrite } : {}),
+    })
+    if (update !== 'off' && execution.outcome.updateSkipped) {
+      await this.warn(`Not updating ${loaded.ref.id}: ${execution.outcome.updateSkipped.reason}.`)
+    }
     const trace = worker.trace
     worker.trace = undefined
     for (const warning of execution.warnings) await this.warn(warning)
@@ -1400,12 +1771,7 @@ export class Runner {
     const file = manifestPathFor({ ...opts, rootDir: this.rootDir }, server)
     const exists = lock && fs.existsSync(file)
     if (!exists && !opts.check && !(lock && opts.updateManifest)) {
-      if (lock) {
-        this.manifests.push({ server, path: file, status: 'missing' })
-        await this.warn(
-          `No manifest lock at ${path.relative(this.rootDir, file).replace(/\\/g, '/') || file}${server === opts.defaultServer ? '' : ` for server "${server}"`}. Run "vib manifest record" to pin tools, schemas and descriptions; vib run then fails on drift.`,
-        )
-      }
+      if (lock) await this.missingLock(server, file)
       return undefined
     }
 
@@ -1438,10 +1804,7 @@ export class Runner {
         )
         await this.emit({ type: 'manifest:ok', path: file, server })
       } else {
-        this.manifests.push({ server, path: file, status: 'missing' })
-        await this.warn(
-          `No manifest lock at ${path.relative(this.rootDir, file).replace(/\\/g, '/') || file}. Run "vib manifest record" (or vib run --update-manifest) to pin tools, schemas and descriptions.`,
-        )
+        await this.missingLock(server, file)
       }
       return captured
     }
@@ -1476,15 +1839,50 @@ export class Runner {
     } else {
       const summary = summarizeDiff(diff)
       this.manifests.push({ server, path: file, status: 'diff', diff, summary })
+      // First line: the one-liner; then the rendered drift; then what to do about it.
+      const body = formatDiff(diff).split('\n').slice(1)
+      const record = `vib manifest record${this.serverFlag(server)}`
+      await this.emit({
+        type: 'manifest:diff',
+        path: file,
+        server,
+        summary: [
+          summary,
+          ...body,
+          `Review the change, then accept it with --update-manifest (or "${record}").`,
+        ].join('\n'),
+        diff: diff as unknown as JsonValue,
+      })
+    }
+    return captured
+  }
+
+  /** ` --server <name>` for non-default servers (CLI hints). */
+  private serverFlag(server: string): string {
+    return server === this.options.defaultServer ? '' : ` --server ${server}`
+  }
+
+  private async missingLock(server: string, file: string): Promise<void> {
+    const opts = this.options
+    const shown = path.relative(this.rootDir, file).replace(/\\/g, '/') || file
+    const record = `vib manifest record${this.serverFlag(server)}`
+    const who = server === opts.defaultServer ? '' : ` for server "${server}"`
+    if (opts.requireManifest) {
+      const summary = `No manifest lock at ${shown}${who}, and requireManifest is on. Record it with "${record}" (or vib run --update-manifest), review it, and commit it.`
+      this.manifests.push({ server, path: file, status: 'missing-required', summary })
       await this.emit({
         type: 'manifest:diff',
         path: file,
         server,
         summary,
-        diff: diff as unknown as JsonValue,
+        diff: { error: 'missing', errorKind: 'load', path: shown },
       })
+      return
     }
-    return captured
+    this.manifests.push({ server, path: file, status: 'missing' })
+    await this.warn(
+      `No manifest lock at ${shown}${who}. Run "${record}" (or vib run --update-manifest) to pin tools, schemas and descriptions; vib run then fails on drift.`,
+    )
   }
 
   private async runServerChecks(
@@ -1510,11 +1908,20 @@ export class Runner {
         return
       }
     }
-    const outcomes = runChecks(data.manifest, {
-      toolsListSamples: data.toolsListSamples,
-      allow: this.options.checks?.allow,
-      severity: this.options.checks?.severity,
-    })
+    const config = resolveServerConfig(this.options, server)
+    const noise = noiseOf(session)
+    const outcomes = runChecks(
+      {
+        ...data.manifest,
+        transport: isHttpServerConfig(config) ? 'http' : 'stdio',
+        ...(noise ? { stdoutNoise: noise } : {}),
+      },
+      {
+        toolsListSamples: data.toolsListSamples,
+        allow: this.options.checks?.allow,
+        severity: this.options.checks?.severity,
+      },
+    )
     for (const outcome of outcomes) {
       await this.emit({ type: 'check', outcome: { ...outcome, server } })
     }
@@ -1626,18 +2033,19 @@ export class Runner {
     forcedOk: boolean | undefined,
     repeat: number,
   ): Promise<RunResult> {
-    const count = (status: CaseStatus) =>
-      this.results.filter((r) => r.outcome.status === status).length
+    const verdicts = this.caseVerdicts()
+    // Per execution: with --repeat the status counts sum to `runs` (= total); the per-case
+    // verdict (flaky floors) lives in passRates and run:end.ok. Reporters derive the number
+    // of distinct cases from the case ids.
+    const counts: Record<CaseStatus, number> = { passed: 0, failed: 0, skipped: 0, updated: 0 }
+    for (const { outcome } of this.results) counts[outcome.status]++
     const summary: RunSummary = {
       total: this.results.length,
-      passed: count('passed'),
-      failed: count('failed'),
-      skipped: count('skipped'),
-      updated: count('updated'),
+      ...counts,
       durationMs: Date.now() - startedAt,
     }
-    const verdicts = this.caseVerdicts()
     if (repeat > 1) {
+      summary.runs = this.results.length
       summary.passRates = Object.fromEntries(
         [...verdicts.entries()].sort(([a], [b]) => (a < b ? -1 : 1)).map(([id, v]) => [id, v.rate]),
       )
@@ -1649,7 +2057,9 @@ export class Runner {
         ? this.baselineFailures.size === 0
         : [...verdicts.values()].every((v) => v.ok)
       const checksOk = this.checks.every((c) => c.status !== 'failed')
-      const manifestsOk = this.manifests.every((m) => m.status !== 'diff' && m.status !== 'error')
+      const manifestsOk = this.manifests.every(
+        (m) => m.status !== 'diff' && m.status !== 'error' && m.status !== 'missing-required',
+      )
       ok = casesOk && checksOk && manifestsOk && !this.fatal
     }
     await this.emit({ type: 'run:end', summary, ok })

@@ -12,7 +12,7 @@ export async function promptsCommand(argv: string[]): Promise<number> {
       session.listPromptsResult(),
     )
     if (flags.json) {
-      printJson({ prompts: prompts.items, listMeta: { prompts: prompts.meta } })
+      printJson({ ok: true, prompts: prompts.items, listMeta: { prompts: prompts.meta } })
     } else {
       console.log(formatPromptList(prompts.items, prompts.meta, prompts.note ? [prompts.note] : []))
     }

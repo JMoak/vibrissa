@@ -5,6 +5,7 @@ import {
   type EvaluatedVerdict,
   type FuzzOutcome,
   type GeneratedCase,
+  type InvariantLevel,
   type Strategy,
   canonicalJson,
   createDefaultInvariants,
@@ -18,20 +19,22 @@ import type { McpSession, Outcome } from '../session/index.js'
 import type { JsonValue, TestCase, ToolSummary } from '../types.js'
 import {
   UsageError,
-  closest,
   hasFlag,
   positionals,
   printJson,
   resolvePathFromCwd,
   schemaRefFor,
   slugify,
+  suiteLayout,
   takeAllFlags,
   takeFlag,
   takeNumberFlag,
+  unknownNameError,
   writeJsonFile,
 } from './args.js'
 import { replayCommand } from './call.js'
 import { colors, isObject, plural, preview, renderTable } from './format.js'
+import { inSuite, outsideSuiteNote, suiteDir } from './record.js'
 import { openSessionOptions, parseCommonFlags, startSession } from './resolve.js'
 
 export const DEFAULT_FUZZ_RUNS = 100
@@ -94,7 +97,10 @@ function parseStrategies(argv: string[]): Strategy[] {
     .filter(Boolean)
   for (const s of raw) {
     if (!(ALL_STRATEGIES as readonly string[]).includes(s)) {
-      throw new UsageError(`Unknown --strategy "${s}": expected ${ALL_STRATEGIES.join(', ')}.`)
+      throw new UsageError(`Unknown --strategy "${s}".`, {
+        code: 'invalid-argument',
+        hint: `Use one of ${ALL_STRATEGIES.join(', ')} (repeatable or comma-separated).`,
+      })
     }
   }
   const strategies = raw.length > 0 ? (raw as Strategy[]) : [...DEFAULT_STRATEGIES]
@@ -158,12 +164,57 @@ function tally(
   })
 }
 
+/** A failure's root cause: the invariant plus its detail without case-specific parts. */
+export function rootCauseKey(v: EvaluatedVerdict): string {
+  let detail = v.detail ?? v.title
+  for (let i = 0; i < 3; i++) detail = detail.replace(/\s*\([^()]*\)/g, '')
+  detail = detail
+    .replace(/"[^"]*"|'[^']*'/g, '…')
+    .replace(/\d+ms/g, 'Nms')
+    .replace(/\s+/g, ' ')
+    .trim()
+  return `${v.invariant}: ${detail}`
+}
+
+export interface RootCause {
+  invariant: string
+  level: InvariantLevel
+  /** The shared detail (case-specific parts removed). */
+  summary: string
+  /** Case ids, in generation order. */
+  cases: string[]
+}
+
+export function groupRootCauses(
+  failures: Array<{ r: FuzzCaseReport; failed: EvaluatedVerdict[] }>,
+): RootCause[] {
+  const groups = new Map<string, RootCause>()
+  for (const { r, failed } of failures) {
+    for (const v of failed) {
+      const key = rootCauseKey(v)
+      const group = groups.get(key) ?? {
+        invariant: v.invariant,
+        level: v.level,
+        summary: key.slice(v.invariant.length + 2),
+        cases: [],
+      }
+      if (!group.cases.includes(r.id)) group.cases.push(r.id)
+      groups.set(key, group)
+    }
+  }
+  return [...groups.values()].sort((a, b) =>
+    a.level === b.level ? b.cases.length - a.cases.length : a.level === 'error' ? -1 : 1,
+  )
+}
+
 export async function fuzzCommand(argv: string[]): Promise<number> {
   const [toolName] = positionals(argv)
   if (!toolName) {
-    throw new UsageError(
-      'Missing tool name. Usage: vib fuzz <tool> [--runs 100] [--seed S] [--inject] [--record-failures]. Run vib tools to list tools.',
-    )
+    throw new UsageError('Missing tool name.', {
+      code: 'missing-argument',
+      hint: 'Usage: vib fuzz <tool> [--runs 100] [--seed S] [--inject] [--record-failures]. Run vib tools to list tools.',
+      next: ['vib tools'],
+    })
   }
   const flags = parseCommonFlags(argv)
   const runs = takeNumberFlag(argv, '--runs', { min: 1, integer: true }) ?? DEFAULT_FUZZ_RUNS
@@ -173,9 +224,10 @@ export async function fuzzCommand(argv: string[]): Promise<number> {
   const budgetMs = takeNumberFlag(argv, '--budget', { min: 1 })
   const onlyId = takeFlag(argv, '--id')
   const recordFailures = hasFlag(argv, '--record-failures')
+  const brief = hasFlag(argv, '--brief')
   const acceptToolError = !hasFlag(argv, '--strict-invalid')
   const resolved = openSessionOptions(flags)
-  const { timeoutMs, rootDir } = resolved
+  const { timeoutMs, rootDir, options } = resolved
   const c = colors()
   const progress = !flags.json && Boolean(process.stderr.isTTY)
 
@@ -187,12 +239,11 @@ export async function fuzzCommand(argv: string[]): Promise<number> {
     const toolsBefore = await session.listTools()
     const tool = toolsBefore.find((t) => t.name === toolName)
     if (!tool) {
-      const suggestion = closest(
+      throw unknownNameError(
+        'tool',
         toolName,
         toolsBefore.map((t) => t.name),
-      )
-      throw new UsageError(
-        `Unknown tool "${toolName}" on ${started.serverName}.${suggestion ? ` Did you mean "${suggestion}"?` : ''} Available: ${toolsBefore.map((t) => t.name).join(', ') || 'none'}.`,
+        'vib tools',
       )
     }
     const genOpts = { seed, count: runs, strategies, selfCheck: true }
@@ -201,7 +252,11 @@ export async function fuzzCommand(argv: string[]): Promise<number> {
       const found = findCase(tool.inputSchema, { ...genOpts, id: onlyId })
       if (!found) {
         throw new UsageError(
-          `Case ${onlyId} not found for seed ${JSON.stringify(seedRaw)} with --runs ${runs}. Use the same --seed, --runs (at least as large) and --strategy/--inject flags as the run that reported it.`,
+          `Case ${onlyId} not found for seed ${JSON.stringify(seedRaw)} with --runs ${runs}.`,
+          {
+            code: 'not-found',
+            hint: 'Use the same --seed, --runs (at least as large) and --strategy/--inject flags as the run that reported it.',
+          },
         )
       }
       cases = [found]
@@ -213,9 +268,19 @@ export async function fuzzCommand(argv: string[]): Promise<number> {
       acceptToolError,
       ...(budgetMs !== undefined ? { budgetMs } : {}),
     })
-    const counts = strategies
+    const byStrategy = strategies
       .map((s) => `${s} ${cases.filter((x) => x.strategy === s).length}`)
-      .join(', ')
+      .join(' · ')
+    const expectations: Array<[GeneratedCase['expectation'], string]> = [
+      ['success', 'should succeed'],
+      ['invalid-params', 'should be rejected'],
+      ['any', 'must not crash'],
+    ]
+    const byExpectation = expectations
+      .map(([e, label]) => [cases.filter((x) => x.expectation === e).length, label] as const)
+      .filter(([n]) => n > 0)
+      .map(([n, label]) => `${n} ${label}`)
+      .join(' · ')
     const reproduceBase = [
       'vib',
       'fuzz',
@@ -237,8 +302,11 @@ export async function fuzzCommand(argv: string[]): Promise<number> {
     if (!flags.json) {
       console.log(
         c.bold(`vib fuzz ${toolName}`) +
-          c.dim(` · seed ${JSON.stringify(seedRaw)} · ${plural(cases.length, 'case')} (${counts})`),
+          c.dim(
+            ` · seed ${JSON.stringify(seedRaw)} · ${plural(cases.length, 'case')}: ${byStrategy}`,
+          ),
       )
+      if (!brief) console.log(c.dim(`  by expectation: ${byExpectation}`))
       for (const w of warnings) console.log(c.yellow(`schema: ${w}`))
     }
 
@@ -316,25 +384,36 @@ export async function fuzzCommand(argv: string[]): Promise<number> {
       },
     ]
 
+    const notApplicable = (id: string): string | undefined => {
+      if (id === 'output-matches-output-schema' && tool.outputSchema === undefined)
+        return 'the tool declares no outputSchema'
+      if (id === 'no-echo-of-injection-payload-in-error-message' && !strategies.includes('inject'))
+        return 'only with --inject'
+      return undefined
+    }
     const rows = tally(
       reports,
       invariants.map(({ id, title, level }) => ({ id, title, level })),
-    )
+    ).map((row) => {
+      const na = notApplicable(row.id)
+      return { ...row, applicable: row.passed + row.failed + row.skipped, ...(na ? { na } : {}) }
+    })
     const failures = reports
       .map((r) => ({ r, failed: r.verdicts.filter((v) => !v.ok) }))
       .filter((x) => x.failed.length > 0)
     const errorFailures = failures.filter((x) => x.failed.some((v) => v.level === 'error'))
+    const warnFailures = failures.filter((x) => !errorFailures.includes(x))
+    const causes = groupRootCauses(failures)
     const ok = errorFailures.length === 0 && runChecks.every((check) => check.ok)
 
-    const recorded: string[] = []
+    const recorded: Array<{ path: string; inSuite: boolean }> = []
     if (recordFailures) {
       const outDirFlag = takeFlag(argv, '--out-dir')
-      const outDir = outDirFlag
-        ? resolvePathFromCwd(outDirFlag)
-        : path.join(rootDir, 'tests', 'integration', 'fuzz')
+      const outDir = outDirFlag ? resolvePathFromCwd(outDirFlag) : suiteDir(options, 'fuzz')
+      const { suffix } = suiteLayout(options.globs)
       for (const { r, failed } of errorFailures) {
         const gc = cases.find((x) => x.id === r.id) as GeneratedCase
-        const file = path.join(outDir, `${slugify(tool.name) || 'tool'}-${r.id}.json`)
+        const file = path.join(outDir, `${slugify(tool.name) || 'tool'}-${r.id}${suffix}`)
         const body = fuzzCaseFile(
           tool,
           gc,
@@ -342,9 +421,10 @@ export async function fuzzCommand(argv: string[]): Promise<number> {
           { timeoutMs, budgetMs },
         )
         writeJsonFile(file, { $schema: schemaRefFor(file, rootDir, 'case.schema.json'), ...body })
-        recorded.push(file)
+        recorded.push({ path: file, inSuite: inSuite(file, options) })
       }
     }
+    const outside = recorded.filter((r) => !r.inSuite)
 
     const reproduce = (id?: string) =>
       replayCommand([...reproduceBase, ...(id ? ['--id', id] : [])])
@@ -363,6 +443,7 @@ export async function fuzzCommand(argv: string[]): Promise<number> {
         schemaWarnings: warnings,
         invariants: rows,
         runChecks,
+        rootCauses: causes.map((cause) => ({ ...cause, reproduce: reproduce(cause.cases[0]) })),
         failures: failures.map(({ r, failed }) => ({
           id: r.id,
           strategy: r.strategy,
@@ -373,66 +454,109 @@ export async function fuzzCommand(argv: string[]): Promise<number> {
           failed,
           reproduce: reproduce(r.id),
         })),
-        cases: reports,
+        ...(brief ? {} : { cases: reports }),
         recorded,
+        ...(outside.length > 0 ? { notes: [outsideSuiteNote(outside[0].path, options)] } : {}),
         reproduce: reproduce(),
       })
       return ok ? 0 : 1
     }
 
-    console.log('')
-    console.log(
-      renderTable(
-        [
-          { header: 'INVARIANT' },
-          { header: 'LEVEL' },
-          { header: 'PASS' },
-          { header: 'FAIL', paint: (t) => (t.trim() !== '0' ? c.red(t) : t) },
-          { header: 'SKIP', paint: (t) => c.dim(t) },
-        ],
-        rows.map((row) => [
-          row.id,
-          row.level,
-          String(row.passed),
-          String(row.failed),
-          String(row.skipped),
-        ]),
-      ),
-    )
-    console.log('')
-    console.log(
-      runChecks
-        .map(
-          (check) =>
-            `${check.ok ? c.green('✓') : c.red('✗')} ${check.id}${check.detail ? c.dim(` (${check.detail})`) : ''}`,
-        )
-        .join('   '),
-    )
+    if (!brief) {
+      console.log('')
+      console.log(
+        renderTable(
+          [
+            { header: 'INVARIANT' },
+            { header: 'LEVEL' },
+            { header: 'CASES' },
+            { header: 'PASS' },
+            { header: 'FAIL', paint: (t) => (/^[1-9]/.test(t.trim()) ? c.red(t) : t) },
+            { header: 'SKIP', paint: (t) => c.dim(t) },
+          ],
+          rows
+            .filter((row) => row.id !== 'no-echo-of-injection-payload-in-error-message' || !row.na)
+            .map((row) =>
+              row.na
+                ? [row.id, row.level, 'n/a', '-', '-', c.dim(`(${row.na})`)]
+                : [
+                    row.id,
+                    row.level,
+                    String(row.applicable),
+                    String(row.passed),
+                    String(row.failed),
+                    String(row.skipped),
+                  ],
+            ),
+        ),
+      )
+      console.log('')
+    }
+    const failedChecks = runChecks.filter((check) => !check.ok)
+    if (!brief || failedChecks.length > 0) {
+      console.log(
+        (brief ? failedChecks : runChecks)
+          .map(
+            (check) =>
+              `${check.ok ? c.green('✓') : c.red('✗')} ${check.id}${check.detail ? c.dim(` (${check.detail})`) : ''}`,
+          )
+          .join('   '),
+      )
+    }
     if (restarts > 0)
       console.log(c.yellow(`The server crashed and was restarted ${plural(restarts, 'time')}.`))
-    const show = (title: string, list: typeof failures, paint: (t: string) => string) => {
+    const show = (
+      title: string,
+      list: RootCause[],
+      glyph: string,
+      paint: (t: string) => string,
+    ) => {
       if (list.length === 0) return
+      const total = new Set(list.flatMap((cause) => cause.cases)).size
       console.log('')
-      console.log(paint(c.bold(`${title} (${list.length})`)))
-      for (const { r, failed } of list.slice(0, 10)) {
-        console.log(`  ${paint('✗')} ${c.bold(r.id)}  ${r.reason}`)
-        console.log(`      args: ${preview(r.args, 160)}`)
-        for (const v of failed)
-          console.log(`      ${c.dim(`${v.invariant}:`)} ${v.detail ?? v.title}`)
-        console.log(c.dim(`      reproduce: ${reproduce(r.id)}`))
+      console.log(
+        paint(c.bold(`${title} (${plural(list.length, 'root cause')}, ${plural(total, 'case')})`)),
+      )
+      for (const cause of list.slice(0, 8)) {
+        const example = reports.find((r) => r.id === cause.cases[0]) as FuzzCaseReport
+        const verdict = example.verdicts.find((v) => !v.ok && v.invariant === cause.invariant)
+        console.log(
+          `  ${paint(glyph)} ${c.bold(cause.invariant)} · ${plural(cause.cases.length, 'case')}`,
+        )
+        console.log(`      ${verdict?.detail ?? cause.summary}`)
+        console.log(c.dim(`      e.g. ${example.id}: ${example.reason}`))
+        console.log(c.dim(`           args: ${preview(example.args, 140)}`))
+        console.log(c.dim(`           reproduce: ${reproduce(example.id)}`))
+        if (cause.cases.length > 1) {
+          const others = cause.cases.slice(1, 6)
+          const more = cause.cases.length - 1 - others.length
+          console.log(c.dim(`      also: ${others.join(', ')}${more > 0 ? `, +${more} more` : ''}`))
+        }
       }
-      if (list.length > 10) console.log(c.dim(`  … ${list.length - 10} more (use --json for all)`))
+      if (list.length > 8) console.log(c.dim(`  … ${list.length - 8} more (use --json for all)`))
     }
-    show('Failures', errorFailures, c.red)
+    show(
+      'Failures',
+      causes.filter((cause) => cause.level === 'error'),
+      '✗',
+      c.red,
+    )
     show(
       'Warnings',
-      failures.filter((x) => !errorFailures.includes(x)),
+      causes.filter((cause) => cause.level !== 'error'),
+      '!',
       c.yellow,
     )
-    for (const file of recorded) console.log(`${c.green('wrote')} ${file}`)
+    for (const file of recorded) console.log(`${c.green('wrote')} ${file.path}`)
+    if (outside.length > 0)
+      console.log(c.yellow(`note: ${outsideSuiteNote(outside[0].path, options)}`))
     console.log('')
-    const summary = `${plural(cases.length, 'case')} in ${durationMs}ms · ${plural(errorFailures.length, 'failing case')}`
-    console.log(ok ? c.green(summary) : c.red(summary))
+    const parts = [
+      `${plural(cases.length, 'case')} in ${durationMs}ms`,
+      plural(errorFailures.length, 'failing case'),
+      ...(warnFailures.length > 0 ? [plural(warnFailures.length, 'warning')] : []),
+    ]
+    console.log(ok ? c.green(parts.join(' · ')) : c.red(parts.join(' · ')))
     if (!ok && !recordFailures) {
       console.log(
         c.dim(

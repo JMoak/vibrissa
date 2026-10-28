@@ -2,9 +2,11 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { COMMANDS, main } from '../src/cli'
+import { CASES_CHEATSHEET, COMMANDS, formatGlobalHelp, main } from '../src/cli'
 import {
   UsageError,
+  argsSummary,
+  assertKnownFlags,
   closest,
   flagTokens,
   normalizeArgv,
@@ -13,16 +15,21 @@ import {
   parseRespond,
   parseToolArgs,
   positionals,
+  printJson,
+  pruneEmpty,
   schemaRefFor,
   slugify,
   splitAtDoubleDash,
   splitCommandLine,
   stringifyArgs,
+  suiteLayout,
   takeNumberFlag,
   takeOptionalFlag,
+  uniquePath,
+  unknownNameError,
 } from '../src/cli/args'
 import { help as diffHelpText } from '../src/cli/diff'
-import { describeExpectation, explainCase } from '../src/cli/explain'
+import { describeExpectation, explainCase, weakAssertions } from '../src/cli/explain'
 import {
   acceptedFlags,
   argSummary,
@@ -30,6 +37,7 @@ import {
   sampleRespond,
   schemaTypeLabel,
 } from '../src/cli/format'
+import { groupRootCauses, rootCauseKey } from '../src/cli/fuzz'
 import { ciWorkflow, pyprojectName, serversFromMcpConfig } from '../src/cli/init'
 import { help as manifestHelpText } from '../src/cli/manifest'
 import { looksLikeCase, migrateCase, migrateConfig } from '../src/cli/migrate'
@@ -41,6 +49,8 @@ import {
   parseFlowLine,
 } from '../src/cli/record'
 import { help as runHelpText } from '../src/cli/run'
+import { loosenVolatile, loosenedSummary } from '../src/cli/volatile'
+import { suggestRespond } from '../src/respond-hint'
 import type { JsonValue, Step } from '../src/types'
 
 describe('cli args helpers', () => {
@@ -469,16 +479,13 @@ describe('init helpers', () => {
   it('writes a CI workflow that runs the ci profile with --check and uploads reports on failure', () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vib-ci-'))
     const bare = ciWorkflow(tmp)
-    expect(bare).toContain(
-      'npx --yes --package @jmoak/vibrissa vib run --profile ci --check --reporter console,github,junit,json',
-    )
+    // The ci profile carries --check / reporters / requireManifest; the workflow adds no flags.
+    expect(bare).toContain('- run: npx --yes --package @jmoak/vibrissa vib run --profile ci\n')
     fs.writeFileSync(path.join(tmp, 'package.json'), '{}')
     const node = ciWorkflow(tmp)
     expect(node).toContain('- run: npm ci')
     expect(node).toContain('- run: npm run build --if-present')
-    expect(node).toContain(
-      '- run: npx vib run --profile ci --check --reporter console,github,junit,json',
-    )
+    expect(node).toContain('- run: npx vib run --profile ci\n')
     expect(node).toMatch(/upload-artifact@v4\n {8}if: failure\(\)\n[\s\S]*path: reports\//)
   })
 })
@@ -605,5 +612,271 @@ describe('dispatcher', () => {
     expect(payload.ok).toBe(false)
     expect(payload.error.type).toBe('UsageError')
     expect(payload.error.message).toMatch(/Case file not found/)
+  })
+})
+
+describe('suite layout and naming helpers', () => {
+  it('derives the case directory and suffix from the first positive glob', () => {
+    expect(suiteLayout(['cases/**/*.json', '!cases/**/*.fail.json'])).toEqual({
+      dir: 'cases',
+      suffix: '.json',
+    })
+    expect(suiteLayout(['!x/**', 'tests/integration/**/*.case.json'])).toEqual({
+      dir: 'tests/integration',
+      suffix: '.case.json',
+    })
+    expect(suiteLayout(['**/*.json'])).toEqual({ dir: '.', suffix: '.json' })
+    expect(suiteLayout([])).toEqual({ dir: 'tests/integration', suffix: '.json' })
+  })
+
+  it('deduplicates file names and summarizes args', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vib-uniq-'))
+    const file = path.join(tmp, 'echo.json')
+    expect(uniquePath(file)).toBe(file)
+    fs.writeFileSync(file, '{}')
+    expect(uniquePath(file)).toBe(path.join(tmp, 'echo-2.json'))
+    fs.writeFileSync(path.join(tmp, 'echo-2.json'), '{}')
+    expect(uniquePath(file)).toBe(path.join(tmp, 'echo-3.json'))
+    expect(argsSummary({ text: 'hello', uppercase: true, n: 3 })).toBe(
+      'text=hello uppercase=true n=3',
+    )
+    expect(argsSummary({})).toBe('')
+    expect(pruneEmpty({ a: [], b: { c: [], d: 1 }, e: [1] })).toEqual({ b: { d: 1 }, e: [1] })
+  })
+
+  it('exports the unknown-option / did-you-mean machinery', () => {
+    expect(() => assertKnownFlags(['--json', '--arg', 'x=1'], ['--arg'], 'call')).not.toThrow()
+    let error: UsageError | undefined
+    try {
+      assertKnownFlags(['--valdiate'], ['--validate', '--raw'], 'call')
+    } catch (err) {
+      error = err as UsageError
+    }
+    expect(error).toBeInstanceOf(UsageError)
+    expect(error?.code).toBe('unknown-option')
+    expect(error?.hint).toBe('Did you mean --validate? Run vib call --help for its options.')
+    expect(error?.next).toEqual(['vib call --help'])
+    const missing = unknownNameError('tool', 'ecoh', ['echo', 'fail'], 'vib tools')
+    expect(missing.code).toBe('unknown-tool')
+    expect(missing.hint).toMatch(/^Did you mean "echo"\? Available: echo, fail\./)
+  })
+})
+
+describe('volatile-field loosening', () => {
+  it('replaces timestamps, UUIDs, epoch-ms and embedded values by pattern', () => {
+    const uuid = '4b1d2c3e-1f2a-4b5c-9d8e-0123456789ab'
+    const { value, loosened } = loosenVolatile({
+      content: [{ type: 'text', text: `created ${uuid} at 2026-10-28T12:00:00.000Z` }],
+      structuredContent: {
+        at: '2026-10-28T12:00:00Z',
+        local: '2026-10-28T12:00:00',
+        id: uuid,
+        ms: 1793178451428,
+        small: 42,
+        name: 'stable',
+      },
+    })
+    const sc = (value as Record<string, Record<string, JsonValue>>).structuredContent
+    expect(sc).toEqual({
+      at: { $schema: { type: 'string', format: 'date-time' } },
+      local: { $regex: '^\\d{4}-\\d{2}-\\d{2}T[0-9:.]+$' },
+      id: { $schema: { type: 'string', format: 'uuid' } },
+      ms: { $type: 'integer' },
+      small: 42,
+      name: 'stable',
+    })
+    expect(loosened.map((l) => [l.path, l.reason])).toEqual([
+      ['content[0].text', 'embedded'],
+      ['structuredContent.at', 'date-time'],
+      ['structuredContent.local', 'date-time'],
+      ['structuredContent.id', 'uuid'],
+      ['structuredContent.ms', 'epoch-ms'],
+    ])
+    const text = (value as { content: Array<{ text: { $regex: string } }> }).content[0].text.$regex
+    const re = new RegExp(text)
+    expect(re.test(`created ${uuid} at 2026-10-28T12:00:00.000Z`)).toBe(true)
+    expect(
+      re.test('created 00000000-1111-2222-3333-444444444444 at 2027-01-01T00:00:00.5+02:00'),
+    ).toBe(true)
+    expect(re.test('deleted 00000000-1111-2222-3333-444444444444 at 2027-01-01T00:00:00Z')).toBe(
+      false,
+    )
+  })
+
+  it('loosens values that changed between two calls (stable check)', () => {
+    const { value, loosened } = loosenVolatile(
+      { text: 'call #1 done', n: 3, flag: true, gone: 'x', same: 'y', list: [1, 2] },
+      { text: 'call #2 done', n: 4, flag: false, same: 'y', list: [1, 2, 3] },
+    )
+    const out = value as Record<string, JsonValue>
+    expect(out.n).toEqual({ $type: 'integer' })
+    expect(out.flag).toEqual({ $type: 'boolean' })
+    expect(out.gone).toEqual({ $ignore: true })
+    expect(out.same).toBe('y')
+    expect(out.list).toEqual({ $type: 'array' })
+    const regex = (out.text as { $regex: string }).$regex
+    expect(new RegExp(regex).test('call #99 done')).toBe(true)
+    expect(new RegExp(regex).test('other')).toBe(false)
+    expect(loosened.every((l) => l.reason === 'changed')).toBe(true)
+    expect(loosenedSummary(loosened)).toBe(
+      'loosened 5 volatile fields (text, n, flag, gone, +1 more)',
+    )
+  })
+
+  it('leaves $literal-escaped data alone', () => {
+    const golden = { $literal: { at: '2026-10-28T12:00:00Z' } }
+    expect(loosenVolatile(golden).value).toEqual(golden)
+  })
+})
+
+describe('respond suggestions, root causes, weak assertions', () => {
+  it('suggestRespond answers every method once', () => {
+    expect(
+      suggestRespond({
+        a: {
+          method: 'elicitation/create',
+          params: {
+            requestedSchema: {
+              properties: { n: { type: 'integer', minimum: 2 }, c: { enum: ['x', 'y'] } },
+            },
+          },
+        },
+        b: { method: 'roots/list', params: {} },
+        c: { method: 'sampling/createMessage', params: {} },
+      }),
+    ).toEqual({
+      'elicitation/create': { action: 'accept', content: { n: 2, c: 'x' } },
+      'roots/list': { roots: [] },
+      'sampling/createMessage': {
+        role: 'assistant',
+        content: { type: 'text', text: '...' },
+        model: 'scripted',
+      },
+    })
+  })
+
+  it('groups fuzz failures by root cause', () => {
+    const verdict = (detail: string) => ({
+      ok: false,
+      invariant: 'invalid-args-yield-invalid-params',
+      title: 't',
+      level: 'error' as const,
+      detail,
+    })
+    const report = (id: string, detail: string) => ({
+      r: { id } as never,
+      failed: [verdict(detail)],
+    })
+    const causes = groupRootCauses([
+      report(
+        'a',
+        "invalid args were accepted silently (wrong type for 'x': expected boolean). Validate arguments.",
+      ),
+      report(
+        'b',
+        "invalid args were accepted silently (null for non-nullable 'y'). Validate arguments.",
+      ),
+      report('c', 'invalid args (missing) caused InternalError (-32603): boom'),
+    ])
+    expect(causes.map((cause) => cause.cases)).toEqual([['a', 'b'], ['c']])
+    expect(rootCauseKey(verdict("x (y 'z') more"))).toBe(
+      'invalid-args-yield-invalid-params: x more',
+    )
+  })
+
+  it('flags weak assertions', () => {
+    const flags = weakAssertions({
+      skip: 'later',
+      steps: [
+        { tool: 'a', expectError: {} },
+        { tool: 'b', expect: { $partial: true } },
+        { tool: 'c' },
+        { tool: 'd', expect: {}, validateOutput: false, ignoreErrors: true },
+      ],
+      teardown: [{ tool: 'e', ignoreErrors: true }],
+    })
+    expect(flags.map((f) => `${f.at} ${f.code}`)).toEqual([
+      'case skipped',
+      'step 1 any-error',
+      'step 2 bare-partial',
+      'step 3 no-expectation',
+      'step 4 no-output-validation',
+      'step 4 ignore-errors',
+    ])
+  })
+})
+
+describe('dispatcher --json error contract', () => {
+  const spies: Array<{ mockRestore(): void }> = []
+  afterEach(() => {
+    for (const spy of spies.splice(0)) spy.mockRestore()
+  })
+  function capture() {
+    for (const spy of spies.splice(0)) spy.mockRestore()
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {})
+    spies.push(log, err)
+    return {
+      // biome-ignore lint/suspicious/noExplicitAny: structural assertions
+      json: (): any => JSON.parse(String(log.mock.calls.at(-1)?.[0])),
+      lines: () => log.mock.calls.length,
+      err: () => err.mock.calls.map((c) => String(c[0])).join('\n'),
+    }
+  }
+
+  it.each([
+    [['nope', '--json'], 'unknown-command'],
+    [['tools', '--bogus', '--json'], 'unknown-option'],
+    [['--bogus', '--json'], 'unknown-option'],
+    [['call', 'echo', '--arg', 'text', '--json'], 'invalid-argument'],
+    [['call', 'echo', '--args', '{bad', '--json'], 'invalid-argument'],
+    [['discover', '--protocol', 'bogus', '--json'], 'invalid-argument'],
+    [['discover', '--timeout', 'soon', '--json'], 'invalid-argument'],
+    [['help', 'casez', '--json'], 'unknown-topic'],
+  ])('%j exits 2 with one JSON envelope and nothing on stderr', async (argv, code) => {
+    const io = capture()
+    expect(await main(argv)).toBe(2)
+    expect(io.lines()).toBe(1)
+    const payload = io.json()
+    expect(payload).toMatchObject({ ok: false, error: { type: 'UsageError', code } })
+    expect(typeof payload.error.message).toBe('string')
+    expect(typeof payload.error.hint).toBe('string')
+    expect(io.err()).toBe('')
+  })
+
+  it('bare vib rejects unknown flags like any command', async () => {
+    const io = capture()
+    expect(await main(['--bogus'])).toBe(2)
+    expect(io.err()).toMatch(/Unknown option --bogus for vib run\./)
+  })
+
+  it('vib help cases prints the ~2 KB cheat sheet', async () => {
+    const io = capture()
+    expect(await main(['help', 'cases'])).toBe(0)
+    expect(CASES_CHEATSHEET.length).toBeLessThan(2600)
+    for (const needle of [
+      '"expectError"',
+      '$partial',
+      '"capture"',
+      '"respond"',
+      '"await"',
+      'Examples:',
+    ]) {
+      expect(CASES_CHEATSHEET).toContain(needle)
+    }
+    expect(io.lines()).toBe(1)
+  })
+
+  it('prints compact JSON when stdout is not a terminal', () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    spies.push(log)
+    printJson({ a: [1, 2] })
+    expect(log.mock.calls[0][0]).toBe('{"a":[1,2]}')
+  })
+
+  it('groups setup commands separately', () => {
+    expect(COMMANDS.init.group).toBe('setup')
+    expect(COMMANDS.migrate.group).toBe('setup')
+    expect(formatGlobalHelp()).toMatch(/Setup — [\s\S]*\n {2}init {2,}[\s\S]*\n {2}migrate /)
   })
 })

@@ -17,6 +17,8 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import type { Reporter, ReporterContext, RunEvent } from '../events.js'
+import { createColors } from './ansi.js'
+import { driftDetail } from './manifest.js'
 import {
   type CaseRecord,
   RunCollector,
@@ -26,7 +28,6 @@ import {
   failureText,
   firstLine,
   isErrorOutcome,
-  manifestDiffLines,
   outcomeHeadline,
   resolveOutDir,
   truncate,
@@ -35,7 +36,7 @@ import {
 export const JUNIT_FILE = 'junit.xml'
 
 // Characters outside the XML 1.0 Char production (control chars, lone surrogates, FFFE/FFFF).
-const INVALID_XML_CHARS = /[^\t\n\r -퟿-�\u{10000}-\u{10FFFF}]/gu
+const INVALID_XML_CHARS = /[^\t\n\r\u0020-\uD7FF\uE000-\uFFFD\u{10000}-\u{10FFFF}]/gu
 
 export function stripInvalidXml(text: string): string {
   return text.replace(INVALID_XML_CHARS, '')
@@ -97,7 +98,8 @@ interface Suite {
   name: string
   timestamp?: string
   properties: Array<[string, string]>
-  testcases: string[]
+  /** Each testcase as structural lines; an element may hold multi-line CDATA. */
+  testcases: string[][]
   tests: number
   failures: number
   errors: number
@@ -143,14 +145,15 @@ function renderSuite(suite: Suite, indent: string): string[] {
     }
     lines.push(`${indent}  </properties>`)
   }
-  for (const tc of suite.testcases) lines.push(...tc.split('\n').map((l) => `${indent}  ${l}`))
+  // Indent tag lines only: splitting would inject indentation into CDATA bodies.
+  for (const tc of suite.testcases) lines.push(...tc.map((l) => `${indent}  ${l}`))
   lines.push(`${indent}</testsuite>`)
   return lines
 }
 
-function testcase(head: Array<[string, string | number | undefined]>, body: string[]): string {
-  if (body.length === 0) return `<testcase${attrs(head)}/>`
-  return [`<testcase${attrs(head)}>`, ...body.map((b) => `  ${b}`), '</testcase>'].join('\n')
+function testcase(head: Array<[string, string | number | undefined]>, body: string[]): string[] {
+  if (body.length === 0) return [`<testcase${attrs(head)}/>`]
+  return [`<testcase${attrs(head)}>`, ...body.map((b) => `  ${b}`), '</testcase>']
 }
 
 /** Render junit.xml from a collected run. Pure; exported for reuse/tests. */
@@ -228,9 +231,11 @@ export function buildJunitXml(run: RunCollector, rootDir: string): string {
       suite.tests++
       if (m.status === 'diff') {
         suite.failures++
-        const text = [m.summary ?? 'Manifest drift', '', ...manifestDiffLines(m.diff, 200)].join(
-          '\n',
-        )
+        const detail = driftDetail(m.summary, m.diff, createColors(false), 200)
+        const text = [
+          m.summary ?? 'Manifest drift',
+          ...(detail.length ? ['', ...detail] : []),
+        ].join('\n')
         body.push(
           `<failure${attrs([
             ['message', truncate(firstLine(m.summary ?? 'Manifest drift'), 500)],

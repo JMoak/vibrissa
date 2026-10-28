@@ -48,7 +48,11 @@
       "items": {
         "type": "string"
       },
-      "description": "Dotted manifest paths ignored when diffing against the lock (e.g. \"server.version\", \"tools.*.description\"). Default [\"server.version\"]."
+      "description": "Dotted manifest paths ignored when diffing against the lock (e.g. \"tools.*.description\"). Default [\"server.version\", \"protocolVersion\", \"listMeta\"]: release and protocol-era noise, so one lock serves both eras. `vib manifest diff --strict` compares everything."
+    },
+    "requireManifest": {
+      "type": "boolean",
+      "description": "Fail the run when a server's manifest lock file is missing (instead of warning). Turn it on in CI so an unrecorded surface cannot pass silently. Default false."
     },
     "outDir": {
       "type": "string",
@@ -188,7 +192,11 @@
             "items": {
               "type": "string"
             },
-            "description": "Dotted manifest paths ignored when diffing against the lock (e.g. \"server.version\", \"tools.*.description\"). Default [\"server.version\"]."
+            "description": "Dotted manifest paths ignored when diffing against the lock (e.g. \"tools.*.description\"). Default [\"server.version\", \"protocolVersion\", \"listMeta\"]: release and protocol-era noise, so one lock serves both eras. `vib manifest diff --strict` compares everything."
+          },
+          "requireManifest": {
+            "type": "boolean",
+            "description": "Fail the run when a server's manifest lock file is missing (instead of warning). Turn it on in CI so an unrecorded surface cannot pass silently. Default false."
           },
           "outDir": {
             "type": "string",

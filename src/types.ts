@@ -172,8 +172,13 @@ export interface RunOptions {
   hooks?: SuiteHooks
   /** `vib check` / `--check` tuning: skipped check ids and per-check severity overrides. */
   checks?: { allow?: string[]; severity?: Record<string, 'failed' | 'warned'> }
-  /** Dotted manifest paths ignored by the lock diff. Filled by loadConfig: ["server.version"]. */
+  /**
+   * Dotted manifest paths ignored by the lock diff. Filled by loadConfig:
+   * ["server.version", "protocolVersion", "listMeta"].
+   */
   manifestIgnore?: string[]
+  /** Fail the run when a server's manifest lock file is missing (CI). Default false (warn). */
+  requireManifest?: boolean
   /** Reporter artifact directory (relative to rootDir). Unset unless configured; the runner defaults to "reports". */
   outDir?: string
   /** Directory the config was loaded from; relative paths resolve against it. */

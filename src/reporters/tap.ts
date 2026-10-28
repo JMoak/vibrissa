@@ -8,19 +8,20 @@
  */
 import type { CheckOutcome, Reporter, ReporterContext, RunEvent } from '../events.js'
 import { createColors } from './ansi.js'
+import { driftDetail, isDetailedSummary } from './manifest.js'
 import {
   type CaseRecord,
   RunCollector,
   displayPath,
   firstLine,
   formatPassRate,
-  manifestDiffLines,
   neutralizeWorkflowCommand,
   outcomeHeadline,
   renderDiff,
   serverInfoLabel,
   splitLines,
   stepLabel,
+  updateSkippedReason,
 } from './shared.js'
 
 const serverSuffix = (server?: string) => (server ? ` (${server})` : '')
@@ -115,7 +116,11 @@ export class TapReporter implements Reporter {
           `manifest ${displayPath(event.path, this.ctx.rootDir)}${serverSuffix(event.server)}`,
         )
         break
-      case 'manifest:diff':
+      case 'manifest:diff': {
+        // A multi-line summary already renders the drift; otherwise render it ourselves.
+        const detail = isDetailedSummary(event.summary)
+          ? splitLines(event.summary.trim()).slice(1)
+          : driftDetail(event.summary, event.diff, createColors(false))
         this.point(
           false,
           `manifest drift ${displayPath(event.path, this.ctx.rootDir)}${serverSuffix(event.server)}`,
@@ -123,10 +128,11 @@ export class TapReporter implements Reporter {
           [
             { kind: 'scalar', key: 'message', value: firstLine(event.summary) },
             { kind: 'scalar', key: 'severity', value: 'fail' },
-            { kind: 'block', key: 'diff', lines: manifestDiffLines(event.diff) },
+            ...(detail.length > 0 ? [{ kind: 'block' as const, key: 'diff', lines: detail }] : []),
           ],
         )
         break
+      }
       case 'check':
         this.checkPoint(event.outcome)
         break
@@ -215,6 +221,7 @@ export class TapReporter implements Reporter {
 
     const yaml: YamlEntry[] = [{ kind: 'scalar', key: 'duration_ms', value: outcome.durationMs }]
     if (outcome.status === 'updated') yaml.push({ kind: 'scalar', key: 'status', value: 'updated' })
+    const notUpdated = updateSkippedReason(outcome)
     if (outcome.status === 'failed') {
       yaml.push({ kind: 'scalar', key: 'message', value: outcomeHeadline(outcome) })
       yaml.push({ kind: 'scalar', key: 'severity', value: 'fail' })
@@ -223,6 +230,7 @@ export class TapReporter implements Reporter {
       if (ref.line !== undefined) yaml.push({ kind: 'scalar', key: 'line', value: ref.line })
       if (outcome.errorKind)
         yaml.push({ kind: 'scalar', key: 'error_kind', value: outcome.errorKind })
+      if (notUpdated) yaml.push({ kind: 'scalar', key: 'not_updated', value: notUpdated })
       if (outcome.reason && splitLines(outcome.reason).length > 1) {
         yaml.push({ kind: 'block', key: 'reason', lines: splitLines(outcome.reason) })
       }

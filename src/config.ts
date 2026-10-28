@@ -323,11 +323,76 @@ function describe(value: unknown): string {
   return JSON.stringify(value)
 }
 
+/** Closest known key within edit distance 2 (case-insensitive), for did-you-mean hints. */
+function suggestKey(key: string, known: Iterable<string>): string | undefined {
+  let best: string | undefined
+  let bestScore = Number.POSITIVE_INFINITY
+  const lower = key.toLowerCase()
+  for (const candidate of known) {
+    const score = editDistance(lower, candidate.toLowerCase())
+    if (score < bestScore) {
+      bestScore = score
+      best = candidate
+    }
+  }
+  return bestScore <= 2 ? best : undefined
+}
+
+function editDistance(a: string, b: string): number {
+  const row = Array.from({ length: b.length + 1 }, (_, i) => i)
+  for (let i = 1; i <= a.length; i++) {
+    let prev = row[0]
+    row[0] = i
+    for (let j = 1; j <= b.length; j++) {
+      const tmp = row[j]
+      row[j] = Math.min(row[j] + 1, row[j - 1] + 1, prev + (a[i - 1] === b[j - 1] ? 0 : 1))
+      prev = tmp
+    }
+  }
+  return row[b.length]
+}
+
 class Validator {
+  /** Every problem found so far; loadConfig throws them together (all at once, not just the first). */
+  readonly errors: string[] = []
+
   constructor(
     readonly source: string,
     readonly warnings: string[],
   ) {}
+
+  /** Run one validation; a ConfigError is recorded instead of aborting the whole file. */
+  attempt<T>(fn: () => T): T | undefined {
+    try {
+      return fn()
+    } catch (err) {
+      if (!(err instanceof ConfigError)) throw err
+      this.errors.push(err.message)
+      return undefined
+    }
+  }
+
+  /** An unknown key is an error (it would silently fall back to a default). */
+  unknownKey(
+    at: string,
+    key: string,
+    known: Iterable<string>,
+    docs = 'schema/vibrissa.schema.json',
+  ): void {
+    const near = suggestKey(key, known)
+    this.errors.push(
+      `Unknown config key at ${at ? `${at}.` : ''}${key} (${this.source}):${near ? ` did you mean "${near}"?` : ''} Check spelling against ${docs}.`,
+    )
+  }
+
+  /** Throw every recorded problem as one ConfigError. */
+  throwIfErrors(): void {
+    if (this.errors.length === 0) return
+    if (this.errors.length === 1) throw new ConfigError(this.errors[0])
+    throw new ConfigError(
+      `Invalid config (${this.source}): ${this.errors.length} problems:\n${this.errors.map((e) => `  - ${e}`).join('\n')}`,
+    )
+  }
 
   fail(
     at: string,
@@ -426,8 +491,7 @@ class Validator {
       'spawnTimeoutMs',
     ])
     for (const key of Object.keys(value)) {
-      if (!known.has(key))
-        this.warnings.push(`Unknown config key at ${at}.${key} (${this.source}): ignored.`)
+      if (!known.has(key)) this.unknownKey(at, key, known)
     }
     if (hasUrl) {
       return {
@@ -450,6 +514,10 @@ class Validator {
   /** Partial server entry for profiles (may omit cmd/url to patch fields). */
   serverPatch(value: unknown, at: string): Partial<ServerConfig> {
     if (isPlainObject(value) && value.cmd === undefined && value.url === undefined) {
+      const known = ['args', 'cwd', 'env', 'headers', 'protocol', 'spawnTimeoutMs', 'cmd', 'url']
+      for (const key of Object.keys(value)) {
+        if (!known.includes(key)) this.unknownKey(at, key, known)
+      }
       const out: Record<string, unknown> = {}
       if (value.args !== undefined) out.args = this.strings(value.args, `${at}.args`)
       if (value.cwd !== undefined) out.cwd = this.string(value.cwd, `${at}.cwd`)
@@ -509,9 +577,7 @@ class Validator {
     }
     const out: ChecksOptions = {}
     for (const key of Object.keys(value)) {
-      if (key !== 'allow' && key !== 'severity') {
-        this.warnings.push(`Unknown config key at ${at}.${key} (${this.source}): ignored.`)
-      }
+      if (key !== 'allow' && key !== 'severity') this.unknownKey(at, key, ['allow', 'severity'])
     }
     if (value.allow !== undefined)
       out.allow = this.strings(value.allow, `${at}.allow`, { allowSingle: true })
@@ -601,6 +667,7 @@ interface Layer extends Partial<Omit<RunOptions, 'servers' | 'rootDir'>> {
 const SCALAR_KEYS = new Set([
   'manifest',
   'manifestIgnore',
+  'requireManifest',
   'outDir',
   'timeoutMs',
   'budgetMs',
@@ -617,6 +684,38 @@ const SCALAR_KEYS = new Set([
 
 const IGNORED_KEYS = new Set(['$schema', 'display', 'profiles'])
 
+/** Every top-level config key (for did-you-mean on unknown keys). */
+export const CONFIG_KEYS: readonly string[] = [
+  '$schema',
+  'server',
+  'servers',
+  'defaultServer',
+  'globs',
+  'manifest',
+  'manifestIgnore',
+  'requireManifest',
+  'outDir',
+  'normalize',
+  'timeoutMs',
+  'budgetMs',
+  'failFast',
+  'allowEmpty',
+  'reporters',
+  'tags',
+  'excludeTags',
+  'grep',
+  'repeat',
+  'shard',
+  'concurrency',
+  'update',
+  'trace',
+  'check',
+  'checks',
+  'baseline',
+  'hooks',
+  'profiles',
+]
+
 /** Validate a file/profile object into a Layer. `patch` allows partial server entries (profiles). */
 function toLayer(
   raw: Record<string, unknown>,
@@ -628,90 +727,108 @@ function toLayer(
   const layer: Layer = {}
   for (const [key, value] of Object.entries(raw)) {
     if (value === undefined || IGNORED_KEYS.has(key)) continue
-    switch (key) {
-      case 'server':
-      case 'servers':
-        break
-      case 'defaultServer':
-        layer.defaultServer = v.string(value, at(key))
-        break
-      case 'globs':
-        layer.globs = v.strings(value, at(key), { allowSingle: true })
-        break
-      case 'reporters':
-        layer.reporters = v.strings(value, at(key), { allowSingle: true })
-        break
-      case 'tags':
-      case 'excludeTags':
-        layer[key] = v.strings(value, at(key), { allowSingle: true })
-        break
-      case 'manifest':
-      case 'grep':
-      case 'baseline':
-        layer[key] = v.string(value, at(key))
-        break
-      case 'timeoutMs':
-      case 'budgetMs':
-        layer[key] = v.number(value, at(key))
-        break
-      case 'repeat':
-      case 'concurrency':
-        layer[key] = v.number(value, at(key), { min: 1, integer: true })
-        break
-      case 'failFast':
-      case 'allowEmpty':
-      case 'update':
-      case 'trace':
-      case 'check':
-        layer[key] = v.boolean(value, at(key))
-        break
-      case 'shard':
-        layer.shard = v.shard(value, at(key))
-        break
-      case 'normalize':
-        layer.normalize = v.normalize(value, at(key))
-        break
-      case 'hooks':
-        layer.hooks = v.hooks(value, at(key))
-        break
-      case 'checks':
-        layer.checks = v.checks(value, at(key))
-        break
-      case 'manifestIgnore':
-        layer.manifestIgnore = v.strings(value, at(key), { allowSingle: true })
-        break
-      case 'outDir':
-        layer.outDir = v.string(value, at(key))
-        break
-      default:
-        v.warnings.push(
-          `Unknown config key at ${at(key)} (${v.source}): ignored. Check spelling against schema/vibrissa.schema.json.`,
-        )
-    }
+    v.attempt(() => assignKey(layer, key, value, at, v, prefix))
   }
 
   const servers: Record<string, Partial<ServerConfig>> = {}
   if (raw.server !== undefined) {
-    servers[DEFAULT_SERVER_NAME] = patch
-      ? v.serverPatch(raw.server, at('server'))
-      : v.server(raw.server, at('server'))
+    const entry = v.attempt(() =>
+      patch ? v.serverPatch(raw.server, at('server')) : v.server(raw.server, at('server')),
+    )
+    if (entry) servers[DEFAULT_SERVER_NAME] = entry
   }
   if (raw.servers !== undefined) {
-    if (!isPlainObject(raw.servers))
-      v.fail(at('servers'), 'an object of named servers', raw.servers)
-    for (const [name, entry] of Object.entries(raw.servers)) {
-      if (raw.server !== undefined && name === DEFAULT_SERVER_NAME) {
-        v.warnings.push(
-          `Both server and servers.default are set (${v.source}): servers.default wins.`,
+    if (!isPlainObject(raw.servers)) {
+      v.attempt(() => v.fail(at('servers'), 'an object of named servers', raw.servers))
+    } else {
+      for (const [name, entry] of Object.entries(raw.servers)) {
+        if (raw.server !== undefined && name === DEFAULT_SERVER_NAME) {
+          v.warnings.push(
+            `Both server and servers.default are set (${v.source}): servers.default wins.`,
+          )
+        }
+        const parsed = v.attempt(() =>
+          patch
+            ? v.serverPatch(entry, at(`servers.${name}`))
+            : v.server(entry, at(`servers.${name}`)),
         )
+        if (parsed) servers[name] = parsed
       }
-      servers[name] = patch
-        ? v.serverPatch(entry, at(`servers.${name}`))
-        : v.server(entry, at(`servers.${name}`))
     }
   }
   if (Object.keys(servers).length > 0) layer.servers = servers
   return layer
+}
+
+function assignKey(
+  layer: Layer,
+  key: string,
+  value: unknown,
+  at: (key: string) => string,
+  v: Validator,
+  prefix: string,
+): void {
+  switch (key) {
+    case 'server':
+    case 'servers':
+      break
+    case 'defaultServer':
+      layer.defaultServer = v.string(value, at(key))
+      break
+    case 'globs':
+      layer.globs = v.strings(value, at(key), { allowSingle: true })
+      break
+    case 'reporters':
+      layer.reporters = v.strings(value, at(key), { allowSingle: true })
+      break
+    case 'tags':
+    case 'excludeTags':
+      layer[key] = v.strings(value, at(key), { allowSingle: true })
+      break
+    case 'manifest':
+    case 'grep':
+    case 'baseline':
+      layer[key] = v.string(value, at(key))
+      break
+    case 'timeoutMs':
+    case 'budgetMs':
+      layer[key] = v.number(value, at(key))
+      break
+    case 'repeat':
+    case 'concurrency':
+      layer[key] = v.number(value, at(key), { min: 1, integer: true })
+      break
+    case 'failFast':
+    case 'allowEmpty':
+    case 'update':
+    case 'trace':
+    case 'check':
+      layer[key] = v.boolean(value, at(key))
+      break
+    case 'shard':
+      layer.shard = v.shard(value, at(key))
+      break
+    case 'normalize':
+      layer.normalize = v.normalize(value, at(key))
+      break
+    case 'hooks':
+      layer.hooks = v.hooks(value, at(key))
+      break
+    case 'checks':
+      layer.checks = v.checks(value, at(key))
+      break
+    case 'manifestIgnore':
+      layer.manifestIgnore = v.strings(value, at(key), { allowSingle: true })
+      break
+    case 'outDir':
+      layer.outDir = v.string(value, at(key))
+      break
+    case 'requireManifest':
+      layer.requireManifest = v.boolean(value, at(key))
+      break
+    default:
+      v.unknownKey(prefix, key, CONFIG_KEYS)
+  }
 }
 
 function mergeServerEntry(
@@ -797,6 +914,32 @@ export function loadConfig(cwd: string, input: ResolveOptionsInput = {}): Resolv
   let servers: Record<string, ServerConfig> = fileLayer.servers
     ? (fileLayer.servers as Record<string, ServerConfig>)
     : { ...defaultRunOptions.servers }
+
+  // Every profile is validated (typos in a profile you are not using today still fail), and
+  // a profile may only patch servers that exist (or define them fully with cmd / url).
+  if (rawProfiles !== undefined && !isPlainObject(rawProfiles)) {
+    validator.attempt(() => validator.fail('profiles', 'an object of named profiles', rawProfiles))
+  }
+  for (const [name, raw] of Object.entries(isPlainObject(rawProfiles) ? rawProfiles : {})) {
+    let layer: Layer
+    if (name === input.profile) layer = profileLayer
+    else if (!isPlainObject(raw)) {
+      validator.attempt(() => validator.fail(`profiles.${name}`, 'a profile object', raw))
+      continue
+    } else layer = toLayer(interpolateEnv(raw, env, []), validator, `profiles.${name}`, true)
+    for (const [server, entry] of Object.entries(layer.servers ?? {})) {
+      const defines =
+        (entry as { cmd?: unknown }).cmd !== undefined ||
+        (entry as { url?: unknown }).url !== undefined
+      if (!defines && !Object.hasOwn(servers, server)) {
+        validator.errors.push(
+          `Invalid config at profiles.${name}.servers.${server} (${source}): profile ${name} patches unknown server '${server}'; servers are: ${Object.keys(servers).join(', ') || 'none'}. Fix the name, or give it "cmd" / "url" to define a new server.`,
+        )
+      }
+    }
+  }
+  validator.throwIfErrors()
+
   for (const [name, entry] of Object.entries(profileLayer.servers ?? {})) {
     servers = { ...servers, [name]: mergeServerEntry(servers[name], entry) }
   }

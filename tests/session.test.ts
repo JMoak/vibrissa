@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from 'node:child_process'
 import path from 'node:path'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import {
   type InputResponder,
   McpSession,
@@ -8,6 +8,7 @@ import {
   SessionStartError,
   errorMatchesCode,
   expandUriTemplate,
+  firstMeaningfulStderrLine,
 } from '../src/session/index'
 import type { JsonValue, ServerConfig, TranscriptEntry } from '../src/types'
 
@@ -201,10 +202,12 @@ describe('McpSession (modern era, stdio)', () => {
     expect(missing.error).toMatchObject({
       kind: 'protocol',
       code: -32602,
-      codeName: 'InvalidParams',
+      codeName: 'ResourceNotFound', // canonical on both eras (wire code stays -32602)
       data: { uri: 'fixture://users/404' },
     })
     expect(errorMatchesCode(missing.error, 'ResourceNotFound')).toBe(true)
+    expect(errorMatchesCode(missing.error, 'InvalidParams')).toBe(true)
+    expect(errorMatchesCode(missing.error, -32602)).toBe(true)
   })
 
   it('gets prompts', async () => {
@@ -419,6 +422,57 @@ describe('McpSession (legacy era)', () => {
     expect(textOf(outcome)).toBe('done: sync')
     expect(outcome.task).toBeUndefined()
   })
+
+  it('names resource-not-found ResourceNotFound on legacy too', async () => {
+    const missing = await session.readResource('fixture://users/404')
+    expect(missing.kind === 'error' && missing.error).toMatchObject({
+      kind: 'protocol',
+      codeName: 'ResourceNotFound',
+      data: { uri: 'fixture://users/404' },
+    })
+  })
+})
+
+describe('McpSession stdout pollution and teardown', () => {
+  it('counts non-JSON-RPC stdout lines and reports them', async () => {
+    const seen: string[] = []
+    const noisy = await start(stdio({ args: [ECHO, '--noisy'] }), {
+      onStdoutNoise: (l) => seen.push(l),
+    })
+    try {
+      expect(textOf(await noisy.callTool('echo', { text: 'still works' }))).toBe('still works')
+      expect(noisy.stdoutNoise).toEqual({ lines: 1, sample: ['Starting echo fixture...'] })
+      expect(seen).toEqual(['Starting echo fixture...'])
+    } finally {
+      await noisy.close()
+    }
+    const clean = await start(stdio({ protocol: 'legacy' }))
+    try {
+      await clean.callTool('echo', { text: 'quiet' })
+      expect(clean.stdoutNoise).toEqual({ lines: 0, sample: [] })
+    } finally {
+      await clean.close()
+    }
+  })
+
+  it('close() after a timed-out call kills the hung server promptly', async () => {
+    const session = await start(stdio({ protocol: 'legacy' }))
+    const outcome = await session.callTool('sleep', { ms: 10000 }, { timeoutMs: 100 })
+    expect(outcome.kind === 'error' && outcome.error.kind).toBe('timeout')
+    const started = Date.now()
+    await session.close()
+    expect(Date.now() - started).toBeLessThan(1500)
+    expect(session.closed).toBe(true)
+  })
+
+  it('close() is quick and idempotent for a well-behaved server', async () => {
+    const session = await start(stdio({ protocol: 'legacy' }))
+    await session.callTool('echo', { text: 'bye' })
+    const started = Date.now()
+    await Promise.all([session.close(), session.close()])
+    await session.close()
+    expect(Date.now() - started).toBeLessThan(1500)
+  })
 })
 
 describe('McpSession era probing (protocol: auto)', () => {
@@ -484,6 +538,78 @@ describe('McpSession start failures', () => {
       })
     },
   )
+
+  it('fails fast when `node <entry>` points at a file that does not exist', async () => {
+    const started = Date.now()
+    await expect(
+      start({ cmd: 'node', args: ['--enable-source-maps', 'dist/nope.js'], cwd: FIXTURE_DIR }),
+    ).rejects.toMatchObject({
+      code: 'spawn',
+      message: expect.stringMatching(
+        /File not found: dist\/nope\.js \(resolved .*nope\.js\)\. Run your build, or vib init --server '<cmd>'\./,
+      ),
+    })
+    expect(Date.now() - started).toBeLessThan(500)
+    // `node -e` and resolvable entries without an extension are not flagged
+    const ok = await start({ cmd: 'node', args: ['index'], cwd: FIXTURE_DIR, protocol: 'legacy' })
+    await ok.close()
+  })
+
+  it('suggests an interpreter when the command is a script', async () => {
+    await expect(start({ cmd: ECHO })).rejects.toMatchObject({
+      code: 'spawn',
+      message: expect.stringMatching(
+        /is a script, not an executable\. Did you mean "node .*index\.js"\?/,
+      ),
+    })
+    await expect(start({ cmd: 'server.py', args: ['--port', '0'] })).rejects.toMatchObject({
+      code: 'spawn',
+      message: expect.stringMatching(
+        /File not found: server\.py .*Did you mean "python server\.py --port 0"\?/,
+      ),
+    })
+  })
+
+  it('shows the first meaningful stderr line of an early exit', async () => {
+    await expect(
+      start({ cmd: 'node', args: ['-e', "require('vib-no-such-module-xyz')"], protocol: 'legacy' }),
+    ).rejects.toMatchObject({
+      code: 'exited',
+      message: expect.stringMatching(
+        /Server stderr: Error: Cannot find module 'vib-no-such-module-xyz'/,
+      ),
+    })
+    const nodeTrace = [
+      'node:internal/modules/cjs/loader:1228',
+      '  throw err;',
+      '  ^',
+      '',
+      "Error: Cannot find module 'C:\\app\\dist\\index.js'",
+      '    at Module._resolveFilename (node:internal/modules/cjs/loader:1225:15)',
+      '',
+      'Node.js v24.8.0',
+    ].join('\n')
+    expect(firstMeaningfulStderrLine(nodeTrace)).toBe(
+      "Error: Cannot find module 'C:\\app\\dist\\index.js'",
+    )
+    expect(firstMeaningfulStderrLine('Traceback (most recent call last):\n  File "x.py"')).toBe(
+      'Traceback (most recent call last):',
+    )
+    expect(firstMeaningfulStderrLine('listening on 3000\nshutting down')).toBe('listening on 3000')
+    expect(firstMeaningfulStderrLine('')).toBeUndefined()
+  })
+
+  it('mentions stdout pollution when the handshake fails', async () => {
+    const script = "console.log('hello from stdout'); setInterval(() => {}, 1000)"
+    await expect(
+      start({ cmd: 'node', args: ['-e', script], protocol: 'legacy', spawnTimeoutMs: 600 }),
+    ).rejects.toMatchObject({
+      code: 'timeout',
+      message: expect.stringMatching(
+        /wrote 1 non-JSON-RPC line to stdout \(first: "hello from stdout"\)/,
+      ),
+    })
+  })
 
   it('reports a server that never answers as a spawn timeout', async () => {
     const silent = {
@@ -569,5 +695,27 @@ describe('McpSession over Streamable HTTP', () => {
         /Server connection failed at server url http:\/\/127\.0\.0\.1:9\/mcp/,
       ),
     })
+  })
+
+  it('close() releases every socket to the server (no handles left; safe to process.exit)', async () => {
+    const port = Number(new URL(url).port)
+    const socketsToServer = () =>
+      (process as unknown as { _getActiveHandles(): Array<{ remotePort?: number }> })
+        ._getActiveHandles()
+        .filter((handle) => handle.remotePort === port)
+    // Global fetch (undici) is what left handles closing at exit; the session owns its sockets.
+    const globalFetch = vi.spyOn(globalThis, 'fetch')
+    try {
+      for (const protocol of ['auto', 'legacy'] as const) {
+        const session = await start({ url, protocol })
+        await session.callTool('echo', { text: 'x' })
+        await session.discover()
+        await session.close()
+        expect(socketsToServer()).toEqual([])
+      }
+      expect(globalFetch).not.toHaveBeenCalled()
+    } finally {
+      globalFetch.mockRestore()
+    }
   })
 })

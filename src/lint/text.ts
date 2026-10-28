@@ -122,7 +122,7 @@ export const TAG_TEXT_MARKER = '[invisible tag text]'
 
 /**
  * Normalize model-visible text before pattern matching: drop invisible
- * characters (so "ig​nore" still reads "ignore"), NFKC-fold look-alike
+ * characters (so "ig\u200Bnore" still reads "ignore"), NFKC-fold look-alike
  * forms (fullwidth letters etc.), and append any tag-smuggled ASCII so the
  * phrase rules can see it.
  */

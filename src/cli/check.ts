@@ -5,7 +5,7 @@ import { printJson, takeAllFlags } from './args.js'
 import { colors, plural, renderTable } from './format.js'
 import { loadChecksConfig, openSessionOptions, parseCommonFlags, startSession } from './resolve.js'
 
-export function formatChecks(outcomes: CheckOutcome[], verbose: boolean): string {
+export function formatChecks(outcomes: CheckOutcome[], verbose: boolean, brief = false): string {
   const c = colors()
   const groups: Array<[CheckOutcome['status'], string, (t: string) => string]> = [
     ['failed', 'Failed', c.red],
@@ -15,7 +15,7 @@ export function formatChecks(outcomes: CheckOutcome[], verbose: boolean): string
   const out: string[] = []
   for (const [status, label, paint] of groups) {
     const items = outcomes.filter((o) => o.status === status)
-    if (items.length === 0) continue
+    if (items.length === 0 || (brief && status === 'passed')) continue
     out.push(paint(c.bold(`${label} (${items.length})`)))
     if (status === 'passed' && !verbose) {
       const ids = [...new Set(items.map((o) => o.id))]
@@ -37,7 +37,7 @@ export async function checkCommand(argv: string[]): Promise<number> {
   const flags = parseCommonFlags(argv)
   if (argv.includes('--list')) {
     const checks = listChecks()
-    if (flags.json) printJson({ checks })
+    if (flags.json) printJson({ ok: true, checks })
     else {
       console.log(
         renderTable(
@@ -74,7 +74,9 @@ export async function checkCommand(argv: string[]): Promise<number> {
         protocolVersion: captured.manifest.protocolVersion,
         serverInfo: captured.manifest.server,
         summary,
-        outcomes,
+        outcomes: argv.includes('--brief')
+          ? outcomes.filter((o) => o.status !== 'passed')
+          : outcomes,
       })
     } else {
       const c = colors()
@@ -83,7 +85,7 @@ export async function checkCommand(argv: string[]): Promise<number> {
         .join(' ')
       console.log(c.bold(`vib check · ${who || serverName} · ${captured.manifest.protocolVersion}`))
       console.log('')
-      console.log(formatChecks(outcomes, argv.includes('--verbose')))
+      console.log(formatChecks(outcomes, argv.includes('--verbose'), argv.includes('--brief')))
       console.log('')
       const line = `${plural(summary.failed, 'failed check')}, ${plural(summary.warned, 'warning')}, ${summary.passed} passed`
       console.log(ok ? c.green(line) : c.red(line))

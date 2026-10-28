@@ -15,6 +15,7 @@ import {
   displayPath,
   resolveOutDir,
   toJsonSafe,
+  updateSkippedReason,
 } from './shared.js'
 
 export const RESULTS_FILE = 'results.json'
@@ -31,13 +32,17 @@ export const RESULTS_FILE = 'results.json'
  *   "complete": true,                 // false when the run stopped before run:end
  *   "startedAt": "2026-10-28T12:00:00.000Z",
  *   "finishedAt": "2026-10-28T12:00:01.234Z",   // startedAt + summary.durationMs
+ *   "repeat": 3,                                // run:start.repeat, when > 1
+ *   "shard": { "index": 1, "total": 4 },        // run:start.shard, when sharded
  *   "servers": [{ "name": "local", "era": "modern", "protocolVersion": "2026-07-28",
  *                 "serverInfo": { "name": "echo-server", "version": "1.2.0" } }],
  *   "summary": {
- *     "total": 3, "passed": 1, "failed": 1, "skipped": 1, "updated": 0, "durationMs": 1234,
- *     "repeat": 5,                               // only when run:start announced it
+ *     "total": 3,                                // distinct cases (not runs)
+ *     "runs": 9,                                 // executions; only when repeated
+ *     "passed": 1, "failed": 1, "skipped": 1, "updated": 0,   // per run when repeated
+ *     "durationMs": 1234,
  *     "passRates": { "cases/echo.json": 0.6 },   // only with --repeat > 1
- *     "flaky": ["cases/echo.json"],              // case ids with 0 < pass rate < 1
+ *     "flaky": ["cases/echo.json"],              // 0 < pass rate < 1; omitted when none
  *     "checks": { "passed": 2, "failed": 0, "warned": 1 },
  *     "manifestDrift": 0,
  *     "warnings": 1
@@ -51,7 +56,9 @@ export const RESULTS_FILE = 'results.json'
  *     "status": "failed", "durationMs": 12,
  *     "errorKind": "assertion",        // assertion | error | timeout | budget | load
  *     "reason": "Expectation failed at content[0].text: ...",
- *     "mismatches": [{ "path": "content[0].text", "message": "...", "expected": "A", "actual": "a" }],
+ *     "mismatches": [{ "path": "content[0].text", "message": "...", "expected": "A", "actual": "a",
+ *                      "field": "expect", "pointer": "/steps/1/expect/content/0/text", "stepIndex": 1 }],
+ *     "updateSkipped": { "reason": "expect contains matchers" },   // --update left it alone
  *     "expected": { ... }, "actual": { ... },
  *     "steps": [{ "index": 0, "name": "create", "kind": "tool", "target": "session.create",
  *                 "status": "passed", "durationMs": 5 }],
@@ -66,6 +73,9 @@ export const RESULTS_FILE = 'results.json'
  *   "warnings": ["..."]
  * }
  * ```
+ *
+ * Empty arrays are omitted (`tags`, `summary.flaky`, `checks`, `manifests`, `warnings`);
+ * `servers` and `cases` are always present.
  */
 export interface JsonReport {
   version: 1
@@ -81,15 +91,20 @@ export interface JsonReport {
   startedAt: string | null
   /** ISO 8601, startedAt + summary.durationMs; null if unknown. */
   finishedAt: string | null
+  /** run:start.repeat, when cases were repeated (> 1). */
+  repeat?: number
+  /** run:start.shard, when the run was one shard of several. */
+  shard?: { index: number; total: number }
   servers: JsonServer[]
   summary: JsonSummary
   /** Sorted by caseId, then run. */
   cases: JsonCase[]
-  /** In emission order. */
-  checks: CheckOutcome[]
-  /** One entry per manifest:ok / manifest:diff event (one per server manifest). */
-  manifests: JsonManifest[]
-  warnings: string[]
+  /** In emission order; omitted when no checks ran. */
+  checks?: CheckOutcome[]
+  /** One entry per manifest:ok / manifest:diff event; omitted when no manifest was checked. */
+  manifests?: JsonManifest[]
+  /** Omitted when there were none. */
+  warnings?: string[]
 }
 
 export interface JsonServer {
@@ -101,18 +116,20 @@ export interface JsonServer {
 }
 
 export interface JsonSummary {
+  /** Distinct cases. With --repeat this is not the number of executions (see `runs`). */
   total: number
+  /** Executions (cases x repeat); present only when cases were repeated. */
+  runs?: number
+  /** Status counts; counted per run when repeated, so they sum to `runs`. */
   passed: number
   failed: number
   skipped: number
   updated: number
   durationMs: number
-  /** run:start.repeat, when the runner announced it. */
-  repeat?: number
   /** Pass rate per case id; present only when cases were repeated. */
   passRates?: Record<string, number>
-  /** Case ids (without repeat suffix) whose pass rate is strictly between 0 and 1. */
-  flaky: string[]
+  /** Case ids (without repeat suffix) whose pass rate is strictly between 0 and 1; omitted when none. */
+  flaky?: string[]
   checks: { passed: number; failed: number; warned: number }
   /** Number of manifests that differ from the lock file. */
   manifestDrift: number
@@ -130,7 +147,8 @@ export interface JsonCase {
   /** Case file, forward slashes. */
   file: string
   server: string
-  tags: string[]
+  /** Omitted when the case has no tags. */
+  tags?: string[]
   /** 1-based line of the case in its file, when known. */
   line?: number
   /** The case declared `flaky: true`. */
@@ -141,6 +159,8 @@ export interface JsonCase {
   errorKind?: 'assertion' | 'error' | 'timeout' | 'budget' | 'load'
   reason?: string
   mismatches?: JsonMismatch[]
+  /** Present when --update left this failing golden alone, and why. */
+  updateSkipped?: { reason: string }
   expected?: JsonValue
   actual?: JsonValue
   steps?: JsonStep[]
@@ -156,6 +176,12 @@ export interface JsonMismatch {
   message: string
   expected?: JsonValue
   actual?: JsonValue
+  /** Case field the mismatch belongs to (`expect`, `expectError`, ...). */
+  field?: string
+  /** RFC 6901 pointer into the case file, e.g. `/steps/1/expect/content/0/text`. */
+  pointer?: string
+  /** 0-based step index for flows. */
+  stepIndex?: number
 }
 
 export interface JsonStep {
@@ -193,7 +219,7 @@ function caseToJson(record: CaseRecord, rootDir: string): JsonCase {
     name: ref.name,
     file: displayPath(ref.file, rootDir),
     server: ref.server,
-    tags: [...ref.tags],
+    ...(ref.tags.length > 0 ? { tags: [...ref.tags] } : {}),
     ...(ref.line !== undefined ? { line: ref.line } : {}),
     ...(ref.flaky ? { flaky: true as const } : {}),
     status: outcome.status,
@@ -206,9 +232,14 @@ function caseToJson(record: CaseRecord, rootDir: string): JsonCase {
       const entry: JsonMismatch = { path: m.path, message: m.message }
       if (m.expected !== undefined) entry.expected = toJsonSafe(m.expected)
       if (m.actual !== undefined) entry.actual = toJsonSafe(m.actual)
+      if (m.field !== undefined) entry.field = m.field
+      if (m.pointer !== undefined) entry.pointer = m.pointer
+      if (m.stepIndex !== undefined) entry.stepIndex = m.stepIndex
       return entry
     })
   }
+  const notUpdated = updateSkippedReason(outcome)
+  if (notUpdated !== undefined) out.updateSkipped = { reason: notUpdated }
   if (outcome.expected !== undefined) out.expected = toJsonSafe(outcome.expected)
   if (outcome.actual !== undefined) out.actual = toJsonSafe(outcome.actual)
   if (record.steps.length > 0) {
@@ -240,27 +271,30 @@ export function buildJsonReport(run: RunCollector, rootDir: string): JsonReport 
   const startedAt = iso(run.startedAt)
   const finishedAt =
     run.startedAt !== undefined && run.ended ? iso(run.startedAt + summary.durationMs) : null
+  const repeat = run.repeatInfo()
   const jsonSummary: JsonSummary = {
-    total: summary.total,
+    total: repeat ? repeat.cases : summary.total,
+    ...(repeat ? { runs: repeat.runs } : {}),
     passed: summary.passed,
     failed: summary.failed,
     skipped: summary.skipped,
     updated: summary.updated,
     durationMs: summary.durationMs,
-    ...(run.repeat !== undefined ? { repeat: run.repeat } : {}),
     ...(summary.passRates ? { passRates: { ...summary.passRates } } : {}),
-    flaky,
+    ...(flaky.length > 0 ? { flaky } : {}),
     checks: run.checkCounts(),
     manifestDrift: run.manifestDrift().length,
     warnings: run.warnings.length,
   }
-  return {
+  const report: JsonReport = {
     version: 1,
     generator: 'vibrissa',
     ok: run.ok() && run.ended,
     complete: run.ended,
     startedAt,
     finishedAt,
+    ...(run.repeat !== undefined && run.repeat > 1 ? { repeat: run.repeat } : {}),
+    ...(run.shard ? { shard: { ...run.shard } } : {}),
     servers: run.servers.map((name) => {
       const session = run.sessions.get(name)
       const server: JsonServer = { name }
@@ -271,7 +305,9 @@ export function buildJsonReport(run: RunCollector, rootDir: string): JsonReport 
     }),
     summary: jsonSummary,
     cases: [...run.cases].sort(compareCases).map((c) => caseToJson(c, rootDir)),
-    checks: run.checks.map((c) => {
+  }
+  if (run.checks.length > 0) {
+    report.checks = run.checks.map((c) => {
       const check: CheckOutcome = {
         id: c.id,
         ...(c.server !== undefined ? { server: c.server } : {}),
@@ -280,8 +316,10 @@ export function buildJsonReport(run: RunCollector, rootDir: string): JsonReport 
       }
       if (c.detail !== undefined) check.detail = c.detail
       return check
-    }),
-    manifests: run.manifests.map((m) => {
+    })
+  }
+  if (run.manifests.length > 0) {
+    report.manifests = run.manifests.map((m) => {
       const entry: JsonManifest = {
         path: displayPath(m.path, rootDir),
         ...(m.server !== undefined ? { server: m.server } : {}),
@@ -290,9 +328,10 @@ export function buildJsonReport(run: RunCollector, rootDir: string): JsonReport 
       if (m.summary !== undefined) entry.summary = m.summary
       if (m.diff !== undefined) entry.diff = toJsonSafe(m.diff)
       return entry
-    }),
-    warnings: [...run.warnings],
+    })
   }
+  if (run.warnings.length > 0) report.warnings = [...run.warnings]
+  return report
 }
 
 export class JsonReporter implements Reporter {

@@ -2,11 +2,14 @@ import fs from 'node:fs'
 import path from 'node:path'
 import readline from 'node:readline'
 import type { Readable } from 'node:stream'
+import { resolveCaseFilesSync } from '../cases.js'
 import { escapeDirectives } from '../match.js'
 import { normalizeResult } from '../normalize.js'
+import { suggestRespond } from '../respond-hint.js'
 import {
   type CallOptions,
   type InputResponder,
+  type McpSession,
   type Outcome,
   type ToolError,
   fromJsonRpcError,
@@ -19,11 +22,14 @@ import type {
   ExpectError,
   JsonValue,
   NormalizeConfig,
+  RunOptions,
   Step,
   TestCase,
+  ToolSummary,
 } from '../types.js'
 import {
   UsageError,
+  argsSummary,
   escapeRegex,
   hasFlag,
   parseArgValue,
@@ -35,11 +41,23 @@ import {
   schemaRefFor,
   slugify,
   stringifyArgs,
+  suiteLayout,
   takeAllFlags,
   takeFlag,
+  uniquePath,
   writeJsonFile,
 } from './args.js'
-import { type OpKind, type OpSpec, executeOp, opLabel, parseAwait, replayCommand } from './call.js'
+import {
+  type OpKind,
+  type OpSpec,
+  executeOp,
+  opLabel,
+  parseAwait,
+  replayCommand,
+  resolveTarget,
+  validateStructured,
+  validationSummary,
+} from './call.js'
 import {
   colors,
   firstLine,
@@ -48,9 +66,15 @@ import {
   isObject,
   plural,
   preview,
-  sampleRespond,
 } from './format.js'
-import { mergeCliOptions, openSessionOptions, parseCommonFlags, startSession } from './resolve.js'
+import {
+  caseServerName,
+  mergeCliOptions,
+  openSessionOptions,
+  parseCommonFlags,
+  startSession,
+} from './resolve.js'
+import { type Loosened, VOLATILE_DOCS, loosenVolatile, loosenedSummary } from './volatile.js'
 
 /** Injectable I/O for tests (stdin lines for --flow and MRTR prompts). */
 export interface RecordIo {
@@ -185,6 +209,12 @@ export interface StepOptions {
   partial?: boolean
   respond?: Record<string, JsonValue>
   awaitOpt?: AwaitOptions | true
+  /** Keep every value verbatim (no volatile loosening). */
+  exact?: boolean
+  /** Raw result of an identical second call (stable check). */
+  second?: JsonValue
+  /** Collects what was loosened. */
+  loosened?: Loosened[]
 }
 
 /** Operation fields for a case/step. Prompt args are strings on the wire. */
@@ -238,7 +268,13 @@ export function stepFromObserved(
     step.expectError = expectErrorFrom(observed.error)
     return step
   }
-  const expect = golden(observed.result ?? null, opts.normalize)
+  let expect = golden(observed.result ?? null, opts.normalize)
+  if (!opts.exact) {
+    const second = opts.second !== undefined ? golden(opts.second, opts.normalize) : undefined
+    const loosened = loosenVolatile(expect, second)
+    expect = loosened.value
+    opts.loosened?.push(...loosened.loosened)
+  }
   step.expect = opts.partial ? withPartial(expect, notes) : expect
   return step
 }
@@ -265,7 +301,7 @@ function makeResponder(
     if (!reader?.interactive) return undefined
     const c = colors()
     const suggestion = JSON.stringify(
-      sampleRespond({ request: { method, params } })[method] ?? { action: 'accept' },
+      suggestRespond({ request: { method, params } })[method] ?? { action: 'accept' },
     )
     process.stderr.write(`${c.yellow('⏸ the server asks for input:')}\n`)
     for (const line of formatInputRequests({ request: { method, params } })) {
@@ -402,85 +438,68 @@ export function inferCaptures(steps: Step[], results: Array<JsonValue | undefine
 }
 
 // ---------------------------------------------------------------------------
-// Command
+// Where cases go
 // ---------------------------------------------------------------------------
 
-function parseOp(argv: string[]): OpSpec {
-  const resource = takeFlag(argv, '--resource')
-  const template = takeFlag(argv, '--resource-template')
-  const prompt = takeFlag(argv, '--prompt')
-  const [tool] = positionals(argv)
-  const chosen = [tool, resource, template, prompt].filter((v) => v !== undefined)
-  if (chosen.length === 0) {
-    throw new UsageError(
-      'Nothing to record. Usage: vib record <tool> [--arg k=v] | --resource <uri> | --resource-template <tpl> --arg k=v | --prompt <name> | --flow | --from-tap <file>. Run vib tools to see tool names.',
-    )
-  }
-  if (chosen.length > 1) {
-    throw new UsageError(
-      'Record one operation at a time: pass a tool name OR --resource OR --resource-template OR --prompt (use --flow for several).',
-    )
-  }
-  const args = parseToolArgs(argv)
-  if (resource !== undefined) return { kind: 'resource', target: resource, args: {} }
-  if (template !== undefined) return { kind: 'resourceTemplate', target: template, args }
-  if (prompt !== undefined) return { kind: 'prompt', target: prompt, args }
-  return { kind: 'tool', target: tool as string, args }
-}
-
-function defaultName(op: OpSpec): string {
-  const verb: Record<OpKind, string> = {
-    tool: '',
-    resource: 'read ',
-    resourceTemplate: 'read ',
-    prompt: 'prompt ',
-  }
-  return `${verb[op.kind]}${op.target} recorded`
-}
-
-interface Target {
+export interface CaseTarget {
   rootDir: string
   outPath: string
+  /** The path was derived (not --out), so it may be deduplicated. */
+  derived: boolean
 }
 
-function outPathFor(argv: string[], rootDir: string, name: string, subdir = ''): string {
+/** Default directory for new cases: the first positive config glob's base (+ `subdir`). */
+export function suiteDir(options: Pick<RunOptions, 'globs' | 'rootDir'>, subdir = ''): string {
+  const { dir } = suiteLayout(options.globs)
+  return path.resolve(options.rootDir, dir, subdir)
+}
+
+/** `--out`, else `<suite dir>/<slug(name)><suffix>` (deduplicated). */
+export function caseTarget(
+  argv: string[],
+  options: Pick<RunOptions, 'globs' | 'rootDir'>,
+  name: string,
+  subdir = '',
+): CaseTarget {
   const out = takeFlag(argv, '--out')
-  if (out) return resolvePathFromCwd(out)
-  return path.join(rootDir, 'tests', 'integration', subdir, `${slugify(name) || 'case'}.json`)
+  if (out) return { rootDir: options.rootDir, outPath: resolvePathFromCwd(out), derived: false }
+  const { suffix } = suiteLayout(options.globs)
+  const file = path.join(suiteDir(options, subdir), `${slugify(name) || 'case'}${suffix}`)
+  return { rootDir: options.rootDir, outPath: uniquePath(file, suffix), derived: true }
 }
 
-function refuseOverwrite(file: string, force: boolean): void {
-  if (fs.existsSync(file) && !force) {
-    throw new UsageError(
-      `Refusing to overwrite ${file}: it already exists. Pass --force to replace it, or --out <path>.`,
-    )
+/** Would `vib run` (config globs) pick this file up? */
+export function inSuite(file: string, options: Pick<RunOptions, 'globs' | 'rootDir'>): boolean {
+  const norm = (p: string) =>
+    process.platform === 'win32' ? path.resolve(p).toLowerCase() : path.resolve(p)
+  const target = norm(file)
+  try {
+    return resolveCaseFilesSync(options.globs, options.rootDir).some((f) => norm(f) === target)
+  } catch {
+    return false
   }
 }
 
-function caseHeader(target: Target, name: string, tags: string[]): TestCase {
+export function outsideSuiteNote(file: string, options: Pick<RunOptions, 'globs'>): string {
+  return `${shellPath(file)} is outside the suite globs (${options.globs.join(', ')}), so vib run will not pick it up. Move it under ${suiteLayout(options.globs).dir}/ or add a glob in vibrissa.json.`
+}
+
+function refuseOverwrite(target: CaseTarget, force: boolean): void {
+  if (!target.derived && fs.existsSync(target.outPath) && !force) {
+    throw new UsageError(`Refusing to overwrite ${target.outPath}: it already exists.`, {
+      code: 'file-exists',
+      hint: 'Pass --force to replace it, or a different --out.',
+    })
+  }
+}
+
+function caseHeader(target: CaseTarget, name: string, tags: string[], server?: string): TestCase {
   return {
     $schema: schemaRefFor(target.outPath, target.rootDir, 'case.schema.json'),
     name,
     ...(tags.length > 0 ? { tags } : {}),
+    ...(server ? { server } : {}),
   }
-}
-
-function printNotes(notes: string[], json: boolean): void {
-  if (json) return
-  const c = colors()
-  for (const note of notes) console.log(c.yellow(`note: ${note}`))
-}
-
-function printWritten(file: string, testCase: TestCase, json: boolean, notes: string[]): void {
-  if (json) {
-    printJson({ ok: true, path: file, case: testCase, notes })
-    return
-  }
-  const c = colors()
-  printNotes(notes, false)
-  console.log(`${c.green('wrote')} ${file}`)
-  const shown = shellPath(file)
-  console.log(c.dim(`Next: vib explain ${shown}   ·   vib run --cases ${shown}`))
 }
 
 /** A path for copy-paste hints: cwd-relative with forward slashes, double-quoted if needed. */
@@ -491,9 +510,120 @@ export function shellPath(file: string): string {
   return /\s/.test(shown) ? `"${shown}"` : shown
 }
 
+/** `echo text=hello`, `read fixture://readme`, `prompt greet name=Jo`. */
+export function defaultName(op: OpSpec): string {
+  const verb: Record<OpKind, string> = {
+    tool: '',
+    resource: 'read ',
+    resourceTemplate: 'read ',
+    prompt: 'prompt ',
+  }
+  const summary = op.kind === 'resource' ? '' : argsSummary(op.args)
+  return `${verb[op.kind]}${op.target}${summary ? ` ${summary}` : ''}`
+}
+
+interface WriteResult {
+  path: string
+  inSuite: boolean
+  loosened: Loosened[]
+  notes: string[]
+}
+
+function looseningNote(loosened: Loosened[]): string {
+  return `${loosenedSummary(loosened)}; see ${VOLATILE_DOCS}. Pass --exact to keep values verbatim.`
+}
+
+function finishWrite(
+  target: CaseTarget,
+  testCase: TestCase,
+  options: Pick<RunOptions, 'globs' | 'rootDir'>,
+  loosened: Loosened[],
+  notes: string[],
+): WriteResult {
+  writeJsonFile(target.outPath, testCase)
+  const suite = inSuite(target.outPath, options)
+  if (loosened.length > 0) notes.push(looseningNote(loosened))
+  if (!suite) notes.push(outsideSuiteNote(target.outPath, options))
+  return { path: target.outPath, inSuite: suite, loosened, notes }
+}
+
+function printWritten(result: WriteResult, testCase: TestCase, json: boolean): void {
+  if (json) {
+    printJson({
+      ok: true,
+      path: result.path,
+      inSuite: result.inSuite,
+      case: testCase,
+      ...(result.loosened.length > 0 ? { loosened: result.loosened } : {}),
+      ...(result.notes.length > 0 ? { notes: result.notes } : {}),
+    })
+    return
+  }
+  const c = colors()
+  for (const note of result.notes) console.log(c.yellow(`note: ${note}`))
+  console.log(`${c.green('wrote')} ${result.path}`)
+  const shown = shellPath(result.path)
+  console.log(c.dim(`Next: vib explain ${shown}   ·   vib run --cases ${shown}`))
+}
+
 function unansweredHint(requests: JsonValue, replay: string): string {
-  const respond = JSON.stringify(sampleRespond(requests))
+  const respond = JSON.stringify(suggestRespond(requests))
   return `The server asked for input and no answer was given. Re-run with --respond '${respond}' (e.g. ${replay} --respond '${respond}'), or run in a terminal to answer interactively.`
+}
+
+// ---------------------------------------------------------------------------
+// Command
+// ---------------------------------------------------------------------------
+
+function parseOp(argv: string[]): OpSpec {
+  const resource = takeFlag(argv, '--resource')
+  const template = takeFlag(argv, '--resource-template')
+  const prompt = takeFlag(argv, '--prompt')
+  const [tool] = positionals(argv)
+  const chosen = [tool, resource, template, prompt].filter((v) => v !== undefined)
+  if (chosen.length === 0) {
+    throw new UsageError('Nothing to record.', {
+      code: 'missing-argument',
+      hint: 'Usage: vib record <tool> [--arg k=v] | --resource <uri> | --resource-template <tpl> --arg k=v | --prompt <name> | --flow | --from-tap <file>. Run vib tools to see tool names.',
+      next: ['vib tools'],
+    })
+  }
+  if (chosen.length > 1) {
+    throw new UsageError('Record one operation at a time.', {
+      code: 'invalid-argument',
+      hint: 'Pass a tool name OR --resource OR --resource-template OR --prompt (use --flow for several).',
+    })
+  }
+  const args = parseToolArgs(argv)
+  if (resource !== undefined) return { kind: 'resource', target: resource, args: {} }
+  if (template !== undefined) return { kind: 'resourceTemplate', target: template, args }
+  if (prompt !== undefined) return { kind: 'prompt', target: prompt, args }
+  return { kind: 'tool', target: tool as string, args }
+}
+
+/** Calls that may change server state are not repeated for the stable check. */
+function mayHaveSideEffects(tool: ToolSummary | undefined): boolean {
+  const ann = isObject(tool?.annotations) ? tool.annotations : {}
+  return ann.destructiveHint === true && ann.idempotentHint !== true
+}
+
+/** Repeat the call for the stable check; the raw result, or undefined (with a note). */
+async function secondCall(
+  session: McpSession,
+  op: OpSpec,
+  first: Observed,
+  callOpts: CallOptions,
+  notes: string[],
+): Promise<JsonValue | undefined> {
+  if (first.kind !== 'result') return undefined
+  const outcome = await executeOp(session, op, callOpts)
+  if (outcome.kind !== 'result') {
+    notes.push(
+      `The repeated call (stable check) answered ${outcome.kind}; only pattern-based loosening was applied.`,
+    )
+    return undefined
+  }
+  return outcome.result
 }
 
 export async function recordCommand(argv: string[], io: RecordIo = {}): Promise<number> {
@@ -507,14 +637,19 @@ export async function recordCommand(argv: string[], io: RecordIo = {}): Promise<
   const name = takeFlag(argv, '--name') ?? defaultName(op)
   const tags = takeAllFlags(argv, '--tag')
   const force = hasFlag(argv, '--force')
+  const exact = hasFlag(argv, '--exact')
+  const stableCheck = !exact && !hasFlag(argv, '--no-stable-check')
   const scripted = parseRespond(argv)
   const awaitOpt = parseAwait(argv)
   const resolved = openSessionOptions(flags)
-  const target = { rootDir: resolved.rootDir, outPath: outPathFor(argv, resolved.rootDir, name) }
-  refuseOverwrite(target.outPath, force)
+  const target = caseTarget(argv, resolved.options, name)
+  refuseOverwrite(target, force)
+  const server = caseServerName(flags)
   const { session, options, timeoutMs } = await startSession(flags, {}, resolved)
   const reader = interactive ? new LineReader(stdin, true) : undefined
   try {
+    let tool: ToolSummary | undefined
+    if (!hasFlag(argv, '--expect-missing')) tool = (await resolveTarget(session, op)).tool
     if (!flags.json) console.log(formatCallHeader(opLabel(op), op.args))
     const used: Record<string, JsonValue> = {}
     const callOpts: CallOptions = {
@@ -539,8 +674,43 @@ export async function recordCommand(argv: string[], io: RecordIo = {}): Promise<
       }
       return 1
     }
+    const validation = op.kind === 'tool' ? validateStructured(tool, outcome) : undefined
+    if (
+      validation?.checked &&
+      validation.ok === false &&
+      !hasFlag(argv, '--allow-invalid-output')
+    ) {
+      const message = `Not writing a golden that violates the outputSchema of "${op.target}": ${validationSummary(validation)}.`
+      const hint =
+        'Fix the tool so structuredContent matches its outputSchema, or pass --allow-invalid-output to record it anyway (vib run will still fail it unless the case sets "validateOutput": false).'
+      if (flags.json) {
+        printJson({
+          ok: false,
+          error: { type: 'OutputSchemaViolation', code: 'invalid-output', message, hint },
+          validation,
+        })
+      } else {
+        console.error(colors().red(`✗ ${message}`))
+        console.error(colors().dim(`hint: ${hint}`))
+      }
+      return 1
+    }
     const notes: string[] = []
+    if (validation?.checked && validation.ok === false) {
+      notes.push(`structuredContent violates the outputSchema: ${validationSummary(validation)}.`)
+    }
+    let second: JsonValue | undefined
+    if (stableCheck && observed.kind === 'result') {
+      if (mayHaveSideEffects(tool)) {
+        notes.push(
+          `Stable check skipped: "${op.target}" is annotated destructive, so it was called once. Loosen changing values by hand, or pass --no-stable-check to silence this.`,
+        )
+      } else {
+        second = await secondCall(session, op, observed, { ...callOpts, respond: used }, notes)
+      }
+    }
     const respond = { ...(scripted ?? {}), ...used }
+    const loosened: Loosened[] = []
     const step = stepFromObserved(
       op,
       observed,
@@ -549,6 +719,9 @@ export async function recordCommand(argv: string[], io: RecordIo = {}): Promise<
         partial: hasFlag(argv, '--partial'),
         respond: Object.keys(respond).length > 0 ? respond : undefined,
         awaitOpt,
+        exact,
+        second,
+        loosened,
       },
       notes,
     ) as Step
@@ -562,9 +735,9 @@ export async function recordCommand(argv: string[], io: RecordIo = {}): Promise<
         )
       } else if (step.expect !== undefined) console.log(c.green('Captured result into expect'))
     }
-    const testCase: TestCase = { ...caseHeader(target, name, tags), ...step }
-    writeJsonFile(target.outPath, testCase)
-    printWritten(target.outPath, testCase, Boolean(flags.json), notes)
+    const testCase: TestCase = { ...caseHeader(target, name, tags, server), ...step }
+    const written = finishWrite(target, testCase, options, loosened, notes)
+    printWritten(written, testCase, Boolean(flags.json))
     return 0
   } finally {
     reader?.close()
@@ -585,16 +758,22 @@ export function parseFlowLine(line: string): Step {
       value = JSON.parse(text)
     } catch (err) {
       throw new UsageError(
-        `Invalid flow line (JSON): ${err instanceof Error ? err.message : String(err)}. Expected {"tool": "name", "args": {...}}.`,
+        `Invalid flow line (JSON): ${err instanceof Error ? err.message : String(err)}.`,
+        { code: 'invalid-argument', hint: 'Expected {"tool": "name", "args": {...}}.' },
       )
     }
-    if (!isObject(value)) throw new UsageError('Invalid flow line: expected a JSON object.')
+    if (!isObject(value))
+      throw new UsageError('Invalid flow line: expected a JSON object.', {
+        code: 'invalid-argument',
+        hint: 'Example: {"tool": "echo", "args": {"text": "hi"}}.',
+      })
     const ops = ['tool', 'resource', 'resourceTemplate', 'prompt'].filter(
       (k) => value[k] !== undefined,
     )
     if (ops.length !== 1) {
       throw new UsageError(
-        'Invalid flow line: give exactly one of "tool", "resource", "resourceTemplate", "prompt". Example: {"tool": "echo", "args": {"text": "hi"}}.',
+        'Invalid flow line: give exactly one of "tool", "resource", "resourceTemplate", "prompt".',
+        { code: 'invalid-argument', hint: 'Example: {"tool": "echo", "args": {"text": "hi"}}.' },
       )
     }
     return value as unknown as Step
@@ -608,12 +787,17 @@ export function parseFlowLine(line: string): Step {
     } catch (err) {
       throw new UsageError(
         `Invalid args JSON for ${tool}: ${err instanceof Error ? err.message : String(err)}.`,
+        { code: 'invalid-argument', hint: `Example: ${tool} {"text": "hi"}.` },
       )
     }
   } else {
     for (const pair of rest) {
       const eq = pair.indexOf('=')
-      if (eq <= 0) throw new UsageError(`Invalid arg "${pair}" for ${tool}: expected key=value.`)
+      if (eq <= 0)
+        throw new UsageError(`Invalid arg "${pair}" for ${tool}: expected key=value.`, {
+          code: 'invalid-argument',
+          hint: `Example: ${tool} text=hi.`,
+        })
       args[pair.slice(0, eq)] = parseArgValue(pair.slice(eq + 1))
     }
   }
@@ -634,10 +818,13 @@ async function recordFlow(argv: string[], stdin: Readable, interactive: boolean)
   const name = takeFlag(argv, '--name') ?? 'recorded flow'
   const tags = takeAllFlags(argv, '--tag')
   const force = hasFlag(argv, '--force')
+  const exact = hasFlag(argv, '--exact')
+  const expectMissing = hasFlag(argv, '--expect-missing')
   const scripted = parseRespond(argv)
   const resolved = openSessionOptions(flags)
-  const target = { rootDir: resolved.rootDir, outPath: outPathFor(argv, resolved.rootDir, name) }
-  refuseOverwrite(target.outPath, force)
+  const target = caseTarget(argv, resolved.options, name)
+  refuseOverwrite(target, force)
+  const server = caseServerName(flags)
   const { session, options, timeoutMs } = await startSession(flags, {}, resolved)
   const reader = new LineReader(stdin, interactive)
   const c = colors()
@@ -654,18 +841,21 @@ async function recordFlow(argv: string[], stdin: Readable, interactive: boolean)
     const steps: Step[] = []
     const results: Array<JsonValue | undefined> = []
     const notes: string[] = []
+    const loosened: Loosened[] = []
     while (true) {
       const line = await reader.next(c.cyan(`step ${steps.length + 1}> `))
       if (line === undefined || line.trim() === '') break
       let input: Step
+      let op: OpSpec
       try {
         input = parseFlowLine(line)
+        op = opFromStep(input)
+        if (!expectMissing) await resolveTarget(session, op)
       } catch (err) {
         if (!interactive) throw err
         say(c.red(err instanceof Error ? err.message : String(err)))
         continue
       }
-      const op = opFromStep(input)
       const used: Record<string, JsonValue> = {}
       const stepScripted = {
         ...(scripted ?? {}),
@@ -682,7 +872,7 @@ async function recordFlow(argv: string[], stdin: Readable, interactive: boolean)
       })
       const observed = observedFromOutcome(outcome)
       if (observed.kind === 'input_required') {
-        const hint = `Step ${steps.length + 1} (${opLabel(op)}) needs input. Add "respond" to that line, e.g. ${JSON.stringify({ ...input, respond: sampleRespond(observed.requests ?? null) })}`
+        const hint = `Step ${steps.length + 1} (${opLabel(op)}) needs input. Add "respond" to that line, e.g. ${JSON.stringify({ ...input, respond: suggestRespond(observed.requests ?? null) })}`
         if (!interactive) {
           if (flags.json)
             printJson({
@@ -705,6 +895,7 @@ async function recordFlow(argv: string[], stdin: Readable, interactive: boolean)
         continue
       }
       const respond = { ...((input.respond ?? {}) as Record<string, JsonValue>), ...used }
+      // Flows are stateful: steps are never repeated, so only pattern loosening applies.
       const step = stepFromObserved(
         op,
         observed,
@@ -712,6 +903,8 @@ async function recordFlow(argv: string[], stdin: Readable, interactive: boolean)
           normalize: options.normalize,
           respond: Object.keys(respond).length > 0 ? respond : undefined,
           awaitOpt,
+          exact,
+          loosened,
         },
         notes,
       ) as Step
@@ -733,14 +926,15 @@ async function recordFlow(argv: string[], stdin: Readable, interactive: boolean)
       say(`  ${c.dim(`#${steps.length}`)} ${opLabel(op)}: ${status}`)
     }
     if (steps.length === 0) {
-      throw new UsageError(
-        'No steps recorded: the input was empty. Pipe NDJSON lines like {"tool": "echo", "args": {"text": "hi"}}, or run in a terminal.',
-      )
+      throw new UsageError('No steps recorded: the input was empty.', {
+        code: 'missing-argument',
+        hint: 'Pipe NDJSON lines like {"tool": "echo", "args": {"text": "hi"}}, or run in a terminal.',
+      })
     }
     if (!hasFlag(argv, '--no-capture')) notes.push(...inferCaptures(steps, results))
-    const testCase: TestCase = { ...caseHeader(target, name, tags), steps }
-    writeJsonFile(target.outPath, testCase)
-    printWritten(target.outPath, testCase, Boolean(flags.json), notes)
+    const testCase: TestCase = { ...caseHeader(target, name, tags, server), steps }
+    const written = finishWrite(target, testCase, options, loosened, notes)
+    printWritten(written, testCase, Boolean(flags.json))
     return 0
   } finally {
     reader.close()
@@ -785,17 +979,26 @@ function opFromTap(call: TapCall): OpSpec {
   return { kind: 'tool', target: call.target, args: call.args }
 }
 
+/** ok | error | no response, as `--from-tap` lists it (isError results count as errors). */
+export function tapCallStatus(call: TapCall): 'ok' | 'error' | 'no response' {
+  if (call.incomplete) return 'no response'
+  if (call.error !== undefined) return 'error'
+  if (isObject(call.result) && call.result.isError === true) return 'error'
+  return 'ok'
+}
+
 function tapListing(calls: TapCall[]): string {
   const c = colors()
   if (calls.length === 0)
     return 'No tools/call, resources/read or prompts/get entries in this capture.'
   return calls
     .map((call) => {
+      const status = tapCallStatus(call)
       const outcome =
-        call.error !== undefined
+        status === 'error'
           ? c.red('error')
-          : call.incomplete
-            ? c.yellow('no response')
+          : status === 'no response'
+            ? c.yellow(status)
             : c.green('ok')
       const extras = [
         Object.keys(call.respond).length > 0 ? 'answered input' : '',
@@ -809,9 +1012,10 @@ function tapListing(calls: TapCall[]): string {
 async function recordFromTap(argv: string[]): Promise<number> {
   const file = resolvePathFromCwd(takeFlag(argv, '--from-tap') as string)
   if (!fs.existsSync(file)) {
-    throw new UsageError(
-      `Tap capture not found: ${file}. Captures are written by vib tap (default reports/tap/*.ndjson).`,
-    )
+    throw new UsageError(`Tap capture not found: ${file}.`, {
+      code: 'not-found',
+      hint: 'Captures are written by vib tap (default reports/tap/*.ndjson).',
+    })
   }
   const flags = parseCommonFlags(argv)
   const { entries, badLines } = readTapFile(file)
@@ -824,7 +1028,13 @@ async function recordFromTap(argv: string[]): Promise<number> {
       printJson({
         ok: true,
         source: file,
-        calls: calls.map(({ index, method, target, args }) => ({ index, method, target, args })),
+        calls: calls.map(({ index, method, target, args }, i) => ({
+          index,
+          method,
+          target,
+          args,
+          status: tapCallStatus(calls[i]),
+        })),
         written: [],
         hint,
       })
@@ -837,23 +1047,26 @@ async function recordFromTap(argv: string[]): Promise<number> {
   }
   const { picked, unmatched } = selectCalls(calls, selectors)
   if (unmatched.length > 0) {
-    throw new UsageError(
-      `--select matched nothing for: ${unmatched.join(', ')}. ${calls.length} call(s) available; run vib record --from-tap ${file} to list them.`,
-    )
+    throw new UsageError(`--select matched nothing for: ${unmatched.join(', ')}.`, {
+      code: 'invalid-argument',
+      hint: `${calls.length} call(s) available; run vib record --from-tap ${shellPath(file)} to list them.`,
+    })
   }
   // Normalization config comes from the project config (no server is started).
   const options = mergeCliOptions(flags)
   const rootDir = options.rootDir
   const force = hasFlag(argv, '--force')
+  const exact = hasFlag(argv, '--exact')
   const tags = takeAllFlags(argv, '--tag')
+  const server = caseServerName(flags)
   const outDirFlag = takeFlag(argv, '--out-dir')
-  const outDir = outDirFlag
-    ? resolvePathFromCwd(outDirFlag)
-    : path.join(rootDir, 'tests', 'integration', 'tap')
+  const outDir = outDirFlag ? resolvePathFromCwd(outDirFlag) : suiteDir(options, 'tap')
+  const { suffix } = suiteLayout(options.globs)
   const single = picked.length === 1
-  const written: Array<{ path: string; index: number; case: TestCase }> = []
+  const written: Array<{ path: string; index: number; inSuite: boolean; case: TestCase }> = []
   const skipped: Array<{ index: number; reason: string }> = []
   const notes: string[] = []
+  const loosened: Loosened[] = []
   for (const call of picked) {
     if (call.incomplete) {
       skipped.push({
@@ -864,15 +1077,16 @@ async function recordFromTap(argv: string[]): Promise<number> {
     }
     const op = opFromTap(call)
     const name =
-      (single ? takeFlag(argv, '--name') : undefined) ?? `${call.target} (tap #${call.index})`
+      (single ? takeFlag(argv, '--name') : undefined) ?? `${defaultName(op)} (tap #${call.index})`
     const outPath =
       single && takeFlag(argv, '--out')
         ? resolvePathFromCwd(takeFlag(argv, '--out') as string)
-        : path.join(outDir, `${slugify(call.target) || 'call'}-${call.index}.json`)
+        : path.join(outDir, `${slugify(call.target) || 'call'}-${call.index}${suffix}`)
     if (fs.existsSync(outPath) && !force) {
       skipped.push({ index: call.index, reason: `${outPath} exists (pass --force to replace)` })
       continue
     }
+    const callLoosened: Loosened[] = []
     const step = stepFromObserved(
       op,
       observedFromTap(call),
@@ -881,25 +1095,44 @@ async function recordFromTap(argv: string[]): Promise<number> {
         partial: hasFlag(argv, '--partial'),
         respond: Object.keys(call.respond).length > 0 ? call.respond : undefined,
         awaitOpt: call.taskAwaited ? true : undefined,
+        exact,
+        loosened: callLoosened,
       },
       notes,
     ) as Step
     if (call.taskAwaited) step.await = true
+    const target: CaseTarget = { rootDir, outPath, derived: false }
     const testCase: TestCase = {
-      ...caseHeader({ rootDir, outPath }, name, tags.length > 0 ? tags : ['tap']),
+      ...caseHeader(target, name, tags.length > 0 ? tags : ['tap'], server),
       ...step,
     }
     writeJsonFile(outPath, testCase)
-    written.push({ path: outPath, index: call.index, case: testCase })
+    loosened.push(...callLoosened.map((l) => ({ ...l, path: `#${call.index} ${l.path}` })))
+    written.push({
+      path: outPath,
+      index: call.index,
+      inSuite: inSuite(outPath, options),
+      case: testCase,
+    })
   }
   if (badLines.length > 0)
     notes.push(
       `Skipped ${plural(badLines.length, 'unreadable line')} in the capture (lines ${badLines.slice(0, 5).join(', ')}).`,
     )
+  if (loosened.length > 0) notes.push(looseningNote(loosened))
+  const outside = written.filter((w) => !w.inSuite)
+  if (outside.length > 0) notes.push(outsideSuiteNote(outside[0].path, options))
   if (flags.json) {
-    printJson({ ok: written.length > 0, source: file, written, skipped, notes })
+    printJson({
+      ok: written.length > 0,
+      source: file,
+      written,
+      ...(skipped.length > 0 ? { skipped } : {}),
+      ...(loosened.length > 0 ? { loosened } : {}),
+      ...(notes.length > 0 ? { notes } : {}),
+    })
   } else {
-    printNotes(notes, false)
+    for (const note of notes) console.log(c.yellow(`note: ${note}`))
     for (const w of written) console.log(`${c.green('wrote')} ${w.path} ${c.dim(`(#${w.index})`)}`)
     for (const s of skipped) console.log(`${c.yellow('skipped')} #${s.index}: ${s.reason}`)
     if (written.length > 0) {

@@ -102,6 +102,15 @@ export function matches(expected: JsonValue, actual: unknown, options?: MatchOpt
   return matchValue(expected, actual, options).length === 0
 }
 
+/**
+ * True when `value` would be interpreted as a matcher (`{"$regex": ...}`, `{"$type": ...}`,
+ * `{"$ref": ...}`, `{"$literal": ...}`), not compared as plain data. Plain objects carrying
+ * only `$partial` next to data keys are not matchers.
+ */
+export function isMatcherObject(value: unknown): boolean {
+  return isPlainObject(value) && parseDirective(value) !== null
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -157,6 +166,45 @@ function isDirectiveKey(key: string, value: JsonValue): key is DirectiveName {
   if (!(DIRECTIVES as readonly string[]).includes(key)) return false
   // A string `$schema` is a JSON Schema dialect URI (data), not the $schema matcher.
   return key !== '$schema' || isSchemaValue(value)
+}
+
+/** Every `$` name an expectation may use (directives plus `$partial`). */
+const MATCHER_NAMES: readonly string[] = ['$partial', ...DIRECTIVES]
+
+/**
+ * A `$`-prefixed key that is neither a matcher nor `$partial` (a string `$schema` is a
+ * dialect URI, i.e. data). Typos such as `$partail` would otherwise be compared as data.
+ */
+function isUnknownDollarKey(key: string, value: JsonValue): boolean {
+  if (!key.startsWith('$') || MATCHER_NAMES.includes(key)) return false
+  return !(key === '$schema' && typeof value === 'string')
+}
+
+function closestMatcher(key: string): string | undefined {
+  let best: string | undefined
+  let bestScore = Number.POSITIVE_INFINITY
+  for (const name of MATCHER_NAMES) {
+    const score = levenshtein(key.toLowerCase(), name.toLowerCase())
+    if (score < bestScore) {
+      bestScore = score
+      best = name
+    }
+  }
+  return bestScore <= 2 ? best : undefined
+}
+
+function levenshtein(a: string, b: string): number {
+  const row = Array.from({ length: b.length + 1 }, (_, i) => i)
+  for (let i = 1; i <= a.length; i++) {
+    let prev = row[0]
+    row[0] = i
+    for (let j = 1; j <= b.length; j++) {
+      const tmp = row[j]
+      row[j] = Math.min(row[j] + 1, row[j - 1] + 1, prev + (a[i - 1] === b[j - 1] ? 0 : 1))
+      prev = tmp
+    }
+  }
+  return row[b.length]
 }
 
 function scratch(ctx: MatchContext, partial: boolean, limit: number): MatchContext {
@@ -986,6 +1034,16 @@ function lintNode(node: JsonValue, path: string, out: Mismatch[]): void {
         expected: node,
       })
     }
+    for (const key of Object.keys(node)) {
+      if (isUnknownDollarKey(key, node[key])) {
+        const near = closestMatcher(key)
+        out.push({
+          path: displayPath(path),
+          message: `"${key}" is not a matcher;${near ? ` did you mean "${near}"?` : ` matchers are ${MATCHER_NAMES.join(', ')}.`} Use {"$literal": ...} for data with a literal $-key`,
+          expected: node,
+        })
+      }
+    }
     for (const [key, child] of Object.entries(node)) {
       if (key !== '$partial') lintNode(child, appendKey(path, key), out)
     }
@@ -1034,8 +1092,11 @@ function lintNode(node: JsonValue, path: string, out: Mismatch[]): void {
 export function escapeDirectives(value: JsonValue): JsonValue {
   if (Array.isArray(value)) return value.map(escapeDirectives)
   if (!isPlainObject(value)) return value
+  // Any `$`-key (except a string `$schema` URI) would be read as a matcher or rejected by
+  // lintExpectation as an unknown one, so the data is compared literally.
   const interpreted = Object.keys(value).some(
-    (key) => key === '$partial' || isDirectiveKey(key, value[key]),
+    (key) =>
+      key === '$partial' || isDirectiveKey(key, value[key]) || isUnknownDollarKey(key, value[key]),
   )
   if (interpreted) return { $literal: value }
   const out: Record<string, JsonValue> = {}
