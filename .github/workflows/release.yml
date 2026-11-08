@@ -3,35 +3,74 @@ name: Release
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      bootstrapAlpha:
+        description: Publish or repair 2.0.0-alpha.0; keep latest at 0.1.0
+        type: boolean
+        default: false
 
-concurrency: release-${{ github.ref }}
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+
   release:
+    needs: verify
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
-      contents: write # changesets: push the Version Packages branch / tags
-      pull-requests: write # changesets: open and update the Version Packages PR
-      id-token: write # npm: OIDC trusted publishing (no tokens, provenance automatic)
+      contents: write
+      id-token: write
+    env:
+      GIT_AUTHOR_NAME: Jordan Moak
+      GIT_AUTHOR_EMAIL: jordan.moak@gmail.com
+      GIT_COMMITTER_NAME: Jordan Moak
+      GIT_COMMITTER_EMAIL: jordan.moak@gmail.com
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 22
-          cache: npm
-          registry-url: https://registry.npmjs.org
-      # Trusted publishing requires npm >= 11.5.1; staged publishing (npm stage) requires >= 11.15.0
-      - run: npm install -g npm@latest
+          node-version: 24
+      # Node 24 includes npm with OIDC support. Do not set registry-url: its
+      # placeholder NODE_AUTH_TOKEN configuration prevents tokenless publishing.
       - run: npm ci
-      - run: npm run typecheck
-      - run: npm run build
-      - run: npm test
-      - name: Version or publish
-        uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1.9.0
-        with:
-          publish: npx changeset publish
+      - name: Bootstrap the approved alpha version
+        if: github.event_name == 'workflow_dispatch' && inputs.bootstrapAlpha
+        run: node scripts/release.mjs bootstrap
+        env:
+          BOOTSTRAP_ALPHA: 'true'
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Check the published alpha baseline
+        id: baseline
+        if: github.event_name != 'workflow_dispatch' || !inputs.bootstrapAlpha
+        run: node scripts/release.mjs check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # semantic-release internally tolerates note-fetch failures. Fail closed:
+      # prerelease channel notes are required to calculate the correct v2 version.
+      - name: Fetch release channel history
+        if: steps.baseline.outputs.ready == 'true' || (github.event_name == 'workflow_dispatch' && inputs.bootstrapAlpha)
+        run: |
+          git fetch origin '+refs/tags/v*:refs/tags/v*' '+refs/notes/semantic-release*:refs/notes/semantic-release*'
+          git notes --ref=semantic-release-v2.0.0-alpha.0 show v2.0.0-alpha.0
+      - name: Verify the automatic release baseline
+        if: github.event_name == 'workflow_dispatch' && inputs.bootstrapAlpha
+        run: npm run release -- --dry-run
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish conventional release commits
+        if: steps.baseline.outputs.ready == 'true'
+        run: npm run release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

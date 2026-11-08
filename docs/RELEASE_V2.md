@@ -1,6 +1,4 @@
----
-"@jmoak/vibrissa": major
----
+# Vibrissa 2.0.0-alpha.0
 
 v2: MCP 2026-07-28, flows, manifest lock, fuzz, check, tap, reporters
 
@@ -16,4 +14,4 @@ v2: MCP 2026-07-28, flows, manifest lock, fuzz, check, tap, reporters
 - **Manifest diffs** mark breaking changes; `requireManifest` fails CI on a missing lock; one lock serves both protocol eras. Vitest bridge (`@jmoak/vibrissa/vitest`) includes the lock and checks.
 - **Matchers v2:** `$any`, `$type`, `$schema`, `$oneOf`, `$contains`, `$length`, `$number`, `$ignore`, `$ref`, `$literal`.
 
-Breaking: error-code names follow the v2 SDK, the `$schema` path in scaffolded files is now `node_modules/@jmoak/vibrissa/...`, and the library API is `runCases(options)` over the v2 `RunOptions`. Run `vib migrate` and see docs/MIGRATION.md.
+Breaking: error-code names follow the v2 SDK, the `$schema` path in scaffolded files is now `node_modules/@jmoak/vibrissa/...`, and the library API is `runCases(options)` over the v2 `RunOptions`. Run `vib migrate` and see [the migration guide](https://github.com/JMoak/vibrissa/blob/main/docs/MIGRATION.md).

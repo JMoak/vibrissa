@@ -56,6 +56,7 @@ import type {
   TranscriptEntry,
 } from '../types.js'
 import { isHttpServerConfig } from '../types.js'
+import { VERSION } from '../version.js'
 import {
   type ToolError,
   fromJsonRpcError,
@@ -69,7 +70,7 @@ export * from './errors.js'
 
 export const MODERN_PROTOCOL_VERSION = '2026-07-28'
 export const TASKS_EXTENSION = 'io.modelcontextprotocol/tasks'
-export const VIBRISSA_CLIENT_INFO = { name: 'vibrissa', version: '2.0.0-alpha.0' }
+export const VIBRISSA_CLIENT_INFO = { name: 'vibrissa', version: VERSION }
 
 const DEFAULT_AWAIT_TIMEOUT_MS = 30000
 const DEFAULT_POLL_MS = 500

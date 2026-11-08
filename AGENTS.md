@@ -84,7 +84,7 @@ hand-built `/` paths for the file system; print paths with forward slashes.
    stream). Agents are first-class users.
 5. **Every case and config key is in the JSON Schema with a `description`.** A test
    enforces it (`tests/config.test.ts`). Docs mirror the schema descriptions.
-6. **User-visible changes get a changeset** (`npx changeset`). See [RELEASING.md](./RELEASING.md).
+6. **Release-worthy changes use conventional commits** (`fix`, `feat`, or a breaking-change marker). See [RELEASING.md](./RELEASING.md).
 
 ## Error messages
 
@@ -175,4 +175,4 @@ The hint says what to do next: a flag, a config key, a command. Never throw a ba
 | [docs/FUZZ.md](./docs/FUZZ.md) | `vib fuzz` generation and invariants |
 | [docs/CI.md](./docs/CI.md) | Reporters, sharding, baselines in CI |
 | [docs/MIGRATION.md](./docs/MIGRATION.md) | v1 to v2 |
-| [RELEASING.md](./RELEASING.md) | Changesets, trusted publishing, 2.0.0 checklist |
+| [RELEASING.md](./RELEASING.md) | Conventional releases, trusted publishing, v2 alpha bootstrap |
