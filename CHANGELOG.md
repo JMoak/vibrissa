@@ -1,0 +1,21 @@
+# @jmoak/vibrissa
+
+## 2.0.0
+
+### Major Changes
+
+- e70446b: v2: MCP 2026-07-28, flows, manifest lock, fuzz, check, tap, reporters
+
+  - **Protocol 2026-07-28** on `@modelcontextprotocol/client` 2.x with era negotiation (`protocol: auto | legacy | modern | { pin }`). Suites run unchanged against 2025-era and 2026-era servers. Streamable HTTP servers via `{ "url", "headers" }`.
+  - **Normalization** strips `resultType`, `_meta["io.modelcontextprotocol/*"]` and list cache hints before matching and recording, so v1 goldens stay green.
+  - **Whole contract:** resources, resource templates and prompts are first-class cases. `outputSchema` is enforced on every `tools/call`.
+  - **Flows:** multi-step `steps` with `capture` and `{{name}}` interpolation, `setup` / `teardown`, MRTR scripting (`respond`, `expectInputRequired`), tasks polling (`await`, `expectTask`).
+  - **Manifest lock:** `vib manifest record` snapshots the server surface; `vib run` fails on drift, including changed descriptions (rug-pull detection). Accept with `--update-manifest`.
+  - **`vib check`** (spec sanity + tool-description lint) and **`vib fuzz`** (schema-driven, seeded, invariant-checked).
+  - **`vib tap`** records real client traffic; `vib record --from-tap` turns it into cases.
+  - **Reporters:** console, json, junit, github, tap. Delta gating with `--baseline`, `--repeat` flake detection, transcripts on failure, `--update`, tags, profiles, shards.
+  - **Authoring loop:** `vib help cases` cheat sheet; `vib init` records a real sample from your server; `vib record` loosens timestamps, UUIDs and changing values to matchers and refuses goldens that violate `outputSchema`; `vib explain` flags weak assertions; `--update` patches only mismatched leaves. Unknown flags, config keys, tools, matchers and error codes fail with a did-you-mean; `--json` always prints one object with `ok`.
+  - **Manifest diffs** mark breaking changes; `requireManifest` fails CI on a missing lock; one lock serves both protocol eras. Vitest bridge (`@jmoak/vibrissa/vitest`) includes the lock and checks.
+  - **Matchers v2:** `$any`, `$type`, `$schema`, `$oneOf`, `$contains`, `$length`, `$number`, `$ignore`, `$ref`, `$literal`.
+
+  Breaking: error-code names follow the v2 SDK, the `$schema` path in scaffolded files is now `node_modules/@jmoak/vibrissa/...`, and the library API is `runCases(options)` over the v2 `RunOptions`. Run `vib migrate` and see docs/MIGRATION.md.
