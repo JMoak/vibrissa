@@ -1,5 +1,6 @@
 import { type ChildProcess, spawn } from 'node:child_process'
 import path from 'node:path'
+import { StdioClientTransport } from '@modelcontextprotocol/client/stdio'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import {
   type InputResponder,
@@ -457,12 +458,24 @@ describe('McpSession stdout pollution and teardown', () => {
 
   it('close() after a timed-out call kills the hung server promptly', async () => {
     const session = await start(stdio({ protocol: 'legacy' }))
-    const outcome = await session.callTool('sleep', { ms: 10000 }, { timeoutMs: 100 })
-    expect(outcome.kind === 'error' && outcome.error.kind).toBe('timeout')
-    const started = Date.now()
-    await session.close()
-    expect(Date.now() - started).toBeLessThan(1500)
-    expect(session.closed).toBe(true)
+    try {
+      const transport = session.sdk.transport
+      if (!(transport instanceof StdioClientTransport) || transport.pid === null) {
+        throw new Error('Expected the fixture to have a running stdio child')
+      }
+      const pid = transport.pid
+      const outcome = await session.callTool('sleep', { ms: 10000 }, { timeoutMs: 100 })
+      expect(outcome.kind === 'error' && outcome.error.kind).toBe('timeout')
+      const started = Date.now()
+      await session.close()
+      // Windows taskkill /T /F can itself take >1500ms. Keep the normal test
+      // timeout as its bound and verify child death, not OS utility startup time.
+      if (process.platform !== 'win32') expect(Date.now() - started).toBeLessThan(1500)
+      expect(() => process.kill(pid, 0)).toThrowError(expect.objectContaining({ code: 'ESRCH' }))
+      expect(session.closed).toBe(true)
+    } finally {
+      await session.close()
+    }
   })
 
   it('close() is quick and idempotent for a well-behaved server', async () => {
