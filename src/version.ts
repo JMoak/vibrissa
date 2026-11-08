@@ -1,4 +1,4 @@
-import { createRequire } from 'node:module'
+import manifest from '../package.json' with { type: 'json' }
 
-// src/ and the published dist/ are both one directory below the manifest.
-export const VERSION: string = createRequire(import.meta.url)('../package.json').version
+// Bundlers inline this value. prepack rebuilds after the release job assigns the version.
+export const VERSION: string = manifest.version
