@@ -739,6 +739,11 @@ describe('Runner: --baseline delta gating', () => {
     expect(first.result.exitCode).toBe(1)
     const baseline = path.join(outDir, 'results.json')
     expect(fs.existsSync(baseline)).toBe(true)
+    // Status comparisons must not depend on the relative speed of two real
+    // fixture runs. Exercise latency separately with the 1ms baseline below.
+    const report = JSON.parse(fs.readFileSync(baseline, 'utf8'))
+    for (const c of report.cases) c.durationMs = 10000
+    writeJson(baseline, report)
 
     const same = await run({ ...options, baseline })
     expect(same.result.exitCode).toBe(0)
@@ -757,7 +762,6 @@ describe('Runner: --baseline delta gating', () => {
     expect(check.detail).toBe('cases/pass.json: newly failing')
 
     writeJson(path.join(options.rootDir, 'cases/pass.json'), echoCase('a'))
-    const report = JSON.parse(fs.readFileSync(baseline, 'utf8'))
     for (const c of report.cases) if (c.caseId === 'cases/sleepy.json') c.durationMs = 1
     const fastBaseline = writeJson(path.join(outDir, 'fast.json'), report)
     const slower = await run({ ...options, baseline: fastBaseline })
