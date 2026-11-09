@@ -4,7 +4,8 @@ import { appendFileSync, readFileSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 
 export const PACKAGE = '@jmoak/vibrissa'
-export const VERSION = '2.0.0-alpha.0'
+export const VERSION = '2.0.0'
+export const ALPHA_VERSION = '2.0.0-alpha.0'
 export const TAG = `v${VERSION}`
 export const BASE_SHA = '6367edc8d0095904739bc0cce699796716d23855'
 const NOTE_REF = `notes/semantic-release-${TAG}`
@@ -52,14 +53,19 @@ export function verifyPublished(published, sha) {
 }
 
 export function verifyInitialRegistry(metadata) {
-  assert.equal(metadata?.['dist-tags']?.latest, '0.1.0', 'latest must stay at 0.1.0')
-  const alpha = metadata['dist-tags'].alpha
   assert.ok(
-    !alpha || alpha === VERSION,
-    'A newer alpha already exists; bootstrap is no longer needed',
+    ['0.1.0', VERSION].includes(metadata?.['dist-tags']?.latest),
+    'Unexpected latest version; stable bootstrap only permits 0.1.0 or 2.0.0',
+  )
+  assert.equal(
+    metadata['dist-tags'].alpha,
+    ALPHA_VERSION,
+    'The published alpha must remain unchanged',
   )
   assert.ok(
-    Object.keys(metadata.versions ?? {}).every((version) => ['0.1.0', VERSION].includes(version)),
+    Object.keys(metadata.versions ?? {}).every((version) =>
+      ['0.1.0', ALPHA_VERSION, VERSION].includes(version),
+    ),
     'Unexpected published versions; review the release history before bootstrapping',
   )
   assert.equal(metadata.versions?.['0.1.0']?.gitHead, BASE_SHA, 'The stable baseline has changed')
@@ -86,18 +92,24 @@ export async function baselineReady({ registry, github }) {
   if (!published) return false
   verifyPublished(published)
   const metadata = await registry()
-  assert.equal(metadata?.['dist-tags']?.latest, '0.1.0', 'The alpha pipeline must not move latest')
+  const latest = metadata?.['dist-tags']?.latest
+  assert.ok(
+    typeof latest === 'string' &&
+      /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(latest) &&
+      Number(latest.split('.')[0]) >= 2,
+    'latest must identify a stable version at or above 2.0.0',
+  )
   const tag = await github(`git/ref/tags/${TAG}`)
   if (!tag) return false
-  assert.equal(tag.object.type, 'commit', 'The alpha baseline must be a lightweight tag')
+  assert.equal(tag.object.type, 'commit', 'The stable baseline must be a lightweight tag')
   assert.equal(
     tag.object.sha,
     published.gitHead,
-    'The alpha tag does not match the published commit',
+    'The stable tag does not match the published commit',
   )
-  if (!(await noteState(github, published.gitHead)).channels.includes('alpha')) return false
+  if (!(await noteState(github, published.gitHead)).channels.includes(null)) return false
   const release = await github(`releases/tags/${TAG}`)
-  return release?.draft === false && release?.prerelease === true
+  return release?.draft === false && release?.prerelease === false
 }
 
 export async function waitForPublication(
@@ -129,15 +141,15 @@ export async function waitForPublication(
 export async function ensureMetadata(github, sha, notes) {
   const tag = await github(`git/ref/tags/${TAG}`)
   if (tag) {
-    assert.equal(tag.object.type, 'commit', 'Existing alpha tag is not a lightweight tag')
-    assert.equal(tag.object.sha, sha, 'Existing alpha tag points to a different commit')
+    assert.equal(tag.object.type, 'commit', 'Existing stable tag is not a lightweight tag')
+    assert.equal(tag.object.sha, sha, 'Existing stable tag points to a different commit')
   } else {
     await github('git/refs', 'POST', { ref: `refs/tags/${TAG}`, sha })
   }
   const state = await noteState(github, sha)
-  if (!state.channels.includes('alpha')) {
+  if (!state.channels.includes(null)) {
     const blob = await github('git/blobs', 'POST', {
-      content: JSON.stringify({ channels: [...state.channels, 'alpha'] }),
+      content: JSON.stringify({ channels: [...state.channels, null] }),
       encoding: 'utf-8',
     })
     const tree = await github('git/trees', 'POST', {
@@ -145,7 +157,7 @@ export async function ensureMetadata(github, sha, notes) {
       tree: [{ path: state.entry?.path ?? sha, mode: '100644', type: 'blob', sha: blob.sha }],
     })
     const commit = await github('git/commits', 'POST', {
-      message: `Record alpha release channel for ${TAG}`,
+      message: `Record stable release channel for ${TAG}`,
       tree: tree.sha,
       parents: state.ref ? [state.ref.object.sha] : [],
       author: IDENTITY,
@@ -160,7 +172,7 @@ export async function ensureMetadata(github, sha, notes) {
   const release = await github(`releases/tags/${TAG}`)
   if (release) {
     assert.equal(release.draft, false, 'Existing release is still a draft')
-    assert.equal(release.prerelease, true, 'Existing release is not marked as a prerelease')
+    assert.equal(release.prerelease, false, 'Existing release must be stable')
   } else {
     await github('releases', 'POST', {
       tag_name: TAG,
@@ -168,13 +180,13 @@ export async function ensureMetadata(github, sha, notes) {
       name: TAG,
       body: notes,
       draft: false,
-      prerelease: true,
-      make_latest: 'false',
+      prerelease: false,
+      make_latest: 'true',
     })
   }
 }
 
-export async function waitForAlphaTag(
+export async function waitForLatestTag(
   registry,
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   attempts = 30,
@@ -182,23 +194,21 @@ export async function waitForAlphaTag(
   for (let attempt = 0; attempt < attempts; attempt++) {
     const metadata = await registry()
     verifyInitialRegistry(metadata)
-    if (metadata['dist-tags'].alpha === VERSION) return
+    if (metadata['dist-tags'].latest === VERSION) return
     if (attempt + 1 < attempts) await sleep(10000)
   }
   throw new Error(
-    'Alpha dist-tag is not visible yet. Rerun the original bootstrap workflow run to repair metadata.',
+    'Latest dist-tag is not visible yet. Rerun the original bootstrap workflow run to repair metadata.',
   )
 }
 
 export async function bootstrap({ registry, github, publish, sha, notes, sleep }) {
   verifyInitialRegistry(await registry())
-  const stable = await github('git/ref/heads/stable')
   const stableTag = await github('git/ref/tags/v0.1.0')
-  assert.equal(stable?.object.sha, BASE_SHA, 'stable must anchor the actual 0.1.0 release')
   assert.equal(stableTag?.object.sha, BASE_SHA, 'v0.1.0 must anchor the actual 0.1.0 release')
   const existingTag = await github(`git/ref/tags/${TAG}`)
   if (existingTag)
-    assert.equal(existingTag.object.sha, sha, 'Existing alpha tag points to another commit')
+    assert.equal(existingTag.object.sha, sha, 'Existing stable tag points to another commit')
   const existing = await registry(VERSION)
   if (existing) verifyPublished(existing, sha)
   else {
@@ -207,7 +217,7 @@ export async function bootstrap({ registry, github, publish, sha, notes, sleep }
     await publish()
   }
   await waitForPublication(registry, sha, sleep)
-  await waitForAlphaTag(registry, sleep)
+  await waitForLatestTag(registry, sleep)
   // A release tag must never claim a version before npm confirms its actual gitHead.
   await ensureMetadata(github, sha, notes)
 }
@@ -228,7 +238,7 @@ async function main() {
     appendFileSync(process.env.GITHUB_OUTPUT, `ready=${ready}\n`)
     if (!ready) {
       const message =
-        'Automatic alpha publishing is waiting for the one-time 2.0.0-alpha.0 bootstrap. Run Release on main with bootstrapAlpha enabled. If publication already happened, rerun the original bootstrap workflow run to repair interrupted metadata writes.'
+        'Automatic stable publishing is waiting for the one-time 2.0.0 bootstrap. Run Release on main with bootstrapStable enabled. If publication already happened, rerun the original bootstrap workflow run to repair interrupted metadata writes.'
       console.log(`::notice::${message}`)
       appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${message}\n`)
     }
@@ -240,7 +250,7 @@ async function main() {
     'workflow_dispatch',
     'Bootstrap requires a manual dispatch',
   )
-  assert.equal(process.env.BOOTSTRAP_ALPHA, 'true', 'Bootstrap must be explicitly selected')
+  assert.equal(process.env.BOOTSTRAP_STABLE, 'true', 'Bootstrap must be explicitly selected')
   const sha = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
   assert.equal(sha, process.env.GITHUB_SHA, 'Checkout does not match the tested workflow commit')
   assert.equal(
@@ -250,16 +260,16 @@ async function main() {
   )
   const manifest = JSON.parse(readFileSync('package.json', 'utf8'))
   assert.equal(manifest.name, PACKAGE)
-  assert.equal(manifest.version, VERSION, 'Bootstrap only publishes 2.0.0-alpha.0')
+  assert.equal(manifest.version, VERSION, 'Bootstrap only publishes 2.0.0')
   await bootstrap({
     ...api,
     sha,
     notes: readFileSync('docs/RELEASE_V2.md', 'utf8'),
-    publish: () => execFileSync('npm', ['publish', '--tag', 'alpha'], { stdio: 'inherit' }),
+    publish: () => execFileSync('npm', ['publish', '--tag', 'latest'], { stdio: 'inherit' }),
   })
   appendFileSync(
     process.env.GITHUB_STEP_SUMMARY,
-    `Published and recorded ${PACKAGE}@${VERSION} on alpha. latest remains 0.1.0.\n`,
+    `Published and recorded ${PACKAGE}@${VERSION} on latest. The alpha channel remains 2.0.0-alpha.0.\n`,
   )
 }
 

@@ -5,8 +5,8 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
-      bootstrapAlpha:
-        description: Publish or repair 2.0.0-alpha.0; keep latest at 0.1.0
+      bootstrapStable:
+        description: Publish or repair stable 2.0.0 on latest; preserve the alpha channel
         type: boolean
         default: false
 
@@ -45,27 +45,27 @@ jobs:
       # Node 24 includes npm with OIDC support. Do not set registry-url: its
       # placeholder NODE_AUTH_TOKEN configuration prevents tokenless publishing.
       - run: npm ci
-      - name: Bootstrap the approved alpha version
-        if: github.event_name == 'workflow_dispatch' && inputs.bootstrapAlpha
+      - name: Bootstrap the approved stable version
+        if: github.event_name == 'workflow_dispatch' && inputs.bootstrapStable
         run: node scripts/release.mjs bootstrap
         env:
-          BOOTSTRAP_ALPHA: 'true'
+          BOOTSTRAP_STABLE: 'true'
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Check the published alpha baseline
+      - name: Check the published stable baseline
         id: baseline
-        if: github.event_name != 'workflow_dispatch' || !inputs.bootstrapAlpha
+        if: github.event_name != 'workflow_dispatch' || !inputs.bootstrapStable
         run: node scripts/release.mjs check
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # semantic-release internally tolerates note-fetch failures. Fail closed:
-      # prerelease channel notes are required to calculate the correct v2 version.
+      # Release tags and channel notes are required to calculate the correct v2 version.
       - name: Fetch release channel history
-        if: steps.baseline.outputs.ready == 'true' || (github.event_name == 'workflow_dispatch' && inputs.bootstrapAlpha)
+        if: steps.baseline.outputs.ready == 'true' || (github.event_name == 'workflow_dispatch' && inputs.bootstrapStable)
         run: |
           git fetch origin '+refs/tags/v*:refs/tags/v*' '+refs/notes/semantic-release*:refs/notes/semantic-release*'
-          git notes --ref=semantic-release-v2.0.0-alpha.0 show v2.0.0-alpha.0
+          git notes --ref=semantic-release-v2.0.0 show v2.0.0
       - name: Verify the automatic release baseline
-        if: github.event_name == 'workflow_dispatch' && inputs.bootstrapAlpha
+        if: github.event_name == 'workflow_dispatch' && inputs.bootstrapStable
         run: npm run release -- --dry-run
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

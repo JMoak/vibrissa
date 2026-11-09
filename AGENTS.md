@@ -175,4 +175,4 @@ The hint says what to do next: a flag, a config key, a command. Never throw a ba
 | [docs/FUZZ.md](./docs/FUZZ.md) | `vib fuzz` generation and invariants |
 | [docs/CI.md](./docs/CI.md) | Reporters, sharding, baselines in CI |
 | [docs/MIGRATION.md](./docs/MIGRATION.md) | v1 to v2 |
-| [RELEASING.md](./RELEASING.md) | Conventional releases, trusted publishing, v2 alpha bootstrap |
+| [RELEASING.md](./RELEASING.md) | Conventional stable releases, trusted publishing, v2 bootstrap |

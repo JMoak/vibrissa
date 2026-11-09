@@ -1,4 +1,4 @@
-# Vibrissa 2.0.0-alpha.0
+# Vibrissa 2.0.0
 
 v2: MCP 2026-07-28, flows, manifest lock, fuzz, check, tap, reporters
 

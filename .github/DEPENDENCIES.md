@@ -26,9 +26,9 @@ Dependabot uses `chore(deps)` / `chore(deps-dev)` commit messages. Dependency
 updates do not implicitly request a package release. When a runtime dependency
 repair should ship, use an explicitly reviewed `fix(deps): ...` squash title;
 keep development-only and Actions maintenance as chores. After the one-time
-`2.0.0-alpha.0` bootstrap, conventional release commits on `main` publish to
-`alpha` after the full CI matrix passes. `latest` remains `0.1.0` until a separate
-stable-v2 transition. There are no changesets or release PRs. Follow
+`2.0.0` stable bootstrap, conventional release commits on `main` publish to
+`latest` after the full CI matrix passes. The existing `alpha` tag stays at
+`2.0.0-alpha.0`. There are no changesets or release PRs. Follow
 [RELEASING.md](../RELEASING.md) for bootstrap and release recovery.
 
 Repository settings must have the dependency graph, Dependabot alerts, and

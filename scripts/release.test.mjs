@@ -5,6 +5,7 @@ import { analyzeCommits } from '@semantic-release/commit-analyzer'
 import getLastRelease from 'semantic-release/lib/get-last-release.js'
 import getNextVersion from 'semantic-release/lib/get-next-version.js'
 import {
+  ALPHA_VERSION,
   BASE_SHA,
   PACKAGE,
   TAG,
@@ -13,7 +14,7 @@ import {
   bootstrap,
   ensureMetadata,
   jsonRequest,
-  waitForAlphaTag,
+  waitForLatestTag,
   waitForPublication,
 } from './release.mjs'
 
@@ -24,9 +25,10 @@ const published = (sha = SHA) => ({ name: PACKAGE, version: VERSION, gitHead: sh
 function fixture({ existing, tag, channels, release, visibleAfter = 0 } = {}) {
   const state = { published: existing, tag, channels, release, writes: [], publishes: 0, reads: 0 }
   const metadata = () => ({
-    'dist-tags': { latest: '0.1.0', ...(state.published ? { alpha: VERSION } : {}) },
+    'dist-tags': { latest: state.published ? VERSION : '0.1.0', alpha: ALPHA_VERSION },
     versions: {
       '0.1.0': { gitHead: BASE_SHA },
+      [ALPHA_VERSION]: { name: PACKAGE, version: ALPHA_VERSION, gitHead: OTHER_SHA },
       ...(state.published ? { [VERSION]: state.published } : {}),
     },
   })
@@ -102,9 +104,11 @@ test('first publication waits for registry propagation before creating metadata'
   await bootstrap(f)
   assert.equal(f.state.publishes, 1)
   assert.equal(f.state.tag, SHA)
-  assert.deepEqual(f.state.channels, ['alpha'])
-  assert.equal(f.state.release.prerelease, true)
-  assert.equal(f.state.release.make_latest, 'false')
+  assert.deepEqual(f.state.channels, [null])
+  assert.equal(f.state.release.prerelease, false)
+  assert.equal(f.state.release.make_latest, 'true')
+  assert.equal((await f.registry())['dist-tags'].alpha, ALPHA_VERSION)
+  assert.ok(f.state.writes.every(({ body }) => !body?.ref?.includes(ALPHA_VERSION)))
   const commit = f.state.writes.find((write) => write.path === 'git/commits').body
   assert.deepEqual(commit.author, { name: 'Jordan Moak', email: 'jordan.moak@gmail.com' })
   assert.deepEqual(commit.committer, commit.author)
@@ -134,7 +138,7 @@ test('conflicting existing tags are never replaced', async () => {
 test('notes preserve other channels, the fanout path, and the existing notes tree', async () => {
   const f = fixture({ existing: published(), tag: SHA, channels: ['next'] })
   await bootstrap(f)
-  assert.deepEqual(f.state.channels, ['next', 'alpha'])
+  assert.deepEqual(f.state.channels, ['next', null])
   const tree = f.state.writes.find((write) => write.path === 'git/trees').body
   assert.equal(tree.base_tree, 'note-tree')
   assert.equal(tree.tree[0].path, `${SHA.slice(0, 2)}/${SHA.slice(2)}`)
@@ -204,12 +208,12 @@ test('publication verification retries transient failures and fails if never vis
   )
 })
 
-test('automatic release waits until real package, tag and alpha channel metadata agree', async () => {
+test('automatic release waits until real package, tag and stable channel metadata agree', async () => {
   assert.equal(await baselineReady(fixture()), false)
   assert.equal(await baselineReady(fixture({ existing: published() })), false)
   assert.equal(await baselineReady(fixture({ existing: published(), tag: SHA })), false)
   assert.equal(
-    await baselineReady(fixture({ existing: published(), tag: SHA, channels: ['alpha'] })),
+    await baselineReady(fixture({ existing: published(), tag: SHA, channels: [null] })),
     false,
   )
   assert.equal(
@@ -217,8 +221,8 @@ test('automatic release waits until real package, tag and alpha channel metadata
       fixture({
         existing: published(),
         tag: SHA,
-        channels: ['alpha'],
-        release: { draft: false, prerelease: true },
+        channels: [null],
+        release: { draft: false, prerelease: false },
       }),
     ),
     true,
@@ -229,30 +233,76 @@ test('automatic release waits until real package, tag and alpha channel metadata
   )
 })
 
-test('alpha dist-tag propagation is retried; unexpected latest fails closed', async () => {
+test('latest dist-tag propagation is retried; unexpected latest fails closed', async () => {
   let reads = 0
   const metadata = {
-    'dist-tags': { latest: '0.1.0' },
+    'dist-tags': { latest: '0.1.0', alpha: ALPHA_VERSION },
     versions: { '0.1.0': { gitHead: BASE_SHA } },
   }
-  await waitForAlphaTag(
+  await waitForLatestTag(
     async () => {
-      if (++reads === 3) metadata['dist-tags'].alpha = VERSION
+      if (++reads === 3) metadata['dist-tags'].latest = VERSION
       return metadata
     },
     async () => {},
     3,
   )
   assert.equal(reads, 3)
-  metadata['dist-tags'].latest = VERSION
+  metadata['dist-tags'].latest = '3.0.0'
   await assert.rejects(
-    waitForAlphaTag(
+    waitForLatestTag(
       async () => metadata,
       async () => {},
       2,
     ),
-    /latest must stay/,
+    /Unexpected latest version/,
   )
+})
+
+test('future stable versions remain eligible for automatic releases', async () => {
+  for (const latest of ['2.0.0', '2.0.1', '2.1.0', '3.0.0', '10.0.0']) {
+    const f = fixture({
+      existing: published(),
+      tag: SHA,
+      channels: [null],
+      release: { draft: false, prerelease: false },
+    })
+    const registry = f.registry
+    f.registry = async (version) => {
+      const value = await registry(version)
+      if (!version) value['dist-tags'].latest = latest
+      return value
+    }
+    assert.equal(await baselineReady(f), true, latest)
+  }
+})
+
+test('automatic releases reject prerelease or pre-v2 latest versions', async () => {
+  for (const latest of ['0.1.0', '1.0.0', ALPHA_VERSION, '2.1.0-beta.0', '02.0.0']) {
+    const f = fixture({ existing: published() })
+    const registry = f.registry
+    f.registry = async (version) => {
+      const value = await registry(version)
+      if (!version) value['dist-tags'].latest = latest
+      return value
+    }
+    await assert.rejects(baselineReady(f), /stable version at or above 2.0.0/)
+  }
+})
+
+test('bootstrap refuses to alter a changed alpha channel or a newer stable history', async () => {
+  for (const changedTag of [{ alpha: '2.0.0-alpha.1' }, { latest: '2.0.1' }]) {
+    const f = fixture()
+    const registry = f.registry
+    f.registry = async (version) => {
+      const value = await registry(version)
+      if (!version) Object.assign(value['dist-tags'], changedTag)
+      return value
+    }
+    await assert.rejects(bootstrap(f), /alpha must remain unchanged|Unexpected latest version/)
+    assert.equal(f.state.publishes, 0)
+    assert.deepEqual(f.state.writes, [])
+  }
 })
 
 test('conventional release commits publish; maintenance-only commits do not', async () => {
@@ -279,31 +329,28 @@ test('conventional release commits publish; maintenance-only commits do not', as
   }
 })
 
-test('the actual semantic-release algorithm increments v2 alphas for all release types', () => {
+test('the actual semantic-release algorithm advances stable v2 for each release type', () => {
   const config = JSON.parse(readFileSync('.releaserc.json', 'utf8'))
-  assert.deepEqual(config.branches, [
-    'stable',
-    { name: 'main', prerelease: 'alpha', channel: 'alpha' },
-  ])
+  assert.deepEqual(config.branches, ['main'])
   const branch = {
-    ...config.branches[1],
-    type: 'prerelease',
+    name: 'main',
+    type: 'release',
     tags: [
       { version: '0.1.0', gitTag: 'v0.1.0', channels: [null] },
-      { version: VERSION, gitTag: TAG, channels: ['alpha'] },
+      { version: ALPHA_VERSION, gitTag: `v${ALPHA_VERSION}`, channels: ['alpha'] },
+      { version: VERSION, gitTag: TAG, channels: [null] },
     ],
   }
   const lastRelease = getLastRelease({ branch, options: { tagFormat: config.tagFormat } })
   assert.equal(lastRelease.version, VERSION)
-  for (const type of ['patch', 'minor', 'major']) {
+  for (const [type, expected] of [
+    ['patch', '2.0.1'],
+    ['minor', '2.1.0'],
+    ['major', '3.0.0'],
+  ]) {
     assert.equal(
-      getNextVersion({
-        branch,
-        lastRelease,
-        nextRelease: { type, channel: 'alpha' },
-        logger: { log() {} },
-      }),
-      '2.0.0-alpha.1',
+      getNextVersion({ branch, lastRelease, nextRelease: { type }, logger: { log() {} } }),
+      expected,
     )
   }
 })
